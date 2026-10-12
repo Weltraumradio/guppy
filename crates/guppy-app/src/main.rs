@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use guppy_core::fs::human_size;
+use guppy_core::ops::{self, Job, OpKind};
 use guppy_core::{Cancel, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
@@ -59,6 +60,10 @@ enum Message {
     Home,
     ToggleMark,
     SwitchSide,
+    Op(OpKind),
+    NewDir,
+    DialogConfirm,
+    DialogCancel,
     ToggleHidden,
     TogglePreview,
     /// Entwickler-Hilfe: `GUPPY_SCREENSHOT=datei.ppm` speichert ein Bild, sobald die
@@ -69,6 +74,23 @@ enum Message {
 /// Beginnt die Eingabe mit `~` (unter Unix auch `/`), wird gesprungen statt gefiltert.
 fn is_jump(query: &str) -> bool {
     query.chars().next().is_some_and(guppy_core::platform::is_jump_prefix)
+}
+
+/// Modaler Dialog über dem Fenster; solange er offen ist, gehen Tasten nur an ihn.
+enum Dialog {
+    Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
+    NewDir { name: String, error: Option<String> },
+    Running { kind: OpKind, job: Job },
+    Report { problems: Vec<String> },
+}
+
+fn op_verb(kind: OpKind) -> &'static str {
+    match kind {
+        OpKind::Copy => "kopieren",
+        OpKind::Move => "verschieben",
+        OpKind::Trash => "in den Papierkorb legen",
+        OpKind::Delete => "endgültig löschen",
+    }
 }
 
 struct Pane {
@@ -144,6 +166,7 @@ struct Guppy {
     shot_wait: u8,
     /// Sprungtreffer müssen nach dem Einlesen noch aufgefrischt werden.
     jump_pending: bool,
+    dialog: Option<Dialog>,
 }
 
 impl Guppy {
@@ -164,6 +187,7 @@ impl Guppy {
             jump_cur: 0,
             shot_wait: 0,
             jump_pending: false,
+            dialog: None,
         };
         g.request_sizes(0);
         g.request_sizes(1);
@@ -171,6 +195,13 @@ impl Guppy {
         // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
+        }
+        // `GUPPY_DIALOG=copy` öffnet den Kopierdialog, `=run` bestätigt ihn auch.
+        if let Ok(d) = std::env::var("GUPPY_DIALOG") {
+            g.ask(OpKind::Copy);
+            if d == "run" {
+                g.confirm_dialog();
+            }
         }
         (g, Task::none())
     }
@@ -197,7 +228,8 @@ impl Guppy {
     fn subscription(&self) -> Subscription<Message> {
         let keys = keyboard::listen().map(Message::Key);
         // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
-        if self.sizes.busy() || self.jump_pending || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+        let running = matches!(self.dialog, Some(Dialog::Running { .. }));
+        if self.sizes.busy() || self.jump_pending || running || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
             keys
@@ -215,8 +247,16 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.dialog.is_some() => {
+                self.on_dialog_key(key, text.as_deref());
+                return Task::none();
+            }
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                 return self.on_key(key, modifiers, text.as_deref());
+            }
+            Message::Tick if matches!(self.dialog, Some(Dialog::Running { .. })) => {
+                self.poll_job();
+                return Task::none();
             }
             Message::Tick if self.jump_pending => {
                 // Unterordner-Index wächst: Treffer auffrischen, Auswahl behalten.
@@ -262,6 +302,10 @@ impl Guppy {
             Message::Home => self.navigate(dirs_home()),
             Message::ToggleMark => self.toggle_mark(),
             Message::SwitchSide => self.active = 1 - self.active,
+            Message::Op(kind) => self.ask(kind),
+            Message::NewDir => self.dialog = Some(Dialog::NewDir { name: String::new(), error: None }),
+            Message::DialogConfirm => self.confirm_dialog(),
+            Message::DialogCancel => self.cancel_dialog(),
             Message::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.panes.iter_mut().for_each(|p| p.cursor = 0);
@@ -311,6 +355,11 @@ impl Guppy {
             Key::Named(Named::Space) if query_empty => self.toggle_mark(),
             Key::Named(Named::ArrowLeft) if m.alt() => self.history(true),
             Key::Named(Named::ArrowRight) if m.alt() => self.history(false),
+            Key::Named(Named::F5) => self.ask(OpKind::Copy),
+            Key::Named(Named::F6) => self.ask(OpKind::Move),
+            Key::Named(Named::F7) => self.dialog = Some(Dialog::NewDir { name: String::new(), error: None }),
+            Key::Named(Named::F8 | Named::Delete) if m.shift() => self.ask(OpKind::Delete),
+            Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("r") if m.control() => {
@@ -329,6 +378,103 @@ impl Guppy {
         }
         self.refresh_preview();
         self.scroll_into_view()
+    }
+
+    /// Ziel der Aktion: markierte sichtbare Einträge, sonst der unter dem Cursor.
+    fn selection(&self) -> Vec<PathBuf> {
+        let p = &self.panes[self.active];
+        let visible = p.visible(self.show_hidden);
+        let marked: Vec<PathBuf> = visible.iter().filter(|e| p.marked.contains(&e.path)).map(|e| e.path.clone()).collect();
+        if !marked.is_empty() {
+            return marked;
+        }
+        visible.get(p.cursor).map(|e| vec![e.path.clone()]).unwrap_or_default()
+    }
+
+    fn ask(&mut self, kind: OpKind) {
+        let sources = self.selection();
+        if sources.is_empty() {
+            return;
+        }
+        let target = matches!(kind, OpKind::Copy | OpKind::Move).then(|| self.panes[1 - self.active].path.clone());
+        if target.as_deref() == Some(self.panes[self.active].path.as_path()) {
+            self.dialog = Some(Dialog::Report { problems: vec!["Quelle und Ziel sind derselbe Ordner.".into()] });
+            return;
+        }
+        self.dialog = Some(Dialog::Confirm { kind, sources, target });
+    }
+
+    fn confirm_dialog(&mut self) {
+        match self.dialog.take() {
+            Some(Dialog::Confirm { kind, sources, target }) => {
+                self.dialog = Some(Dialog::Running { kind, job: ops::start(kind, sources, target) });
+            }
+            Some(Dialog::NewDir { name, .. }) => match ops::make_dir(&self.panes[self.active].path, name.trim()) {
+                Ok(created) => {
+                    self.reload(self.active);
+                    let p = &self.panes[self.active];
+                    if let Some(i) = p.visible(self.show_hidden).iter().position(|e| e.path == created) {
+                        self.panes[self.active].cursor = i;
+                    }
+                }
+                Err(e) => self.dialog = Some(Dialog::NewDir { name, error: Some(e.to_string()) }),
+            },
+            Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
+            Some(Dialog::Report { .. }) | None => {}
+        }
+    }
+
+    fn cancel_dialog(&mut self) {
+        match &self.dialog {
+            // Laufende Operation abbrechen; der Dialog schließt, sobald sie steht.
+            Some(Dialog::Running { job, .. }) => job.cancel(),
+            _ => self.dialog = None,
+        }
+    }
+
+    fn on_dialog_key(&mut self, key: Key, typed: Option<&str>) {
+        match key.as_ref() {
+            Key::Named(Named::Enter) => self.confirm_dialog(),
+            Key::Named(Named::Escape) => self.cancel_dialog(),
+            _ => {
+                if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
+                    match (key.as_ref(), typed) {
+                        (Key::Named(Named::Backspace), _) => {
+                            name.pop();
+                        }
+                        (_, Some(t)) if t.chars().all(|c| !c.is_control()) => name.push_str(t),
+                        _ => return,
+                    }
+                    *error = None;
+                }
+            }
+        }
+    }
+
+    fn poll_job(&mut self) {
+        let Some(Dialog::Running { job, .. }) = &self.dialog else { return };
+        let progress = job.progress();
+        if !progress.finished {
+            return;
+        }
+        self.dialog = (!progress.problems.is_empty()).then_some(Dialog::Report { problems: progress.problems });
+        for side in 0..2 {
+            let path = self.panes[side].path.clone();
+            self.sizes.invalidate(&path);
+            self.reload(side);
+        }
+    }
+
+    /// Liest den Ordner neu ein und behält den Cursor so gut es geht.
+    fn reload(&mut self, side: usize) {
+        let p = &mut self.panes[side];
+        if let Ok(entries) = guppy_core::read_dir(&p.path) {
+            p.entries = entries;
+            p.marked.retain(|m| m.exists());
+            let len = p.visible(self.show_hidden).len();
+            p.cursor = p.cursor.min(len.saturating_sub(1));
+        }
+        self.request_sizes(side);
     }
 
     fn set_query(&mut self, q: String) {
@@ -486,7 +632,146 @@ impl Guppy {
                 background: Some(rgb(t.dark_background).into()),
                 ..Default::default()
             });
-        column![self.menubar(), desk, self.statusbar()].into()
+        let main = column![self.menubar(), desk, self.statusbar()];
+        match self.dialog_view() {
+            Some(d) => iced::widget::stack![main, iced::widget::opaque(d)].into(),
+            None => main.into(),
+        }
+    }
+
+    fn dialog_view(&self) -> Option<Element<'_, Message>> {
+        let t = &self.theme;
+        let dialog = self.dialog.as_ref()?;
+        let fg = rgb(t.foreground);
+        let title = |s: String| text(s).size(15).font(BOLD).color(rgb(t.bright));
+        let small = |s: String| text(s).size(12).color(fg);
+        let btn = |label: &'static str, msg: Message, primary: bool| {
+            button(text(label).size(13))
+                .padding([8, 16])
+                .on_press(msg)
+                .style(move |_, status| button::Style {
+                    background: Some(if primary { rgb(t.accent) } else if matches!(status, button::Status::Hovered) {
+                        Color { a: 0.08, ..Color::WHITE }
+                    } else {
+                        Color::TRANSPARENT
+                    }.into()),
+                    text_color: if primary { rgb(t.background) } else { fg },
+                    border: Border { color: if primary { rgb(t.accent) } else { Color { a: 0.2, ..Color::WHITE } }, width: 1.0, radius: 6.0.into() },
+                    ..Default::default()
+                })
+        };
+        let buttons = |ok: &'static str| {
+            row![iced::widget::Space::new().width(Length::Fill), btn("Abbrechen", Message::DialogCancel, false), btn(ok, Message::DialogConfirm, true)]
+                .spacing(8)
+        };
+        let names = |paths: &[PathBuf]| {
+            let mut lines: Vec<String> = paths.iter().take(6).map(|p| {
+                let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if p.is_dir() { format!("· {n}/") } else { format!("· {n}") }
+            }).collect();
+            if paths.len() > 6 {
+                lines.push(format!("  und {} weitere", paths.len() - 6));
+            }
+            small(lines.join("\n"))
+        };
+
+        let content: Element<'_, Message> = match dialog {
+            Dialog::Confirm { kind, sources, target } => {
+                let what = if sources.len() == 1 { "1 Eintrag".to_string() } else { format!("{} Einträge", sources.len()) };
+                let mut c = column![title(format!("{what} {}", op_verb(*kind)))].spacing(14);
+                if let Some(target) = target {
+                    c = c.push(small(format!("nach {}", self.jumper.display(target))));
+                }
+                c = c.push(names(sources));
+                if *kind == OpKind::Delete {
+                    c = c.push(text("Kann nicht rückgängig gemacht werden.").size(12).color(rgb(t.red)));
+                }
+                let ok = match kind {
+                    OpKind::Copy => "Kopieren",
+                    OpKind::Move => "Verschieben",
+                    OpKind::Trash => "Papierkorb",
+                    OpKind::Delete => "Löschen",
+                };
+                c.push(buttons(ok)).into()
+            }
+            Dialog::NewDir { name, error } => {
+                let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                let mut c = column![
+                    title("Neuer Ordner".into()),
+                    small(format!("in {}", self.jumper.display(&self.panes[self.active].path))),
+                    field,
+                ]
+                .spacing(14);
+                if let Some(e) = error {
+                    c = c.push(text(e.clone()).size(12).color(rgb(t.red)));
+                }
+                c.push(buttons("Anlegen")).into()
+            }
+            Dialog::Running { kind, job } => {
+                let p = job.progress();
+                let frac = if p.total == 0 { 0.0 } else { p.done as f32 / p.total as f32 };
+                let amount = if matches!(kind, OpKind::Copy | OpKind::Move) {
+                    format!("{} von {}", human_size(p.done), human_size(p.total))
+                } else {
+                    format!("{} von {}", p.done, p.total)
+                };
+                column![
+                    title(format!("Wird {}", match kind {
+                        OpKind::Copy => "kopiert",
+                        OpKind::Move => "verschoben",
+                        OpKind::Trash => "in den Papierkorb gelegt",
+                        OpKind::Delete => "gelöscht",
+                    })),
+                    iced::widget::progress_bar(0.0..=1.0, frac).girth(6).style(move |_| iced::widget::progress_bar::Style {
+                        background: Color { a: 0.25, ..Color::BLACK }.into(),
+                        bar: rgb(t.accent).into(),
+                        border: Border::default().rounded(3),
+                    }),
+                    row![small(p.current), iced::widget::Space::new().width(Length::Fill), small(amount)],
+                    row![iced::widget::Space::new().width(Length::Fill), btn("Abbrechen", Message::DialogCancel, false)],
+                ]
+                .spacing(14)
+                .into()
+            }
+            Dialog::Report { problems } => {
+                let mut lines: Vec<String> = problems.iter().take(8).cloned().collect();
+                if problems.len() > 8 {
+                    lines.push(format!("und {} weitere", problems.len() - 8));
+                }
+                column![
+                    title("Erledigt, mit Hinweisen".into()),
+                    small(lines.join("\n")),
+                    row![iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)],
+                ]
+                .spacing(14)
+                .into()
+            }
+        };
+
+        let card = container(content)
+            .padding(22)
+            .width(480)
+        .style(move |_| container::Style {
+            background: Some(rgb(0x4a463f).into()),
+            border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
+            ..Default::default()
+        });
+        Some(
+            container(card)
+                .center(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Color { a: 0.6, ..Color::BLACK }.into()),
+                    ..Default::default()
+                })
+                .into(),
+        )
     }
 
     fn icon_button(&self, data: &'static str, label: &'static str, msg: Option<Message>) -> Element<'_, Message> {
@@ -540,10 +825,10 @@ impl Guppy {
             self.icon_button(icons::UP, "Übergeordneter Ordner (⌫)", Some(Message::Parent)),
             self.icon_button(icons::HOME, "Home", Some(Message::Home)),
             sep(),
-            self.icon_button(icons::NEW_DIR, "Neuer Ordner (F7) – folgt", None),
-            self.icon_button(icons::COPY, "Kopieren (F5) – folgt", None),
-            self.icon_button(icons::MOVE, "Verschieben (F6) – folgt", None),
-            self.icon_button(icons::DELETE, "Löschen (F8) – folgt", None),
+            self.icon_button(icons::NEW_DIR, "Neuer Ordner (F7)", Some(Message::NewDir)),
+            self.icon_button(icons::COPY, "Kopieren (F5)", Some(Message::Op(OpKind::Copy))),
+            self.icon_button(icons::MOVE, "Verschieben (F6)", Some(Message::Op(OpKind::Move))),
+            self.icon_button(icons::DELETE, "Papierkorb (F8 · Entf), endgültig mit Umschalt", Some(Message::Op(OpKind::Trash))),
             sep(),
             self.icon_button(icons::MARK, "Markieren (Ins)", Some(Message::ToggleMark)),
             self.icon_button(icons::SWAP, "Seite wechseln (Tab)", Some(Message::SwitchSide)),
