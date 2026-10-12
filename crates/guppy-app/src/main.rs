@@ -181,6 +181,8 @@ struct Guppy {
     width: f32,
     /// Zeitpunkt, ab dem die Vorschau geladen wird.
     preview_due: Option<std::time::Instant>,
+    /// Letzte Cursorbewegung, um Tastenwiederholung zu erkennen.
+    last_move: Option<std::time::Instant>,
 }
 
 impl Guppy {
@@ -205,6 +207,7 @@ impl Guppy {
             last_frame: None,
             width: 1200.0,
             preview_due: None,
+            last_move: None,
         };
         g.request_sizes(0);
         g.request_sizes(1);
@@ -665,6 +668,7 @@ impl Guppy {
             return Task::none();
         }
         const MARGIN: f32 = 2.0 * ROW_H;
+        let now = std::time::Instant::now();
         let p = &mut self.panes[self.active];
         // Gegen das laufende Ziel rechnen, sonst springt es bei Tastenwiederholung zurück.
         let base = p.scroll_target.unwrap_or(p.scroll_y);
@@ -675,8 +679,18 @@ impl Guppy {
         } else if top + ROW_H + margin > base + p.view_h {
             top + ROW_H + margin - p.view_h
         } else {
+            self.last_move = Some(now);
             return Task::none();
         };
+        // Tastenwiederholung: Liste läuft im Takt der Tasten mit, der Cursor steht still.
+        // Animiert nachzuziehen erzeugt hier ein Sägezahn-Zittern (Cursor springt, Liste holt auf).
+        let repeating = self.last_move.is_some_and(|t| now.duration_since(t) < Duration::from_millis(90));
+        self.last_move = Some(now);
+        if repeating {
+            p.scroll_target = None;
+            p.scroll_y = y;
+            return operation::scroll_to(p.id.clone(), AbsoluteOffset { x: None, y: Some(y) });
+        }
         p.scroll_target = Some(y);
         self.last_frame = None;
         Task::none()
