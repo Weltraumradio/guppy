@@ -179,6 +179,8 @@ struct Guppy {
     last_frame: Option<std::time::Instant>,
     /// Fensterbreite, für das anpassungsfähige Layout.
     width: f32,
+    /// Zeitpunkt, ab dem die Vorschau geladen wird.
+    preview_due: Option<std::time::Instant>,
 }
 
 impl Guppy {
@@ -202,6 +204,7 @@ impl Guppy {
             dialog: None,
             last_frame: None,
             width: 1200.0,
+            preview_due: None,
         };
         g.request_sizes(0);
         g.request_sizes(1);
@@ -249,7 +252,7 @@ impl Guppy {
         }
         // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
         let running = matches!(self.dialog, Some(Dialog::Running { .. }));
-        if self.sizes.busy() || self.jump_pending || running || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+        if self.sizes.busy() || self.jump_pending || running || self.preview_due.is_some() || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
             keys
@@ -287,6 +290,11 @@ impl Guppy {
                 self.poll_job();
                 return Task::none();
             }
+            Message::Tick if self.preview_due.is_some_and(|t| std::time::Instant::now() >= t) => {
+                self.preview_due = None;
+                self.refresh_preview();
+                return Task::none();
+            }
             Message::Tick if self.jump_pending => {
                 // Unterordner-Index wächst: Treffer auffrischen, Auswahl behalten.
                 // Nach dem Ende des Einlesens ein letztes Mal.
@@ -298,7 +306,7 @@ impl Guppy {
                 }
                 return Task::none();
             }
-            Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending => {
+            Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending && self.preview_due.is_none() => {
                 // Ein paar Takte warten, damit der letzte Stand gezeichnet ist.
                 self.shot_wait += 1;
                 if self.shot_wait < 4 {
@@ -327,12 +335,12 @@ impl Guppy {
             }
             Message::Scrolled(side, vp) => {
                 let p = &mut self.panes[side];
-                // Mausrad o. Ä. während der Animation: Nutzer hat Vorrang.
-                if p.scroll_target.is_some() && (vp.absolute_offset().y - p.scroll_y).abs() > 1.0 {
-                    p.scroll_target = None;
+                p.view_h = vp.bounds().height;
+                // Während der Animation meldet die Liste die Position eines früheren Bildes;
+                // maßgeblich ist dann die eigene.
+                if p.scroll_target.is_none() {
+                    p.scroll_y = vp.absolute_offset().y;
                 }
-                self.panes[side].scroll_y = vp.absolute_offset().y;
-                self.panes[side].view_h = vp.bounds().height;
                 return Task::none();
             }
             Message::Back => self.history(true),
@@ -357,7 +365,7 @@ impl Guppy {
                 return iced::exit();
             }
         }
-        self.refresh_preview();
+        self.schedule_preview();
         self.scroll_into_view()
     }
 
@@ -415,7 +423,7 @@ impl Guppy {
                 _ => return Task::none(),
             },
         }
-        self.refresh_preview();
+        self.schedule_preview();
         self.scroll_into_view()
     }
 
@@ -619,6 +627,17 @@ impl Guppy {
         p.cursor = p.cursor.min(len.saturating_sub(1));
     }
 
+    /// Vorschau erst laden, wenn der Cursor kurz ruht; beim Dauerscrollen kein Dateizugriff.
+    fn schedule_preview(&mut self) {
+        let same = match (self.current(), &self.preview) {
+            (Some(e), Some((p, _))) => e.path == *p,
+            _ => false,
+        };
+        if !same {
+            self.preview_due = Some(std::time::Instant::now() + Duration::from_millis(90));
+        }
+    }
+
     fn refresh_preview(&mut self) {
         let Some(e) = self.current() else {
             self.preview = None;
@@ -665,7 +684,7 @@ impl Guppy {
 
     /// Ein Animationsschritt: nähert sich dem Ziel exponentiell, unabhängig von der Bildrate.
     fn animate_scroll(&mut self, now: std::time::Instant) -> Task<Message> {
-        const TAU: f32 = 0.045; // Sekunden; kleiner = schneller
+        const TAU: f32 = 0.03; // Sekunden; kleiner = schneller
         let dt = self.last_frame.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
         self.last_frame = Some(now);
         let k = 1.0 - (-dt / TAU).exp();
@@ -673,6 +692,9 @@ impl Guppy {
         for p in &mut self.panes {
             let Some(target) = p.scroll_target else { continue };
             let mut y = p.scroll_y + (target - p.scroll_y) * k;
+            // Nie hinter dem Cursor herhinken: seine Zeile bleibt vollständig im Bild.
+            let top = p.cursor as f32 * ROW_H;
+            y = y.clamp((top + ROW_H - p.view_h).min(top), top);
             if (target - y).abs() < 0.5 {
                 y = target;
                 p.scroll_target = None;
@@ -1086,7 +1108,8 @@ impl Guppy {
     fn preview_view(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let content: Element<'_, Message> = match (self.current(), &self.preview) {
-            (Some(e), Some((_, body))) => {
+            (Some(e), Some((path, body))) => {
+                let body = if *path == e.path { body.as_str() } else { "" };
                 let kind = match e.class() {
                     FileClass::Dir => "ORDNER",
                     FileClass::Code => "CODE",
