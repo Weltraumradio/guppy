@@ -674,10 +674,12 @@ impl Guppy {
         let base = p.scroll_target.unwrap_or(p.scroll_y);
         let top = p.cursor as f32 * ROW_H;
         let margin = MARGIN.min(((p.view_h - ROW_H) / 2.0).max(0.0));
+        // Ziele auf ganze Zeilen runden, damit die Zeilen beim Scrollbeginn nicht
+        // um ein paar Pixel (Fensterhöhe modulo Zeilenhöhe) springen.
         let y = if top - margin < base {
-            (top - margin).max(0.0)
+            ((top - margin) / ROW_H).floor().max(0.0) * ROW_H
         } else if top + ROW_H + margin > base + p.view_h {
-            top + ROW_H + margin - p.view_h
+            ((top + ROW_H + margin - p.view_h) / ROW_H).ceil() * ROW_H
         } else {
             self.last_move = Some(now);
             return Task::none();
