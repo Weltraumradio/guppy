@@ -1,5 +1,6 @@
 mod icons;
 mod paper;
+mod watch;
 
 use paper::Paper;
 
@@ -38,6 +39,8 @@ fn main() -> iced::Result {
         .font(FONT_REGULAR)
         .font(FONT_BOLD)
         .default_font(FONT)
+        // Beim Schließen erst den Größen-Cache sichern.
+        .exit_on_close_request(false)
         .run()
 }
 
@@ -57,6 +60,9 @@ enum Message {
     /// Bildwechsel während weichen Scrollens.
     Frame(std::time::Instant),
     Resized(iced::Size),
+    /// Dateien in einem offenen Ordner oder das Theme haben sich geändert.
+    FsChanged(Vec<PathBuf>),
+    CloseRequested(iced::window::Id),
     Back,
     Forward,
     Parent,
@@ -96,6 +102,45 @@ fn op_verb(kind: OpKind) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    /// Ordner zuerst, dann alphabetisch.
+    Name,
+    /// Größte zuerst, Ordner und Dateien gemischt.
+    Size,
+    /// Neueste zuerst.
+    Date,
+}
+
+impl Sort {
+    fn next(self) -> Self {
+        match self {
+            Sort::Name => Sort::Size,
+            Sort::Size => Sort::Date,
+            Sort::Date => Sort::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "Name",
+            Sort::Size => "Größe ↓",
+            Sort::Date => "Datum ↓",
+        }
+    }
+}
+
+/// Größe eines Eintrags für Anzeige und Sortierung; Ordner aus der Größenberechnung.
+fn entry_size(e: &Entry, sizes: &DirSizes) -> Option<u64> {
+    if !e.is_dir() {
+        return Some(e.size);
+    }
+    match sizes.get(&e.path) {
+        Some(DirSize::Done(n) | DirSize::Cached(n)) => Some(n),
+        _ => None,
+    }
+}
+
 struct Pane {
     path: PathBuf,
     entries: Vec<Entry>,
@@ -106,6 +151,7 @@ struct Pane {
     forward: Vec<PathBuf>,
     /// Getippte Eingabe: Filter, oder Sprungziel wenn sie mit `~`/`/` beginnt.
     query: String,
+    sort: Sort,
     /// Bricht die Größenberechnung ab, wenn das Pane den Ordner verlässt.
     sizing: Cancel,
     scroll_y: f32,
@@ -125,6 +171,7 @@ impl Pane {
             back: Vec::new(),
             forward: Vec::new(),
             query: String::new(),
+            sort: Sort::Name,
             sizing: Cancel::default(),
             scroll_y: 0.0,
             view_h: 400.0,
@@ -149,13 +196,21 @@ impl Pane {
         }
     }
 
-    fn visible(&self, hidden: bool) -> Vec<&Entry> {
+    fn visible(&self, hidden: bool, sizes: &DirSizes) -> Vec<&Entry> {
         let f = if is_jump(&self.query) { String::new() } else { self.query.to_lowercase() };
-        self.entries
+        let mut v: Vec<&Entry> = self
+            .entries
             .iter()
             .filter(|e| hidden || !e.hidden)
             .filter(|e| f.is_empty() || e.name.to_lowercase().contains(&f))
-            .collect()
+            .collect();
+        // `entries` ist bereits nach Name sortiert; sort_by ist stabil.
+        match self.sort {
+            Sort::Name => {}
+            Sort::Size => v.sort_by_key(|e| std::cmp::Reverse(entry_size(e, sizes).unwrap_or(0))),
+            Sort::Date => v.sort_by_key(|e| std::cmp::Reverse(e.modified)),
+        }
+        v
     }
 }
 
@@ -197,7 +252,7 @@ impl Guppy {
             show_preview: true,
             preview: None,
             papers: [Paper::new(1), Paper::new(2), Paper::new(3)],
-            sizes: DirSizes::default(),
+            sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
             jumper: Jumper::load(),
             jump: Vec::new(),
             jump_cur: 0,
@@ -215,6 +270,9 @@ impl Guppy {
         // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
+        }
+        if std::env::var("GUPPY_SORT").as_deref() == Ok("size") {
+            g.panes.iter_mut().for_each(|p| p.sort = Sort::Size);
         }
         // `GUPPY_DIALOG=copy` öffnet den Kopierdialog, `=run` bestätigt ihn auch.
         if let Ok(d) = std::env::var("GUPPY_DIALOG") {
@@ -246,9 +304,17 @@ impl Guppy {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let mut dirs: Vec<PathBuf> = self.panes.iter().map(|p| p.path.clone()).collect();
+        if let Some(theme_dir) = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            // Das Theme-Verzeichnis selbst und sein Elternordner (Omarchy tauscht es beim Wechsel aus).
+            dirs.extend(theme_dir.parent().map(Path::to_path_buf));
+            dirs.push(theme_dir);
+        }
         let mut keys = Subscription::batch([
             keyboard::listen().map(Message::Key),
             iced::window::resize_events().map(|(_, size)| Message::Resized(size)),
+            iced::window::close_requests().map(Message::CloseRequested),
+            watch::changes(watch::Targets { dirs }).map(Message::FsChanged),
         ]);
         if self.panes.iter().any(|p| p.scroll_target.is_some()) {
             keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
@@ -264,7 +330,7 @@ impl Guppy {
 
     fn current(&self) -> Option<&Entry> {
         let p = &self.panes[self.active];
-        p.visible(self.show_hidden).get(p.cursor).copied()
+        p.visible(self.show_hidden, &self.sizes).get(p.cursor).copied()
     }
 
     /// Bei schmalem Fenster weicht zuerst die Vorschau, dann die Datumsspalte.
@@ -332,6 +398,14 @@ impl Guppy {
                 self.jump_selected();
             }
             Message::Frame(now) => return self.animate_scroll(now),
+            Message::CloseRequested(id) => {
+                let _ = self.sizes.save();
+                return iced::window::close(id);
+            }
+            Message::FsChanged(paths) => {
+                self.on_fs_changed(&paths);
+                return Task::none();
+            }
             Message::Resized(size) => {
                 self.width = size.width;
                 return Task::none();
@@ -376,7 +450,7 @@ impl Guppy {
     fn on_key(&mut self, key: Key, m: keyboard::Modifiers, typed: Option<&str>) -> Task<Message> {
         let jumping = self.jumping();
         let query_empty = self.panes[self.active].query.is_empty();
-        let len = if jumping { self.jump.len() } else { self.panes[self.active].visible(self.show_hidden).len() };
+        let len = if jumping { self.jump.len() } else { self.panes[self.active].visible(self.show_hidden, &self.sizes).len() };
         let page = (self.panes[self.active].view_h / ROW_H).max(1.0) as usize;
         let cur = if jumping { self.jump_cur } else { self.panes[self.active].cursor };
         let mut move_to = |i: usize| {
@@ -411,6 +485,14 @@ impl Guppy {
             Key::Named(Named::F8 | Named::Delete) if m.shift() => self.ask(OpKind::Delete),
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
+            Key::Character("s") if m.control() => {
+                // Cursor bleibt auf demselben Eintrag.
+                let path = self.current().map(|e| e.path.clone());
+                let p = &mut self.panes[self.active];
+                p.sort = p.sort.next();
+                let pos = self.panes[self.active].visible(self.show_hidden, &self.sizes).iter().position(|e| Some(&e.path) == path.as_ref());
+                self.panes[self.active].cursor = pos.unwrap_or(0);
+            }
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("r") if m.control() => {
                 let path = self.panes[self.active].path.clone();
@@ -433,7 +515,7 @@ impl Guppy {
     /// Ziel der Aktion: markierte sichtbare Einträge, sonst der unter dem Cursor.
     fn selection(&self) -> Vec<PathBuf> {
         let p = &self.panes[self.active];
-        let visible = p.visible(self.show_hidden);
+        let visible = p.visible(self.show_hidden, &self.sizes);
         let marked: Vec<PathBuf> = visible.iter().filter(|e| p.marked.contains(&e.path)).map(|e| e.path.clone()).collect();
         if !marked.is_empty() {
             return marked;
@@ -463,7 +545,7 @@ impl Guppy {
                 Ok(created) => {
                     self.reload(self.active);
                     let p = &self.panes[self.active];
-                    if let Some(i) = p.visible(self.show_hidden).iter().position(|e| e.path == created) {
+                    if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == created) {
                         self.panes[self.active].cursor = i;
                     }
                 }
@@ -515,13 +597,39 @@ impl Guppy {
         }
     }
 
+    fn on_fs_changed(&mut self, paths: &[PathBuf]) {
+        let theme_dir = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf));
+        if theme_dir.is_some_and(|t| paths.iter().any(|p| p.starts_with(&t) || t.starts_with(p))) {
+            self.theme = guppy_core::Theme::load();
+        }
+        for side in 0..2 {
+            let dir = self.panes[side].path.clone();
+            let touched: Vec<&PathBuf> = paths.iter().filter(|p| p.parent() == Some(dir.as_path()) || **p == dir).collect();
+            if touched.is_empty() {
+                continue;
+            }
+            for p in touched {
+                self.sizes.invalidate(p);
+            }
+            // Cursor auf demselben Eintrag halten.
+            let keep = (side == self.active).then(|| self.current().map(|e| e.path.clone())).flatten();
+            self.reload(side);
+            if let Some(keep) = keep {
+                let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == keep);
+                if let Some(i) = pos {
+                    self.panes[side].cursor = i;
+                }
+            }
+        }
+    }
+
     /// Liest den Ordner neu ein und behält den Cursor so gut es geht.
     fn reload(&mut self, side: usize) {
         let p = &mut self.panes[side];
         if let Ok(entries) = guppy_core::read_dir(&p.path) {
             p.entries = entries;
             p.marked.retain(|m| m.exists());
-            let len = p.visible(self.show_hidden).len();
+            let len = p.visible(self.show_hidden, &self.sizes).len();
             p.cursor = p.cursor.min(len.saturating_sub(1));
         }
         self.request_sizes(side);
@@ -604,7 +712,7 @@ impl Guppy {
         self.navigate(parent);
         // Cursor auf den Ordner setzen, aus dem wir kamen.
         let p = &self.panes[self.active];
-        if let Some(i) = p.visible(self.show_hidden).iter().position(|e| e.path == came_from) {
+        if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == came_from) {
             self.panes[self.active].cursor = i;
         }
     }
@@ -626,7 +734,7 @@ impl Guppy {
             p.marked.insert(path);
         }
         p.cursor += 1;
-        let len = p.visible(self.show_hidden).len();
+        let len = p.visible(self.show_hidden, &self.sizes).len();
         p.cursor = p.cursor.min(len.saturating_sub(1));
     }
 
@@ -969,7 +1077,8 @@ impl Guppy {
         let t = &self.theme;
         let p = &self.panes[side];
         let active = side == self.active;
-        let list = p.visible(self.show_hidden);
+        let list = p.visible(self.show_hidden, &self.sizes);
+        let max_size = list.iter().filter_map(|e| entry_size(e, &self.sizes)).max().unwrap_or(0);
 
         let rows = list.iter().enumerate().map(|(i, e)| {
             let marked = p.marked.contains(&e.path);
@@ -988,9 +1097,31 @@ impl Guppy {
             let (size, pending) = match (e.is_dir(), self.sizes.get(&e.path)) {
                 (false, _) => (human_size(e.size), false),
                 (true, Some(DirSize::Done(n))) => (human_size(n), false),
+                // Aus dem Cache des letzten Laufs, wird gerade überprüft.
+                (true, Some(DirSize::Cached(n))) => (format!("≈ {}", human_size(n)), true),
                 (true, Some(DirSize::Partial(n))) => (format!("… {}", human_size(n)), true),
                 (true, None) => ("…".to_string(), true),
             };
+            let share = (p.sort == Sort::Size).then(|| {
+                let frac = entry_size(e, &self.sizes).unwrap_or(0) as f32 / max_size.max(1) as f32;
+                let fill = (frac * 1000.0).round() as u16;
+                let bar_color = if on_cursor { Color { a: 0.55, ..rgb(t.background) } } else { Color { a: 0.55, ..rgb(t.accent) } };
+                let track = Color { a: if on_cursor { 0.15 } else { 0.12 }, ..Color::BLACK };
+                container(row![
+                    container(iced::widget::Space::new().height(4)).width(Length::FillPortion(fill.max(1))).style(move |_| container::Style {
+                        background: Some(if fill == 0 { track } else { bar_color }.into()),
+                        border: Border::default().rounded(2),
+                        ..Default::default()
+                    }),
+                    container(iced::widget::Space::new().height(4)).width(Length::FillPortion(1000 - fill.min(999))),
+                ])
+                .width(56)
+                .style(move |_| container::Style {
+                    background: Some(track.into()),
+                    border: Border::default().rounded(2),
+                    ..Default::default()
+                })
+            });
             let mut line = row![
                 text(dot).color(dot_color).size(12).width(14),
                 container(
@@ -1007,6 +1138,9 @@ impl Guppy {
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center);
+            if let Some(bar) = share {
+                line = line.push(bar);
+            }
             if self.show_dates() {
                 line = line.push(
                 text(e.modified.map(human_date).unwrap_or_default())
@@ -1041,10 +1175,18 @@ impl Guppy {
         });
 
         let header = container(
-            text(p.path.display().to_string())
-                .size(12)
-                .color(if active { rgb(t.accent) } else { rgb(t.foreground) })
-                .wrapping(iced::widget::text::Wrapping::None),
+            row![
+                container(
+                    text(p.path.display().to_string())
+                        .size(12)
+                        .color(if active { rgb(t.accent) } else { rgb(t.foreground) })
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .width(Length::Fill)
+                .clip(true),
+                text(p.sort.label()).size(11).color(rgb(t.foreground)),
+            ]
+            .spacing(10),
         )
         .padding([10, 10])
         .width(Length::Fill)
@@ -1054,6 +1196,30 @@ impl Guppy {
         });
 
         let list = scrollable(column(rows).padding([0, 6]))
+            .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(3)))
+            .style(move |_, status| {
+                let hot = matches!(status, scrollable::Status::Hovered { .. } | scrollable::Status::Dragged { .. });
+                let rail = scrollable::Rail {
+                    background: None,
+                    border: Border::default(),
+                    scroller: scrollable::Scroller {
+                        background: Color { a: if hot { 0.45 } else { 0.22 }, ..Color::WHITE }.into(),
+                        border: Border::default().rounded(2),
+                    },
+                };
+                scrollable::Style {
+                    container: container::Style::default(),
+                    vertical_rail: rail,
+                    horizontal_rail: rail,
+                    gap: None,
+                    auto_scroll: scrollable::AutoScroll {
+                        background: rgb(t.lighter_background).into(),
+                        border: Border::default().rounded(4),
+                        shadow: iced::Shadow::default(),
+                        icon: rgb(t.foreground),
+                    },
+                }
+            })
             .id(p.id.clone())
             .on_scroll(move |vp| Message::Scrolled(side, vp))
             .height(Length::Fill);
@@ -1134,13 +1300,35 @@ impl Guppy {
                     FileClass::Archive => "ARCHIV",
                     FileClass::Other => "DATEI",
                 };
-                column![
+                let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
+                // Bild erst zeigen, wenn der Cursor ruht (gleiche Entprellung wie beim Text).
+                let settled = self.preview.as_ref().is_some_and(|(p, _)| *p == e.path);
+                let picture: Option<Element<'_, Message>> = match ext.as_str() {
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" if settled => Some(
+                        iced::widget::image(iced::widget::image::Handle::from_path(&e.path))
+                            .content_fit(iced::ContentFit::Contain)
+                            .width(Length::Fill)
+                            .into(),
+                    ),
+                    "svg" if settled => Some(
+                        svg(svg::Handle::from_path(&e.path)).content_fit(iced::ContentFit::Contain).width(Length::Fill).into(),
+                    ),
+                    _ => None,
+                };
+                let mut c = column![
                     text(format!("VORSCHAU · {kind}")).size(11).color(rgb(t.foreground)),
                     text(&e.name).size(17).font(BOLD).color(rgb(t.bright)),
-                    scrollable(text(body).size(12).color(rgb(t.foreground)).line_height(1.6)).height(Length::Fill),
                 ]
-                .spacing(12)
-                .into()
+                .spacing(12);
+                match picture {
+                    Some(pic) => {
+                        c = c.push(container(pic).max_height(420)).push(small_meta(e, t));
+                    }
+                    None => {
+                        c = c.push(scrollable(text(body).size(12).color(rgb(t.foreground)).line_height(1.6)).height(Length::Fill));
+                    }
+                }
+                c.into()
             }
             _ => text("Leer").color(rgb(t.foreground)).into(),
         };
@@ -1152,7 +1340,7 @@ impl Guppy {
     fn statusbar(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let p = &self.panes[self.active];
-        let visible = p.visible(self.show_hidden);
+        let visible = p.visible(self.show_hidden, &self.sizes);
         let count = visible.len();
         let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
         // Summe der sichtbaren Einträge, sobald alle Ordnergrößen feststehen.
@@ -1255,4 +1443,9 @@ fn save_ppm(path: &std::ffi::OsStr, shot: &iced::window::Screenshot) {
     let mut out = format!("P6 {} {} 255\n", shot.size.width, shot.size.height).into_bytes();
     out.extend(shot.rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
     let _ = std::fs::write(path, out);
+}
+
+fn small_meta<'a>(e: &Entry, t: &guppy_core::Theme) -> Element<'a, Message> {
+    let date = e.modified.map(human_date).unwrap_or_default();
+    text(format!("{} · {date}", human_size(e.size))).size(12).color(rgb(t.foreground)).into()
 }

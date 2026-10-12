@@ -19,6 +19,8 @@ pub enum DirSize {
     Done(u64),
     /// Berechnung läuft, bisher gezählt.
     Partial(u64),
+    /// Wert aus dem letzten Programmlauf; wird im Hintergrund überprüft.
+    Cached(u64),
 }
 
 #[derive(Default)]
@@ -26,6 +28,9 @@ struct Inner {
     done: Mutex<HashMap<PathBuf, u64>>,
     running: Mutex<HashMap<PathBuf, Arc<AtomicU64>>>,
     pending: AtomicUsize,
+    /// Dauerhafter Cache: beim Start geladen, beim Beenden gespeichert.
+    cached: Mutex<HashMap<PathBuf, u64>>,
+    cache_file: Option<PathBuf>,
 }
 
 /// Teilbarer Größen-Speicher; `clone()` ist billig.
@@ -49,12 +54,62 @@ impl Cancel {
 }
 
 impl DirSizes {
+    /// Standardort des Caches, z. B. `~/.cache/guppy/sizes.tsv`.
+    pub fn default_cache_file() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("guppy/sizes.tsv"))
+    }
+
+    /// Mit dauerhaftem Cache in `file` (Zeilen `größe<TAB>pfad`).
+    pub fn with_cache(file: PathBuf) -> Self {
+        let cached = std::fs::read_to_string(&file)
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| {
+                        let (n, p) = l.split_once('\t')?;
+                        Some((PathBuf::from(p), n.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            inner: Arc::new(Inner { cached: Mutex::new(cached), cache_file: Some(file), ..Default::default() }),
+        }
+    }
+
+    /// Schreibt alle bekannten Größen in den Cache (atomar über eine Zwischendatei).
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(file) = &self.inner.cache_file else { return Ok(()) };
+        let mut all = self.inner.cached.lock().unwrap().clone();
+        all.extend(self.inner.done.lock().unwrap().iter().map(|(p, n)| (p.clone(), *n)));
+        let mut out = String::new();
+        for (p, n) in &all {
+            let p = p.to_string_lossy();
+            // Pfade mit Zeilenumbruch passen nicht ins Zeilenformat.
+            if !p.contains('\n') {
+                out.push_str(&format!("{n}\t{p}\n"));
+            }
+        }
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = file.with_extension("tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(tmp, file)
+    }
+
     pub fn get(&self, dir: &Path) -> Option<DirSize> {
         if let Some(&n) = self.inner.done.lock().unwrap().get(dir) {
             return Some(DirSize::Done(n));
         }
-        let running = self.inner.running.lock().unwrap();
-        running.get(dir).map(|acc| DirSize::Partial(acc.load(Ordering::Relaxed)))
+        if let Some(acc) = self.inner.running.lock().unwrap().get(dir) {
+            // Solange der Zwischenstand kleiner ist, zeigt der Cache den besseren Schätzwert.
+            let partial = acc.load(Ordering::Relaxed);
+            return match self.inner.cached.lock().unwrap().get(dir) {
+                Some(&n) if n > partial => Some(DirSize::Cached(n)),
+                _ => Some(DirSize::Partial(partial)),
+            };
+        }
+        self.inner.cached.lock().unwrap().get(dir).map(|&n| DirSize::Cached(n))
     }
 
     /// Läuft gerade mindestens eine Berechnung?
@@ -89,11 +144,9 @@ impl DirSizes {
 
     /// Vergisst alles unter `dir` und die Summen der übergeordneten Ordner.
     pub fn invalidate(&self, dir: &Path) {
-        self.inner
-            .done
-            .lock()
-            .unwrap()
-            .retain(|p, _| !p.starts_with(dir) && !dir.starts_with(p));
+        let keep = |p: &PathBuf, _: &mut u64| !p.starts_with(dir) && !dir.starts_with(p);
+        self.inner.done.lock().unwrap().retain(keep);
+        self.inner.cached.lock().unwrap().retain(keep);
     }
 
     fn walk(
@@ -143,6 +196,24 @@ impl DirSizes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_roundtrip() {
+        let file = std::env::temp_dir().join(format!("guppy-cache-{}.tsv", std::process::id()));
+        let root = std::env::temp_dir().join(format!("guppy-cdir-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("x"), [0u8; 42]).unwrap();
+
+        let sizes = DirSizes::with_cache(file.clone());
+        sizes.request(vec![root.clone()], Cancel::default());
+        while sizes.busy() {
+            std::thread::yield_now();
+        }
+        sizes.save().unwrap();
+        assert_eq!(DirSizes::with_cache(file.clone()).get(&root), Some(DirSize::Cached(42)));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(file).unwrap();
+    }
 
     #[test]
     fn sums_nested() {

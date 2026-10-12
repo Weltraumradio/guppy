@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/guppy-core", "crates/guppy-app"]
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
+panic = "abort"
