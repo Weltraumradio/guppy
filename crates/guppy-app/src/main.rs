@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::fs::human_size;
+use guppy_core::fs::{human_date, human_size};
 use guppy_core::ops::{self, Job, OpKind};
 use guppy_core::{Cancel, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
@@ -54,6 +54,9 @@ enum Message {
     Scrolled(usize, scrollable::Viewport),
     /// Ordnergrößen laufen noch: neu zeichnen.
     Tick,
+    /// Bildwechsel während weichen Scrollens.
+    Frame(std::time::Instant),
+    Resized(iced::Size),
     Back,
     Forward,
     Parent,
@@ -107,6 +110,8 @@ struct Pane {
     sizing: Cancel,
     scroll_y: f32,
     view_h: f32,
+    /// Ziel des weichen Scrollens; `None` = keine Animation.
+    scroll_target: Option<f32>,
     id: Id,
 }
 
@@ -123,6 +128,7 @@ impl Pane {
             sizing: Cancel::default(),
             scroll_y: 0.0,
             view_h: 400.0,
+            scroll_target: None,
             id: Id::new(id),
         };
         p.load(path);
@@ -137,6 +143,9 @@ impl Pane {
             self.cursor = 0;
             self.marked.clear();
             self.query.clear();
+            // Neuer Ordner beginnt oben, ohne Animation.
+            self.scroll_y = 0.0;
+            self.scroll_target = Some(0.0);
         }
     }
 
@@ -167,6 +176,9 @@ struct Guppy {
     /// Sprungtreffer müssen nach dem Einlesen noch aufgefrischt werden.
     jump_pending: bool,
     dialog: Option<Dialog>,
+    last_frame: Option<std::time::Instant>,
+    /// Fensterbreite, für das anpassungsfähige Layout.
+    width: f32,
 }
 
 impl Guppy {
@@ -188,6 +200,8 @@ impl Guppy {
             shot_wait: 0,
             jump_pending: false,
             dialog: None,
+            last_frame: None,
+            width: 1200.0,
         };
         g.request_sizes(0);
         g.request_sizes(1);
@@ -226,7 +240,13 @@ impl Guppy {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keys = keyboard::listen().map(Message::Key);
+        let mut keys = Subscription::batch([
+            keyboard::listen().map(Message::Key),
+            iced::window::resize_events().map(|(_, size)| Message::Resized(size)),
+        ]);
+        if self.panes.iter().any(|p| p.scroll_target.is_some()) {
+            keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
+        }
         // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
         let running = matches!(self.dialog, Some(Dialog::Running { .. }));
         if self.sizes.busy() || self.jump_pending || running || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
@@ -239,6 +259,15 @@ impl Guppy {
     fn current(&self) -> Option<&Entry> {
         let p = &self.panes[self.active];
         p.visible(self.show_hidden).get(p.cursor).copied()
+    }
+
+    /// Bei schmalem Fenster weicht zuerst die Vorschau, dann die Datumsspalte.
+    fn preview_visible(&self) -> bool {
+        self.show_preview && self.width >= 1100.0
+    }
+
+    fn show_dates(&self) -> bool {
+        self.width >= if self.preview_visible() { 1300.0 } else { 760.0 }
     }
 
     fn jumping(&self) -> bool {
@@ -291,7 +320,17 @@ impl Guppy {
                 self.jump_cur = i;
                 self.jump_selected();
             }
+            Message::Frame(now) => return self.animate_scroll(now),
+            Message::Resized(size) => {
+                self.width = size.width;
+                return Task::none();
+            }
             Message::Scrolled(side, vp) => {
+                let p = &mut self.panes[side];
+                // Mausrad o. Ä. während der Animation: Nutzer hat Vorrang.
+                if p.scroll_target.is_some() && (vp.absolute_offset().y - p.scroll_y).abs() > 1.0 {
+                    p.scroll_target = None;
+                }
                 self.panes[side].scroll_y = vp.absolute_offset().y;
                 self.panes[side].view_h = vp.bounds().height;
                 return Task::none();
@@ -601,20 +640,47 @@ impl Guppy {
         self.preview = Some((e.path.clone(), body));
     }
 
-    fn scroll_into_view(&self) -> Task<Message> {
+    /// Hält den Cursor sichtbar, mit zwei Zeilen Abstand zum Rand; gescrollt wird weich.
+    fn scroll_into_view(&mut self) -> Task<Message> {
         if self.jumping() {
             return Task::none();
         }
-        let p = &self.panes[self.active];
+        const MARGIN: f32 = 2.0 * ROW_H;
+        let p = &mut self.panes[self.active];
+        // Gegen das laufende Ziel rechnen, sonst springt es bei Tastenwiederholung zurück.
+        let base = p.scroll_target.unwrap_or(p.scroll_y);
         let top = p.cursor as f32 * ROW_H;
-        let y = if top < p.scroll_y {
-            top
-        } else if top + ROW_H > p.scroll_y + p.view_h {
-            top + ROW_H - p.view_h
+        let margin = MARGIN.min(((p.view_h - ROW_H) / 2.0).max(0.0));
+        let y = if top - margin < base {
+            (top - margin).max(0.0)
+        } else if top + ROW_H + margin > base + p.view_h {
+            top + ROW_H + margin - p.view_h
         } else {
             return Task::none();
         };
-        operation::scroll_to(p.id.clone(), AbsoluteOffset { x: None, y: Some(y) })
+        p.scroll_target = Some(y);
+        self.last_frame = None;
+        Task::none()
+    }
+
+    /// Ein Animationsschritt: nähert sich dem Ziel exponentiell, unabhängig von der Bildrate.
+    fn animate_scroll(&mut self, now: std::time::Instant) -> Task<Message> {
+        const TAU: f32 = 0.045; // Sekunden; kleiner = schneller
+        let dt = self.last_frame.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
+        self.last_frame = Some(now);
+        let k = 1.0 - (-dt / TAU).exp();
+        let mut tasks = Vec::new();
+        for p in &mut self.panes {
+            let Some(target) = p.scroll_target else { continue };
+            let mut y = p.scroll_y + (target - p.scroll_y) * k;
+            if (target - y).abs() < 0.5 {
+                y = target;
+                p.scroll_target = None;
+            }
+            p.scroll_y = y;
+            tasks.push(operation::scroll_to(p.id.clone(), AbsoluteOffset { x: None, y: Some(y) }));
+        }
+        Task::batch(tasks)
     }
 
     // ---------- Ansicht ----------
@@ -622,7 +688,7 @@ impl Guppy {
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let mut body = row![self.pane_view(0), self.pane_view(1)].spacing(22);
-        if self.show_preview {
+        if self.preview_visible() {
             body = body.push(self.preview_view());
         }
         let desk = container(body)
@@ -759,7 +825,7 @@ impl Guppy {
             .padding(22)
             .width(480)
         .style(move |_| container::Style {
-            background: Some(rgb(0x4a463f).into()),
+            background: Some(rgb(0x57534a).into()),
             border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
             ..Default::default()
         });
@@ -839,7 +905,9 @@ impl Guppy {
         .spacing(2)
         .align_y(iced::Alignment::Center);
         container(bar)
-            .padding([6, 10])
+            .padding([0, 10])
+            .height(46)
+            .center_y(46)
             .width(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(rgb(t.dark_background).into()),
@@ -885,7 +953,7 @@ impl Guppy {
                 (true, Some(DirSize::Partial(n))) => (format!("… {}", human_size(n)), true),
                 (true, None) => ("…".to_string(), true),
             };
-            let line = row![
+            let mut line = row![
                 text(dot).color(dot_color).size(12).width(14),
                 container(
                     text(name).color(fg).size(13).font(if e.is_dir() { BOLD } else { FONT })
@@ -895,10 +963,22 @@ impl Guppy {
                 .clip(true),
                 text(size)
                     .color(if on_cursor { fg } else if pending { rgb(t.light_foreground) } else { rgb(t.foreground) })
-                    .size(12),
+                    .size(12)
+                    .width(84)
+                    .align_x(iced::alignment::Horizontal::Right),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center);
+            if self.show_dates() {
+                line = line.push(
+                text(e.modified.map(human_date).unwrap_or_default())
+                    .color(if on_cursor { fg } else { rgb(t.foreground) })
+                    .size(12)
+                    .width(100)
+                    .align_x(iced::alignment::Horizontal::Right)
+
+                );
+            }
             let bg = if on_cursor {
                 Some(rgb(t.accent))
             } else if is_cur {
@@ -941,7 +1021,7 @@ impl Guppy {
             .height(Length::Fill);
 
         let body: Element<'_, Message> = if active && self.jumping() { self.jump_view() } else { list.into() };
-        let tone = if active { 0x4a463f } else { 0x423e38 };
+        let tone = if active { 0x57534a } else { 0x4f4b43 };
         self.sheet(column![header, body].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
             .width(Length::FillPortion(3))
             .into()
@@ -1025,7 +1105,7 @@ impl Guppy {
             }
             _ => text("Leer").color(rgb(t.foreground)).into(),
         };
-        self.sheet(container(content).padding(16).into(), &self.papers[2], 0x46423b, None)
+        self.sheet(container(content).padding(16).into(), &self.papers[2], 0x535047, None)
             .width(Length::FillPortion(2))
             .into()
     }
@@ -1076,7 +1156,7 @@ impl Guppy {
         let bar = row![
             search,
             iced::widget::Space::new().width(Length::Fill),
-            text(cur).size(12).color(rgb(t.foreground)),
+            text(cur).size(12).color(rgb(t.foreground)).wrapping(iced::widget::text::Wrapping::None),
             bar_sep(),
             text(format!("{count} Einträge")).size(12).color(dim),
             bar_sep(),
@@ -1099,7 +1179,9 @@ impl Guppy {
         .align_y(iced::Alignment::Center);
 
         container(bar)
-            .padding([6, 14])
+            .padding([0, 14])
+            .height(42)
+            .center_y(42)
             .width(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(rgb(t.dark_background).into()),

@@ -106,6 +106,20 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Kompaktes Änderungsdatum: `heute 21:17`, `12.10. 21:17` (dieses Jahr), sonst `12.10.2024`.
+pub fn human_date(t: SystemTime) -> String {
+    use chrono::{DateTime, Datelike, Local};
+    let t: DateTime<Local> = t.into();
+    let now = Local::now();
+    if t.date_naive() == now.date_naive() {
+        t.format("heute %H:%M").to_string()
+    } else if t.year() == now.year() {
+        t.format("%d.%m. %H:%M").to_string()
+    } else {
+        t.format("%d.%m.%Y").to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
