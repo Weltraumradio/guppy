@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/guppy-core", "crates/guppy-app"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
