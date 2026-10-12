@@ -72,7 +72,7 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
                 _ => EntryKind::File,
             };
             Entry {
-                hidden: name.starts_with('.'),
+                hidden: crate::platform::is_hidden(&name, meta.as_ref()),
                 size: meta.as_ref().map_or(0, |m| m.len()),
                 modified: meta.as_ref().and_then(|m| m.modified().ok()),
                 name,

@@ -97,7 +97,7 @@ impl Jumper {
                         let name = e.file_name();
                         let name = name.to_string_lossy();
                         // Versteckte Ordner und Build-Artefakte sind selten Sprungziele.
-                        let skip = name.starts_with('.') || matches!(&*name, "target" | "node_modules" | "__pycache__");
+                        let skip = crate::platform::is_hidden(&name, None) || matches!(&*name, "target" | "node_modules" | "__pycache__");
                         if !skip && e.file_type().is_ok_and(|t| t.is_dir()) {
                             next.push(e.path());
                         }

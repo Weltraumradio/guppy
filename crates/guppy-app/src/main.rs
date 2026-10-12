@@ -19,7 +19,10 @@ use iced::{Background, Border, Color, Element, Font, Length, Subscription, Task}
 const ROW_H: f32 = 26.0;
 const SHEET_RADIUS: f32 = 6.0;
 const JUMP_LIMIT: usize = 14;
-const FONT: Font = Font::with_name("JetBrainsMono Nerd Font");
+/// Eingebettet, damit Guppy auf jedem System gleich aussieht (Lizenz: fonts/OFL.txt).
+const FONT_REGULAR: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
+const FONT_BOLD: &[u8] = include_bytes!("../fonts/JetBrainsMono-Bold.ttf");
+const FONT: Font = Font::with_name("JetBrains Mono");
 const BOLD: Font = Font {
     weight: iced::font::Weight::Bold,
     ..FONT
@@ -31,6 +34,8 @@ fn main() -> iced::Result {
         .theme(Guppy::theme)
         .subscription(Guppy::subscription)
         .window_size((1200.0, 760.0))
+        .font(FONT_REGULAR)
+        .font(FONT_BOLD)
         .default_font(FONT)
         .run()
 }
@@ -61,9 +66,9 @@ enum Message {
     Shot(iced::window::Screenshot),
 }
 
-/// Beginnt die Eingabe mit `~` oder `/`, wird gesprungen statt gefiltert.
+/// Beginnt die Eingabe mit `~` (unter Unix auch `/`), wird gesprungen statt gefiltert.
 fn is_jump(query: &str) -> bool {
-    query.starts_with('~') || query.starts_with('/')
+    query.chars().next().is_some_and(guppy_core::platform::is_jump_prefix)
 }
 
 struct Pane {
@@ -414,7 +419,7 @@ impl Guppy {
             let path = e.path.clone();
             self.navigate(path);
         } else {
-            let _ = std::process::Command::new("xdg-open").arg(&e.path).spawn();
+            let _ = guppy_core::platform::open(&e.path);
         }
     }
 

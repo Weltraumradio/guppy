@@ -1,16 +1,17 @@
 //! Ordnergrößen: parallel berechnet, abbrechbar, Ergebnisse für alle Panes geteilt.
 //!
-//! Gezählt wird die nominelle Dateigröße (`st_size`). Hardlinks zählen pro
-//! angefragtem Ordner nur einmal, andere Dateisysteme (z. B. `/proc`, Mounts)
-//! werden nicht betreten.
+//! Gezählt wird die nominelle Dateigröße. Hardlinks zählen pro angefragtem
+//! Ordner nur einmal, andere Dateisysteme (z. B. `/proc`, Mounts) werden nicht
+//! betreten (siehe [`crate::platform`]).
 
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
+
+use crate::platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirSize {
@@ -77,7 +78,7 @@ impl DirSizes {
             todo.par_iter().for_each(|dir| {
                 let acc = Arc::new(AtomicU64::new(0));
                 me.inner.running.lock().unwrap().insert(dir.clone(), acc.clone());
-                let dev = std::fs::symlink_metadata(dir).map(|m| m.dev()).unwrap_or(0);
+                let dev = std::fs::symlink_metadata(dir).map(|m| platform::device(&m)).unwrap_or(0);
                 let links = Mutex::new(HashSet::new());
                 me.walk(dir, dev, &cancel, &links, &acc);
                 me.inner.running.lock().unwrap().remove(dir);
@@ -118,10 +119,10 @@ impl DirSizes {
             // DirEntry::metadata folgt keinen Symlinks.
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {
-                if m.dev() == dev {
+                if platform::device(&m) == dev {
                     subdirs.push(e.path());
                 }
-            } else if m.nlink() > 1 && !links.lock().unwrap().insert((m.dev(), m.ino())) {
+            } else if platform::hardlink_key(&m).is_some_and(|k| !links.lock().unwrap().insert(k)) {
                 // Hardlink schon gezählt.
             } else {
                 files += m.len();
@@ -149,6 +150,7 @@ mod tests {
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         std::fs::write(root.join("a/x"), [0u8; 100]).unwrap();
         std::fs::write(root.join("a/b/y"), [0u8; 50]).unwrap();
+        #[cfg(unix)]
         std::fs::hard_link(root.join("a/b/y"), root.join("a/b/y2")).unwrap();
 
         let sizes = DirSizes::default();

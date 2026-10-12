@@ -3,6 +3,7 @@
 pub mod du;
 pub mod fs;
 pub mod jump;
+pub mod platform;
 pub mod theme;
 
 pub use du::{Cancel, DirSize, DirSizes};
