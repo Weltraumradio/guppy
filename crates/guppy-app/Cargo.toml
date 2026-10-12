@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 guppy-core = { version = "0.1.0", path = "../guppy-core" }
-iced = { version = "0.14.0", features = ["svg", "canvas"] }
+iced = { version = "0.14.0", features = ["svg", "canvas", "smol"] }

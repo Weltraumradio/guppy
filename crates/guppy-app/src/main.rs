@@ -5,18 +5,20 @@ use paper::Paper;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use guppy_core::fs::human_size;
-use guppy_core::{Entry, FileClass};
+use guppy_core::{Cancel, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::{
-    Id, button, column, container, mouse_area, row, scrollable, svg, text, text_input,
+    Id, button, column, container, mouse_area, row, scrollable, svg, text,
 };
 use iced::{Background, Border, Color, Element, Font, Length, Subscription, Task};
 
 const ROW_H: f32 = 26.0;
 const SHEET_RADIUS: f32 = 6.0;
+const JUMP_LIMIT: usize = 14;
 const FONT: Font = Font::with_name("JetBrainsMono Nerd Font");
 const BOLD: Font = Font {
     weight: iced::font::Weight::Bold,
@@ -42,8 +44,10 @@ enum Message {
     Key(keyboard::Event),
     Select(usize, usize),
     Open(usize, usize),
+    JumpTo(usize),
     Scrolled(usize, scrollable::Viewport),
-    Filter(String),
+    /// Ordnergrößen laufen noch: neu zeichnen.
+    Tick,
     Back,
     Forward,
     Parent,
@@ -52,8 +56,14 @@ enum Message {
     SwitchSide,
     ToggleHidden,
     TogglePreview,
-    /// Entwickler-Hilfe: `GUPPY_SCREENSHOT=datei.ppm` speichert das erste Bild und beendet.
+    /// Entwickler-Hilfe: `GUPPY_SCREENSHOT=datei.ppm` speichert ein Bild, sobald die
+    /// Größen berechnet sind, und beendet.
     Shot(iced::window::Screenshot),
+}
+
+/// Beginnt die Eingabe mit `~` oder `/`, wird gesprungen statt gefiltert.
+fn is_jump(query: &str) -> bool {
+    query.starts_with('~') || query.starts_with('/')
 }
 
 struct Pane {
@@ -64,6 +74,10 @@ struct Pane {
     marked: HashSet<PathBuf>,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
+    /// Getippte Eingabe: Filter, oder Sprungziel wenn sie mit `~`/`/` beginnt.
+    query: String,
+    /// Bricht die Größenberechnung ab, wenn das Pane den Ordner verlässt.
+    sizing: Cancel,
     scroll_y: f32,
     view_h: f32,
     id: Id,
@@ -78,6 +92,8 @@ impl Pane {
             marked: HashSet::new(),
             back: Vec::new(),
             forward: Vec::new(),
+            query: String::new(),
+            sizing: Cancel::default(),
             scroll_y: 0.0,
             view_h: 400.0,
             id: Id::new(id),
@@ -93,11 +109,12 @@ impl Pane {
             self.path = path;
             self.cursor = 0;
             self.marked.clear();
+            self.query.clear();
         }
     }
 
-    fn visible(&self, filter: &str, hidden: bool) -> Vec<&Entry> {
-        let f = filter.to_lowercase();
+    fn visible(&self, hidden: bool) -> Vec<&Entry> {
+        let f = if is_jump(&self.query) { String::new() } else { self.query.to_lowercase() };
         self.entries
             .iter()
             .filter(|e| hidden || !e.hidden)
@@ -110,11 +127,18 @@ struct Guppy {
     theme: guppy_core::Theme,
     panes: [Pane; 2],
     active: usize,
-    filter: String,
     show_hidden: bool,
     show_preview: bool,
     preview: Option<(PathBuf, String)>,
     papers: [Paper; 3],
+    sizes: DirSizes,
+    jumper: Jumper,
+    /// Treffer im Sprungmodus und die gewählte Zeile.
+    jump: Vec<PathBuf>,
+    jump_cur: usize,
+    shot_wait: u8,
+    /// Sprungtreffer müssen nach dem Einlesen noch aufgefrischt werden.
+    jump_pending: bool,
 }
 
 impl Guppy {
@@ -125,21 +149,25 @@ impl Guppy {
             theme: guppy_core::Theme::load(),
             panes: [Pane::new(cwd, "pane-left"), Pane::new(home, "pane-right")],
             active: 0,
-            filter: String::new(),
             show_hidden: false,
             show_preview: true,
             preview: None,
             papers: [Paper::new(1), Paper::new(2), Paper::new(3)],
+            sizes: DirSizes::default(),
+            jumper: Jumper::load(),
+            jump: Vec::new(),
+            jump_cur: 0,
+            shot_wait: 0,
+            jump_pending: false,
         };
+        g.request_sizes(0);
+        g.request_sizes(1);
         g.refresh_preview();
-        let task = if std::env::var_os("GUPPY_SCREENSHOT").is_some() {
-            iced::window::latest()
-                .and_then(iced::window::screenshot)
-                .map(Message::Shot)
-        } else {
-            Task::none()
-        };
-        (g, task)
+        // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
+        if let Ok(q) = std::env::var("GUPPY_QUERY") {
+            g.set_query(q);
+        }
+        (g, Task::none())
     }
 
     fn title(&self) -> String {
@@ -162,20 +190,49 @@ impl Guppy {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().map(Message::Key)
+        let keys = keyboard::listen().map(Message::Key);
+        // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
+        if self.sizes.busy() || self.jump_pending || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+            Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
+        } else {
+            keys
+        }
     }
 
     fn current(&self) -> Option<&Entry> {
         let p = &self.panes[self.active];
-        p.visible(&self.filter, self.show_hidden).get(p.cursor).copied()
+        p.visible(self.show_hidden).get(p.cursor).copied()
+    }
+
+    fn jumping(&self) -> bool {
+        is_jump(&self.panes[self.active].query)
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                return self.on_key(key, modifiers);
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
+                return self.on_key(key, modifiers, text.as_deref());
             }
-            Message::Key(_) => {}
+            Message::Tick if self.jump_pending => {
+                // Unterordner-Index wächst: Treffer auffrischen, Auswahl behalten.
+                // Nach dem Ende des Einlesens ein letztes Mal.
+                self.jump_pending = self.jumper.indexing();
+                if self.jumping() {
+                    let cur = self.jump_cur;
+                    self.update_jump();
+                    self.jump_cur = cur.min(self.jump.len().saturating_sub(1));
+                }
+                return Task::none();
+            }
+            Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending => {
+                // Ein paar Takte warten, damit der letzte Stand gezeichnet ist.
+                self.shot_wait += 1;
+                if self.shot_wait < 4 {
+                    return Task::none();
+                }
+                return iced::window::latest().and_then(iced::window::screenshot).map(Message::Shot);
+            }
+            Message::Key(_) | Message::Tick => return Task::none(),
             Message::Select(side, i) => {
                 self.active = side;
                 self.panes[side].cursor = i;
@@ -185,14 +242,14 @@ impl Guppy {
                 self.panes[side].cursor = i;
                 self.open_current();
             }
+            Message::JumpTo(i) => {
+                self.jump_cur = i;
+                self.jump_selected();
+            }
             Message::Scrolled(side, vp) => {
                 self.panes[side].scroll_y = vp.absolute_offset().y;
                 self.panes[side].view_h = vp.bounds().height;
                 return Task::none();
-            }
-            Message::Filter(f) => {
-                self.filter = f;
-                self.panes[self.active].cursor = 0;
             }
             Message::Back => self.history(true),
             Message::Forward => self.history(false),
@@ -216,14 +273,17 @@ impl Guppy {
         self.scroll_into_view()
     }
 
-    fn on_key(&mut self, key: Key, m: keyboard::Modifiers) -> Task<Message> {
-        let len = {
-            let p = &self.panes[self.active];
-            p.visible(&self.filter, self.show_hidden).len()
-        };
+    /// Tastatur-Konzept: Buchstaben filtern das aktive Pane, `~`/`/` am Anfang springt.
+    fn on_key(&mut self, key: Key, m: keyboard::Modifiers, typed: Option<&str>) -> Task<Message> {
+        let jumping = self.jumping();
+        let query_empty = self.panes[self.active].query.is_empty();
+        let len = if jumping { self.jump.len() } else { self.panes[self.active].visible(self.show_hidden).len() };
         let page = (self.panes[self.active].view_h / ROW_H).max(1.0) as usize;
-        let cur = self.panes[self.active].cursor;
-        let mut move_to = |i: usize| self.panes[self.active].cursor = i.min(len.saturating_sub(1));
+        let cur = if jumping { self.jump_cur } else { self.panes[self.active].cursor };
+        let mut move_to = |i: usize| {
+            let i = i.min(len.saturating_sub(1));
+            if jumping { self.jump_cur = i } else { self.panes[self.active].cursor = i }
+        };
 
         match key.as_ref() {
             Key::Named(Named::ArrowDown) => move_to(cur + 1),
@@ -232,21 +292,85 @@ impl Guppy {
             Key::Named(Named::PageUp) => move_to(cur.saturating_sub(page)),
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
+            Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => self.open_current(),
-            Key::Named(Named::Backspace) => self.go_parent(),
-            Key::Named(Named::Tab) => self.active = 1 - self.active,
-            Key::Named(Named::Insert | Named::Space) => self.toggle_mark(),
-            Key::Named(Named::Escape) => {
-                self.filter.clear();
+            Key::Named(Named::Backspace) if !query_empty => {
+                let mut q = self.panes[self.active].query.clone();
+                q.pop();
+                self.set_query(q);
             }
+            Key::Named(Named::Backspace) => self.go_parent(),
+            Key::Named(Named::Escape) => self.set_query(String::new()),
+            Key::Named(Named::Tab) => self.active = 1 - self.active,
+            Key::Named(Named::Insert) => self.toggle_mark(),
+            Key::Named(Named::Space) if query_empty => self.toggle_mark(),
             Key::Named(Named::ArrowLeft) if m.alt() => self.history(true),
             Key::Named(Named::ArrowRight) if m.alt() => self.history(false),
-            Key::Character("/") => return operation::focus(Id::new("filter")),
+            Key::Character("g") if m.control() => self.set_query("~".into()),
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
-            _ => return Task::none(),
+            Key::Character("r") if m.control() => {
+                let path = self.panes[self.active].path.clone();
+                self.sizes.invalidate(&path);
+                self.request_sizes(self.active);
+            }
+            // Alles Druckbare ohne Strg/Alt landet in der Eingabe.
+            _ => match typed {
+                Some(t) if !m.control() && !m.alt() && !m.logo() && t.chars().all(|c| !c.is_control()) => {
+                    let q = format!("{}{t}", self.panes[self.active].query);
+                    self.set_query(q);
+                }
+                _ => return Task::none(),
+            },
         }
         self.refresh_preview();
         self.scroll_into_view()
+    }
+
+    fn set_query(&mut self, q: String) {
+        let entering_jump = is_jump(&q) && !self.jumping();
+        let p = &mut self.panes[self.active];
+        p.query = q;
+        p.cursor = 0;
+        if entering_jump {
+            self.jumper.index_nearby(&self.panes[self.active].path);
+            self.jump_pending = true;
+        }
+        if self.jumping() {
+            self.update_jump();
+        }
+    }
+
+    fn update_jump(&mut self) {
+        let q = &self.panes[self.active].query;
+        let pattern = &q[1..];
+        let mut hits = self.jumper.search(pattern, JUMP_LIMIT);
+        // Eingetippter Pfad, der existiert, steht ganz oben.
+        let typed = match q.strip_prefix('~') {
+            Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
+            None => PathBuf::from(q),
+        };
+        if q.len() > 1 && typed.is_dir() {
+            hits.retain(|h| *h != typed);
+            hits.insert(0, typed);
+            hits.truncate(JUMP_LIMIT);
+        }
+        self.jump = hits;
+        self.jump_cur = 0;
+    }
+
+    fn jump_selected(&mut self) {
+        if let Some(target) = self.jump.get(self.jump_cur).cloned() {
+            self.navigate(target);
+        }
+        self.jump.clear();
+    }
+
+    fn request_sizes(&mut self, side: usize) {
+        let p = &mut self.panes[side];
+        p.sizing.cancel();
+        p.sizing = Cancel::default();
+        let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
+        self.sizes.request(dirs, p.sizing.clone());
     }
 
     fn navigate(&mut self, path: PathBuf) {
@@ -256,7 +380,8 @@ impl Guppy {
         if p.path != old {
             p.back.push(old);
             p.forward.clear();
-            self.filter.clear();
+            self.jumper.visit(&self.panes[self.active].path);
+            self.request_sizes(self.active);
         }
     }
 
@@ -267,6 +392,7 @@ impl Guppy {
             let old = p.path.clone();
             p.load(t);
             if back { p.forward.push(old) } else { p.back.push(old) }
+            self.request_sizes(self.active);
         }
     }
 
@@ -277,7 +403,7 @@ impl Guppy {
         self.navigate(parent);
         // Cursor auf den Ordner setzen, aus dem wir kamen.
         let p = &self.panes[self.active];
-        if let Some(i) = p.visible(&self.filter, self.show_hidden).iter().position(|e| e.path == came_from) {
+        if let Some(i) = p.visible(self.show_hidden).iter().position(|e| e.path == came_from) {
             self.panes[self.active].cursor = i;
         }
     }
@@ -299,7 +425,7 @@ impl Guppy {
             p.marked.insert(path);
         }
         p.cursor += 1;
-        let len = p.visible(&self.filter, self.show_hidden).len();
+        let len = p.visible(self.show_hidden).len();
         p.cursor = p.cursor.min(len.saturating_sub(1));
     }
 
@@ -325,6 +451,9 @@ impl Guppy {
     }
 
     fn scroll_into_view(&self) -> Task<Message> {
+        if self.jumping() {
+            return Task::none();
+        }
         let p = &self.panes[self.active];
         let top = p.cursor as f32 * ROW_H;
         let y = if top < p.scroll_y {
@@ -444,7 +573,7 @@ impl Guppy {
         let t = &self.theme;
         let p = &self.panes[side];
         let active = side == self.active;
-        let list = p.visible(&self.filter, self.show_hidden);
+        let list = p.visible(self.show_hidden);
 
         let rows = list.iter().enumerate().map(|(i, e)| {
             let marked = p.marked.contains(&e.path);
@@ -460,7 +589,12 @@ impl Guppy {
             let dot = if marked { "●" } else if e.is_dir() { " " } else { "▪" };
             let dot_color = if on_cursor { fg } else if marked { rgb(t.marked) } else { self.class_color(e.class()) };
             let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
-            let size = if e.is_dir() { "DIR".to_string() } else { human_size(e.size) };
+            let (size, pending) = match (e.is_dir(), self.sizes.get(&e.path)) {
+                (false, _) => (human_size(e.size), false),
+                (true, Some(DirSize::Done(n))) => (human_size(n), false),
+                (true, Some(DirSize::Partial(n))) => (format!("… {}", human_size(n)), true),
+                (true, None) => ("…".to_string(), true),
+            };
             let line = row![
                 text(dot).color(dot_color).size(12).width(14),
                 container(
@@ -469,7 +603,9 @@ impl Guppy {
                 )
                 .width(Length::Fill)
                 .clip(true),
-                text(size).color(if on_cursor { fg } else { rgb(t.foreground) }).size(12),
+                text(size)
+                    .color(if on_cursor { fg } else if pending { rgb(t.light_foreground) } else { rgb(t.foreground) })
+                    .size(12),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center);
@@ -514,10 +650,42 @@ impl Guppy {
             .on_scroll(move |vp| Message::Scrolled(side, vp))
             .height(Length::Fill);
 
+        let body: Element<'_, Message> = if active && self.jumping() { self.jump_view() } else { list.into() };
         let tone = if active { 0x4a463f } else { 0x423e38 };
-        self.sheet(column![header, list].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
+        self.sheet(column![header, body].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
             .width(Length::FillPortion(3))
             .into()
+    }
+
+    /// Trefferliste im Sprungmodus, an Stelle der Dateiliste des aktiven Panes.
+    fn jump_view(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        let rows = self.jump.iter().enumerate().map(|(i, path)| {
+            let on = i == self.jump_cur;
+            let fg = if on { rgb(t.background) } else { rgb(t.bright) };
+            mouse_area(
+                container(text(self.jumper.display(path)).color(fg).size(13).wrapping(iced::widget::text::Wrapping::None))
+                    .clip(true)
+                    .width(Length::Fill)
+                    .height(ROW_H)
+                    .padding([0, 10])
+                    .center_y(ROW_H)
+                    .style(move |_| container::Style {
+                        background: on.then(|| rgb(t.accent).into()),
+                        border: Border::default().rounded(3),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Message::JumpTo(i))
+            .into()
+        });
+        let hint = if self.jump.is_empty() { "Keine Treffer" } else { "↑↓ wählen · Enter springen · Esc zurück" };
+        column![
+            container(text("SPRINGEN NACH").size(11).color(rgb(t.foreground))).padding([4, 16]),
+            column(rows).padding([0, 6]),
+            container(text(hint).size(11).color(rgb(t.foreground))).padding([8, 16]),
+        ]
+        .into()
     }
 
     /// Ein Blatt Papier: Korn-Struktur unter dem Inhalt, optional mit farbigem Rand.
@@ -575,7 +743,15 @@ impl Guppy {
     fn statusbar(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let p = &self.panes[self.active];
-        let count = p.visible(&self.filter, self.show_hidden).len();
+        let visible = p.visible(self.show_hidden);
+        let count = visible.len();
+        let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
+        // Summe der sichtbaren Einträge, sobald alle Ordnergrößen feststehen.
+        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir(), self.sizes.get(&e.path)) {
+            (false, _) => Some(acc + e.size),
+            (true, Some(DirSize::Done(n))) => Some(acc + n),
+            _ => None,
+        });
         let cur = self.current().map(|e| {
             if e.is_dir() { e.name.clone() } else { format!("{} · {}", e.name, human_size(e.size)) }
         }).unwrap_or_default();
@@ -587,20 +763,18 @@ impl Guppy {
             .width(15)
             .height(15)
             .style(move |_, _| svg::Style { color: Some(dim) });
-        let input = text_input("Filtern …", &self.filter)
-            .id(Id::new("filter"))
-            .on_input(Message::Filter)
-            .size(12)
-            .padding(0)
-            .style(move |_, _| text_input::Style {
-                background: Color::TRANSPARENT.into(),
-                border: Border::default(),
-                icon: dim,
-                placeholder: rgb(0x555555),
-                value: rgb(t.bright),
-                selection: rgb(t.selection),
-            });
-        let search = container(row![search_icon, input, text("/").size(11).color(rgb(0x555555))].spacing(8).align_y(iced::Alignment::Center))
+        let jumping = self.jumping();
+        let (mode, mode_color) = if jumping { ("SPRINGEN", rgb(t.accent)) } else { ("FILTER", dim) };
+        let query: Element<'_, Message> = if p.query.is_empty() {
+            text("tippen filtert · ~ springt").size(12).color(rgb(0x555555)).wrapping(iced::widget::text::Wrapping::None).into()
+        } else {
+            text(format!("{}▏", p.query)).size(12).color(rgb(t.bright)).into()
+        };
+        let input = row![text(mode).size(10).font(BOLD).color(mode_color), query]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+        let search = container(row![search_icon, input].spacing(8).align_y(iced::Alignment::Center))
             .width(300)
             .padding([6, 10])
             .style(move |_| container::Style {
@@ -616,7 +790,18 @@ impl Guppy {
             bar_sep(),
             text(format!("{count} Einträge")).size(12).color(dim),
             bar_sep(),
-            text(if marked > 0 { format!("{marked} markiert") } else { "nichts markiert".into() })
+            text(match total {
+                Some(n) => format!("Σ {}", human_size(n)),
+                None => "Σ …".into(),
+            })
+            .size(12)
+            .color(dim),
+            bar_sep(),
+            text(match (marked, hidden_marked) {
+                (0, _) => "nichts markiert".into(),
+                (m, 0) => format!("{m} markiert"),
+                (m, h) => format!("{m} markiert ({h} ausgeblendet)"),
+            })
                 .size(12)
                 .color(if marked > 0 { rgb(t.marked) } else { dim }),
         ]

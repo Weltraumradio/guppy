@@ -1,7 +1,11 @@
-//! Guppy-Kern: Dateisystem-Zugriff und Theme, ohne GUI-Abhängigkeiten.
+//! Guppy-Kern: Dateisystem-Zugriff, Ordnergrößen, Sprungziele und Theme, ohne GUI-Abhängigkeiten.
 
+pub mod du;
 pub mod fs;
+pub mod jump;
 pub mod theme;
 
+pub use du::{Cancel, DirSize, DirSizes};
 pub use fs::{Entry, EntryKind, FileClass, read_dir};
+pub use jump::Jumper;
 pub use theme::Theme;
