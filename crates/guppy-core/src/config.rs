@@ -13,6 +13,14 @@ pub struct Config {
     pub view: View,
     pub confirm: Confirm,
     pub network: Network,
+    pub edit: Edit,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Edit {
+    /// Editor command for F4; empty = automatic.
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -60,7 +68,7 @@ pub struct Network {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default() }
+        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default(), edit: Edit::default() }
     }
 }
 
@@ -109,6 +117,9 @@ delete = true      # permanent delete; turning this off is not recommended
 
 [network]
 threads = 4        # parallel accesses per folder-size computation on network drives
+
+[edit]
+command = ""       # editor for F4, e.g. "code" or "kitty -e nvim"; "" = automatic
 "#;
 
 impl SortBy {
@@ -134,6 +145,7 @@ impl Config {
                     "start" => "start",
                     "view" => "view",
                     "confirm" => "confirm",
+                    "edit" => "edit",
                     _ => "network",
                 };
                 out.push_str(line);
@@ -157,6 +169,7 @@ impl Config {
                 ("confirm", "trash") => self.confirm.trash.to_string(),
                 ("confirm", "delete") => self.confirm.delete.to_string(),
                 ("network", "threads") => self.network.threads.to_string(),
+                ("edit", "command") => q(&self.edit.command),
                 _ => rest.split('#').next().unwrap_or("").trim().to_string(),
             };
             let comment = rest.find('#').map(|i| &rest[i..]);
@@ -233,6 +246,7 @@ mod tests {
         c.view.sort = SortBy::Date;
         c.confirm.trash = false;
         c.network.threads = 7;
+        c.edit.command = "kitty -e nvim".into();
         assert_eq!(toml::from_str::<Config>(&c.to_toml()).unwrap(), c);
     }
 }

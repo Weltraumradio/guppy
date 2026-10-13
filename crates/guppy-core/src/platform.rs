@@ -58,6 +58,43 @@ pub fn open(path: &Path) -> io::Result<()> {
     cmd.arg(path).spawn().map(|_| ())
 }
 
+/// Opens a file for editing. `command` (from the settings) wins; otherwise
+/// Omarchy's editor launcher, `$VISUAL`, `$EDITOR` in a terminal, then the
+/// system default application.
+pub fn edit(path: &Path, command: &str) -> io::Result<()> {
+    use std::process::Command;
+    let spawn = |line: &str| -> io::Result<()> {
+        let mut parts = line.split_whitespace();
+        let program = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty editor command"))?;
+        Command::new(program).args(parts).arg(path).spawn().map(|_| ())
+    };
+    if !command.trim().is_empty() {
+        return spawn(command);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if spawn("omarchy-launch-editor").is_ok() {
+            return Ok(());
+        }
+        if let Ok(v) = std::env::var("VISUAL")
+            && spawn(&v).is_ok()
+        {
+            return Ok(());
+        }
+        // A terminal editor needs a terminal window around it.
+        if let Ok(e) = std::env::var("EDITOR")
+            && spawn(&format!("xdg-terminal-exec {e}")).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if Command::new("open").arg("-t").arg(path).spawn().is_ok() {
+        return Ok(());
+    }
+    open(path)
+}
+
 /// Characters that switch input into jump mode.
 /// Only `~` on Windows, since `/` doesn't start a path there.
 pub fn is_jump_prefix(c: char) -> bool {

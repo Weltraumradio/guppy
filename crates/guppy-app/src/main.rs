@@ -76,6 +76,7 @@ enum Message {
     DialogCancel,
     ToggleHidden,
     OpenSettings,
+    Viewed(PathBuf, ViewBody),
     /// Click on a settings row: select it and change it one step.
     SettingClick(usize),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
@@ -92,12 +93,73 @@ fn is_jump(query: &str) -> bool {
 enum Dialog {
     Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
     NewDir { name: String, error: Option<String> },
+    Rename { from: PathBuf, name: String, error: Option<String> },
+    /// Viewer (F3) for the file under the cursor.
+    View { path: PathBuf, body: ViewBody },
     Running { kind: OpKind, job: Job },
     Report { title: &'static str, problems: Vec<String> },
     /// Quick help listing all keys (F1).
     Help,
-    /// Settings (F9): selected row, and the text being typed for path rows.
+    /// Settings (F12): selected row, and the text being typed for path rows.
     Settings { row: usize, edit: Option<String> },
+}
+
+/// What the viewer shows.
+#[derive(Debug, Clone)]
+enum ViewBody {
+    Loading,
+    Text { text: String, truncated: bool },
+    Image,
+    Svg,
+    /// Folder: its entries, one per line.
+    Dir(String),
+    /// Not displayable; a short description instead.
+    Other(String),
+}
+
+/// The viewer shows at most this much of a text file.
+const VIEW_MAX: usize = 512 * 1024;
+
+fn view_id() -> Id {
+    Id::new("viewer")
+}
+
+/// Reads what the viewer shows; runs off the UI thread (slow drives, big files).
+fn load_view(path: &Path) -> ViewBody {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return ViewBody::Other(e.to_string()),
+    };
+    if meta.is_dir() {
+        return match guppy_core::read_dir(path) {
+            Ok(list) => ViewBody::Dir(
+                list.iter().map(|c| if c.is_dir() { format!("{}/", c.name) } else { format!("{:<40} {:>10}", c.name, human_size(c.size)) }).collect::<Vec<_>>().join("\n"),
+            ),
+            Err(e) => ViewBody::Other(e.to_string()),
+        };
+    }
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => return ViewBody::Image,
+        "svg" => return ViewBody::Svg,
+        _ => {}
+    }
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| f.take(VIEW_MAX as u64).read_to_end(&mut buf));
+    if let Err(e) = read {
+        return ViewBody::Other(e.to_string());
+    }
+    // NUL bytes in the first few KB: treat as binary.
+    if buf.iter().take(8192).any(|&b| b == 0) {
+        return ViewBody::Other(format!("Binary file · {}", human_size(meta.len())));
+    }
+    let text = match String::from_utf8(buf) {
+        Ok(s) => s,
+        // Cut-off multi-byte character at the end of the buffer.
+        Err(e) => String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to().max(e.as_bytes().len().saturating_sub(4))]).into_owned(),
+    };
+    ViewBody::Text { text: text.replace('\t', "    "), truncated: meta.len() as usize > VIEW_MAX }
 }
 
 /// Rows of the settings overlay, in display order: (section, label).
@@ -176,6 +238,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Files", &[
         ("Insert", "mark and advance"),
         ("Space", "mark (when search is empty)"),
+        ("F2", "rename"),
+        ("F3", "view"),
+        ("F4", "edit"),
         ("F5", "copy to other pane"),
         ("F6", "move to other pane"),
         ("F7", "new folder"),
@@ -184,7 +249,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("View", &[
         ("F1", "this help"),
-        ("F9", "settings (also Ctrl+Comma)"),
+        ("F12", "settings (also Ctrl+Comma)"),
         ("Ctrl+H", "hidden files"),
         ("Ctrl+S", "sort: name, size, date"),
         ("Ctrl+R", "recompute folder sizes"),
@@ -422,6 +487,14 @@ impl Guppy {
         }
         // `GUPPY_DIALOG=copy` opens the copy dialog, `=run` also confirms it.
         if let Ok(d) = std::env::var("GUPPY_DIALOG") {
+            if d == "view" {
+                let task = g.open_view();
+                return (g, task);
+            }
+            if d == "rename" {
+                g.start_rename();
+                return (g, Task::none());
+            }
             if d == "settings" {
                 g.dialog = Some(Dialog::Settings { row: 2, edit: None });
                 return (g, Task::none());
@@ -501,6 +574,9 @@ impl Guppy {
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.dialog.is_some() => {
+                if matches!(self.dialog, Some(Dialog::View { .. })) {
+                    return self.on_view_key(key);
+                }
                 self.on_dialog_key(key, text.as_deref());
                 return Task::none();
             }
@@ -582,6 +658,13 @@ impl Guppy {
             Message::DialogConfirm => self.confirm_dialog(),
             Message::DialogCancel => self.cancel_dialog(),
             Message::OpenSettings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
+            Message::Viewed(path, body) => {
+                if let Some(Dialog::View { path: p, body: b }) = &mut self.dialog
+                    && *p == path
+                {
+                    *b = body;
+                }
+            }
             Message::SettingClick(row) => {
                 if let Some(Dialog::Settings { row: sel, edit }) = &mut self.dialog {
                     *sel = row;
@@ -623,7 +706,10 @@ impl Guppy {
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
             Key::Named(Named::F1) => self.dialog = Some(Dialog::Help),
-            Key::Named(Named::F9) => return self.update(Message::OpenSettings),
+            Key::Named(Named::F2) => self.start_rename(),
+            Key::Named(Named::F3) => return self.open_view(),
+            Key::Named(Named::F4) => self.edit_current(),
+            Key::Named(Named::F12) => return self.update(Message::OpenSettings),
             Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => self.open_current(),
@@ -747,7 +833,7 @@ impl Guppy {
             Key::Named(Named::End) => *row = SETTINGS.len() - 1,
             Key::Named(Named::Enter | Named::Space) | Key::Named(Named::ArrowRight) => self.settings_activate(1),
             Key::Named(Named::ArrowLeft) => self.settings_activate(-1),
-            Key::Named(Named::Escape | Named::F9) => self.dialog = None,
+            Key::Named(Named::Escape | Named::F12) => self.dialog = None,
             // On a start-folder row, "." takes the folder currently shown in that pane.
             Key::Character(".") if setting_is_text(*row) => {
                 let row = *row;
@@ -818,6 +904,17 @@ impl Guppy {
             },
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
+            Some(d @ Dialog::View { .. }) => self.dialog = Some(d),
+            Some(Dialog::Rename { from, name, .. }) => match ops::rename(&from, name.trim()) {
+                Ok(to) => {
+                    self.reload(self.active);
+                    let p = &self.panes[self.active];
+                    if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == to) {
+                        self.panes[self.active].cursor = i;
+                    }
+                }
+                Err(e) => self.dialog = Some(Dialog::Rename { from, name, error: Some(e.to_string()) }),
+            },
             Some(Dialog::Report { .. } | Dialog::Help) | None => {}
         }
     }
@@ -840,7 +937,7 @@ impl Guppy {
             Key::Named(Named::Escape) => self.cancel_dialog(),
             Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help)) => self.dialog = None,
             _ => {
-                if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
+                if let Some(Dialog::NewDir { name, error } | Dialog::Rename { name, error, .. }) = &mut self.dialog {
                     match (key.as_ref(), typed) {
                         (Key::Named(Named::Backspace), _) => {
                             name.pop();
@@ -852,6 +949,64 @@ impl Guppy {
                 }
             }
         }
+    }
+
+    fn start_rename(&mut self) {
+        if let Some(e) = self.current() {
+            self.dialog = Some(Dialog::Rename { from: e.path.clone(), name: e.name.clone(), error: None });
+        }
+    }
+
+    fn edit_current(&mut self) {
+        let Some(e) = self.current() else { return };
+        if e.is_dir() {
+            return;
+        }
+        if let Err(err) = guppy_core::platform::edit(&e.path, &self.config.edit.command) {
+            self.dialog = Some(Dialog::Report { title: "Editor not started", problems: vec![err.to_string()] });
+        }
+    }
+
+    /// Opens the viewer for the entry under the cursor and loads it in the background.
+    fn open_view(&mut self) -> Task<Message> {
+        let Some(path) = self.current().map(|e| e.path.clone()) else { return Task::none() };
+        self.dialog = Some(Dialog::View { path: path.clone(), body: ViewBody::Loading });
+        Task::batch([
+            operation::scroll_to(view_id(), AbsoluteOffset { x: None, y: Some(0.0) }),
+            Task::perform(
+                async move {
+                    let p = path.clone();
+                    (path, smol::unblock(move || load_view(&p)).await)
+                },
+                |(p, b)| Message::Viewed(p, b),
+            ),
+        ])
+    }
+
+    fn on_view_key(&mut self, key: Key) -> Task<Message> {
+        let line = 18.0;
+        let page = self.panes[self.active].view_h.max(200.0);
+        let by = |dy: f32| operation::scroll_by(view_id(), AbsoluteOffset { x: 0.0, y: dy });
+        match key.as_ref() {
+            Key::Named(Named::Escape | Named::F3 | Named::Enter) => self.dialog = None,
+            Key::Named(Named::ArrowDown) => return by(3.0 * line),
+            Key::Named(Named::ArrowUp) => return by(-3.0 * line),
+            Key::Named(Named::PageDown | Named::Space) => return by(page),
+            Key::Named(Named::PageUp) => return by(-page),
+            Key::Named(Named::Home) => return operation::scroll_to(view_id(), AbsoluteOffset { x: None, y: Some(0.0) }),
+            Key::Named(Named::End) => return operation::scroll_to(view_id(), AbsoluteOffset { x: None, y: Some(f32::MAX) }),
+            // Previous / next entry of the pane, like flipping through a folder.
+            Key::Named(dir @ (Named::ArrowLeft | Named::ArrowRight)) => {
+                let len = self.panes[self.active].visible(self.show_hidden, &self.sizes).len();
+                let p = &mut self.panes[self.active];
+                p.cursor = if dir == Named::ArrowRight { (p.cursor + 1).min(len.saturating_sub(1)) } else { p.cursor.saturating_sub(1) };
+                let scroll = self.scroll_into_view();
+                return Task::batch([self.open_view(), scroll]);
+            }
+            Key::Named(Named::F4) => self.edit_current(),
+            _ => {}
+        }
+        Task::none()
     }
 
     fn poll_job(&mut self) {
@@ -1210,6 +1365,60 @@ impl Guppy {
                 };
                 c.push(buttons(ok)).into()
             }
+            Dialog::Rename { from, name, error } => {
+                let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                let old = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut c = column![title("Rename".into()), small(old), field].spacing(14);
+                if let Some(e) = error {
+                    c = c.push(text(e.clone()).size(12).color(rgb(t.red)));
+                }
+                c.push(buttons("Rename")).into()
+            }
+            Dialog::View { path, body } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                let meta = std::fs::symlink_metadata(path).ok();
+                let info = match &meta {
+                    Some(m) if m.is_dir() => "folder".to_string(),
+                    Some(m) => {
+                        let date = m.modified().ok().map(|t| human_date(t.into())).unwrap_or_default();
+                        format!("{} · {date}", human_size(m.len()))
+                    }
+                    None => String::new(),
+                };
+                let mono = |s: String| text(s).size(12).font(FONT).color(rgb(t.bright));
+                let content: Element<'_, Message> = match body {
+                    ViewBody::Loading => small("loading …".into()).into(),
+                    ViewBody::Text { text: s, truncated } => {
+                        let mut c = column![mono(s.clone())];
+                        if *truncated {
+                            c = c.push(small(format!("… only the first {} are shown", human_size(VIEW_MAX as u64))));
+                        }
+                        c.into()
+                    }
+                    ViewBody::Dir(s) => mono(s.clone()).into(),
+                    ViewBody::Image => container(iced::widget::image(iced::widget::image::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown))
+                        .center_x(Length::Fill)
+                        .into(),
+                    ViewBody::Svg => container(svg(svg::Handle::from_path(path)).width(Length::Shrink).height(Length::Shrink))
+                        .center_x(Length::Fill)
+                        .into(),
+                    ViewBody::Other(s) => small(s.clone()).into(),
+                };
+                column![
+                    row![title(name), iced::widget::Space::new().width(Length::Fill), small(info)].align_y(iced::Alignment::Center).spacing(12),
+                    scrollable(content).id(view_id()).height(Length::Fill).width(Length::Fill),
+                    small("↑↓ PgUp PgDn scroll · ←→ previous / next · F4 edit · Esc closes".into()),
+                ]
+                .spacing(14)
+                .into()
+            }
             Dialog::NewDir { name, error } => {
                 let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
                     .padding([8, 10])
@@ -1353,13 +1562,17 @@ impl Guppy {
             }
         };
 
+        let viewer = matches!(dialog, Dialog::View { .. });
         let card = container(content)
             .padding(22)
             .width(match dialog {
-                Dialog::Help => 760,
-                Dialog::Settings { .. } => 560,
-                _ => 480,
+                Dialog::View { .. } => Length::Fill,
+                Dialog::Help => Length::Fixed(760.0),
+                Dialog::Settings { .. } => Length::Fixed(560.0),
+                _ => Length::Fixed(480.0),
             })
+            .height(if viewer { Length::Fill } else { Length::Shrink })
+            .max_width(1400)
         .style(move |_| container::Style {
             background: Some(rgb(0x57534a).into()),
             border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
@@ -1368,6 +1581,7 @@ impl Guppy {
         Some(
             container(card)
                 .center(Length::Fill)
+                .padding(if viewer { 32 } else { 0 })
                 .style(|_| container::Style {
                     background: Some(Color { a: 0.6, ..Color::BLACK }.into()),
                     ..Default::default()
@@ -1436,7 +1650,7 @@ impl Guppy {
             self.icon_button(icons::SWAP, "Switch side (Tab)", Some(Message::SwitchSide)),
             iced::widget::Space::new().width(Length::Fill),
             self.icon_button(icons::HIDDEN, "Hidden files (Ctrl H)", Some(Message::ToggleHidden)),
-            self.icon_button(icons::SETTINGS, "Settings (F9)", Some(Message::OpenSettings)),
+            self.icon_button(icons::SETTINGS, "Settings (F12)", Some(Message::OpenSettings)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);

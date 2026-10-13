@@ -127,6 +127,24 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
+/// Renames `from` within its folder; refuses to overwrite an existing entry.
+pub fn rename(from: &Path, name: &str) -> io::Result<PathBuf> {
+    if name.is_empty() || name.contains(std::path::MAIN_SEPARATOR) || name == "." || name == ".." {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid name"));
+    }
+    let to = from.with_file_name(name);
+    if to == from {
+        return Ok(to);
+    }
+    // Only a change of case may hit "itself" on case-insensitive file systems.
+    let same_entry = to.to_string_lossy().to_lowercase() == from.to_string_lossy().to_lowercase();
+    if to.symlink_metadata().is_ok() && !same_entry {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file with that name already exists"));
+    }
+    std::fs::rename(from, &to)?;
+    Ok(to)
+}
+
 /// Creates a new directory; errors (e.g. already exists) go to the caller.
 pub fn make_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
     if name.is_empty() || name.contains(std::path::MAIN_SEPARATOR) {
@@ -231,6 +249,12 @@ mod tests {
 
         assert!(make_dir(&a, "new").is_ok());
         assert!(make_dir(&a, "new").is_err());
+
+        let renamed = rename(&a.join("new"), "renamed").unwrap();
+        assert!(renamed.is_dir() && !a.join("new").exists());
+        std::fs::create_dir(a.join("new")).unwrap();
+        assert!(rename(&a.join("new"), "renamed").is_err());
+        std::fs::remove_dir(&renamed).unwrap();
 
         wait(&start(OpKind::Delete, vec![b.join("sub"), a.join("new")], None));
         assert!(!b.join("sub").exists() && !a.join("new").exists());
