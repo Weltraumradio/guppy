@@ -83,6 +83,8 @@ enum Message {
     EditAction(text_editor::Action),
     EditSave,
     EditClose,
+    /// Clipboard text for the text field that has the keyboard.
+    Paste(Option<String>),
     /// Click on a settings row: select it and change it one step.
     SettingClick(usize),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
@@ -153,6 +155,20 @@ enum ViewBody {
 const VIEW_MAX: usize = 512 * 1024;
 /// Binary files: dumped up to this size (16 bytes per line).
 const HEX_MAX: usize = 64 * 1024;
+
+/// Ctrl+C / Ctrl+X / Ctrl+V and Shift+Insert, as 'c', 'x', 'v'.
+fn clip_key(key: &Key, m: keyboard::Modifiers) -> Option<char> {
+    match key.as_ref() {
+        Key::Character(c) if m.command() && !m.shift() && !m.alt() => match c.to_lowercase().as_str() {
+            "c" => Some('c'),
+            "x" => Some('x'),
+            "v" => Some('v'),
+            _ => None,
+        },
+        Key::Named(Named::Insert) if m.shift() => Some('v'),
+        _ => None,
+    }
+}
 
 fn editor_id() -> Id {
     Id::new("editor")
@@ -650,6 +666,41 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            // Copy / cut / paste in every one-line text field.
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if clip_key(&key, modifiers).is_some() && self.field_mut().is_some() =>
+            {
+                let op = clip_key(&key, modifiers).expect("checked above");
+                if op == 'v' {
+                    return iced::clipboard::read().map(Message::Paste);
+                }
+                let field = self.field_mut().expect("checked above");
+                let copied = if op == 'x' { std::mem::take(field) } else { field.clone() };
+                if let Some(r) = &mut self.rename {
+                    r.caret = r.caret.min(r.name.chars().count());
+                }
+                // Empty field: leave the clipboard alone.
+                if copied.is_empty() {
+                    return Task::none();
+                }
+                return iced::clipboard::write(copied);
+            }
+            Message::Paste(Some(clip)) => {
+                // One-line fields: newlines become spaces.
+                let clip = clip.trim_end_matches(['\n', '\r']).replace(['\n', '\r'], " ");
+                if let Some(r) = &mut self.rename {
+                    let b = r.byte(r.caret);
+                    r.name.insert_str(b, &clip);
+                    r.caret += clip.chars().count();
+                    r.error = None;
+                } else if self.dialog.is_none() {
+                    let q = format!("{}{clip}", self.panes[self.active].query);
+                    self.set_query(q);
+                } else if let Some(field) = self.field_mut() {
+                    field.push_str(&clip);
+                }
+            }
+            Message::Paste(None) => {}
             Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.rename.is_some() => {
                 self.on_rename_key(key, text.as_deref());
                 return Task::none();
@@ -1086,6 +1137,19 @@ impl Guppy {
             _ => e.name.chars().count(),
         };
         self.rename = Some(Rename { side: self.active, from: e.path.clone(), name: e.name.clone(), caret: stem, error: None });
+    }
+
+    /// The one-line text field that currently has the keyboard, if any.
+    fn field_mut(&mut self) -> Option<&mut String> {
+        if let Some(r) = &mut self.rename {
+            return Some(&mut r.name);
+        }
+        match &mut self.dialog {
+            None => Some(&mut self.panes[self.active].query),
+            Some(Dialog::NewDir { name, .. }) => Some(name),
+            Some(Dialog::Settings { edit: Some(text), .. }) => Some(text),
+            _ => None,
+        }
     }
 
     fn on_rename_key(&mut self, key: Key, typed: Option<&str>) {
