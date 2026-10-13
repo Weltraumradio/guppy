@@ -23,5 +23,4 @@ Future ideas (not built yet):
 - Multi-rename with patterns like [N]_[C].[E] and live preview
 - Git status in the file list
 - Drag & drop to and from other apps (Wayland)
-- Startup-time / memory benchmark in the README
 - Nested archives, writing into archives, image preview inside archives

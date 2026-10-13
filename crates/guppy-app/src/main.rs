@@ -37,7 +37,11 @@ const BOLD: Font = Font {
     ..FONT
 };
 
+/// Process start, for `GUPPY_BENCH`.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() -> iced::Result {
+    START.get_or_init(std::time::Instant::now);
     iced::application(Guppy::new, Guppy::update, Guppy::view)
         .title(Guppy::title)
         .theme(Guppy::theme)
@@ -1072,7 +1076,10 @@ impl Guppy {
                 self.jump_cur = i;
                 self.jump_selected();
             }
-            Message::Frame(now) => return self.animate_scroll(now),
+            Message::Frame(now) => {
+                bench_report();
+                return self.animate_scroll(now);
+            }
             Message::CloseRequested(id) => {
                 // Running jobs: the first request shows them, the second quits.
                 if self.jobs.busy() && !self.close_armed {
@@ -3603,6 +3610,29 @@ fn capitalize(s: &str) -> String {
 
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Developer aid: with `GUPPY_BENCH=1`, prints the time to the first frame,
+/// then the memory use after three idle seconds, and exits.
+fn bench_report() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("GUPPY_BENCH").is_none() {
+        return;
+    }
+    DONE.call_once(|| {
+        let ms = START.get().map_or(0, |s| s.elapsed().as_millis());
+        println!("first frame: {ms} ms");
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            let field = |file: &str, key: &str| {
+                std::fs::read_to_string(file).ok()?.lines().find(|l| l.starts_with(key)).map(|l| l[key.len()..].trim().to_string())
+            };
+            println!("rss: {}", field("/proc/self/status", "VmRSS:").unwrap_or_default());
+            println!("pss: {}", field("/proc/self/smaps_rollup", "Pss:").unwrap_or_default());
+            println!("private: {}", field("/proc/self/smaps_rollup", "Private_Dirty:").unwrap_or_default());
+            std::process::exit(0);
+        });
+    });
 }
 
 fn save_ppm(path: &std::ffi::OsStr, shot: &iced::window::Screenshot) {
