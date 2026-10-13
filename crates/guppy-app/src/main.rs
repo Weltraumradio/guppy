@@ -75,6 +75,9 @@ enum Message {
     DialogConfirm,
     DialogCancel,
     ToggleHidden,
+    OpenSettings,
+    /// Click on a settings row: select it and change it one step.
+    SettingClick(usize),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
     /// computed, then exits.
     Shot(iced::window::Screenshot),
@@ -93,6 +96,64 @@ enum Dialog {
     Report { title: &'static str, problems: Vec<String> },
     /// Quick help listing all keys (F1).
     Help,
+    /// Settings (F9): selected row, and the text being typed for path rows.
+    Settings { row: usize, edit: Option<String> },
+}
+
+/// Rows of the settings overlay, in display order: (section, label).
+const SETTINGS: &[(&str, &str)] = &[
+    ("View", "Show hidden files"),
+    ("View", "Default sort"),
+    ("View", "Folder sizes automatically"),
+    ("Ask before", "Copy"),
+    ("Ask before", "Move"),
+    ("Ask before", "Move to trash"),
+    ("Ask before", "Delete permanently"),
+    ("Start folders", "Left pane"),
+    ("Start folders", "Right pane"),
+    ("Network drives", "Parallel accesses"),
+];
+
+/// Rows 7 and 8 hold paths and are edited as text.
+fn setting_is_text(row: usize) -> bool {
+    matches!(row, 7 | 8)
+}
+
+fn setting_value(c: &Config, row: usize) -> String {
+    let on = |b: bool| if b { "on" } else { "off" }.to_string();
+    let path = |p: &str| if p.trim().is_empty() { "startup folder".to_string() } else { p.to_string() };
+    match row {
+        0 => on(c.view.show_hidden),
+        1 => sort_from(c.view.sort).label().trim_end_matches(" ↓").to_string(),
+        2 => on(c.view.dir_sizes),
+        3 => on(c.confirm.copy),
+        4 => on(c.confirm.move_),
+        5 => on(c.confirm.trash),
+        6 => on(c.confirm.delete),
+        7 => path(&c.start.left),
+        8 => path(&c.start.right),
+        _ => c.network.threads.to_string(),
+    }
+}
+
+/// Changes a non-text setting one step; `dir` is -1 or +1.
+fn setting_step(c: &mut Config, row: usize, dir: i32) {
+    let flip = |b: &mut bool| *b = !*b;
+    match row {
+        0 => flip(&mut c.view.show_hidden),
+        1 => {
+            let order = [SortBy::Name, SortBy::Size, SortBy::Date];
+            let i = order.iter().position(|s| *s == c.view.sort).unwrap_or(0) as i32;
+            c.view.sort = order[(i + dir).rem_euclid(3) as usize];
+        }
+        2 => flip(&mut c.view.dir_sizes),
+        3 => flip(&mut c.confirm.copy),
+        4 => flip(&mut c.confirm.move_),
+        5 => flip(&mut c.confirm.trash),
+        6 => flip(&mut c.confirm.delete),
+        9 => c.network.threads = (c.network.threads as i32 + dir).clamp(1, 32) as usize,
+        _ => {}
+    }
 }
 
 /// Quick help sections: heading and (key, action).
@@ -123,6 +184,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("View", &[
         ("F1", "this help"),
+        ("F9 Ctrl+,", "settings"),
         ("Ctrl+H", "hidden files"),
         ("Ctrl+S", "sort: name, size, date"),
         ("Ctrl+R", "recompute folder sizes"),
@@ -360,6 +422,10 @@ impl Guppy {
         }
         // `GUPPY_DIALOG=copy` opens the copy dialog, `=run` also confirms it.
         if let Ok(d) = std::env::var("GUPPY_DIALOG") {
+            if d == "settings" {
+                g.dialog = Some(Dialog::Settings { row: 2, edit: None });
+                return (g, Task::none());
+            }
             if d == "help" {
                 g.dialog = Some(Dialog::Help);
                 return (g, Task::none());
@@ -515,6 +581,14 @@ impl Guppy {
             Message::NewDir => self.dialog = Some(Dialog::NewDir { name: String::new(), error: None }),
             Message::DialogConfirm => self.confirm_dialog(),
             Message::DialogCancel => self.cancel_dialog(),
+            Message::OpenSettings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
+            Message::SettingClick(row) => {
+                if let Some(Dialog::Settings { row: sel, edit }) = &mut self.dialog {
+                    *sel = row;
+                    *edit = None;
+                }
+                self.settings_activate(1);
+            }
             Message::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.panes.iter_mut().for_each(|p| p.cursor = 0);
@@ -549,6 +623,8 @@ impl Guppy {
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
             Key::Named(Named::F1) => self.dialog = Some(Dialog::Help),
+            Key::Named(Named::F9) => return self.update(Message::OpenSettings),
+            Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => self.open_current(),
             Key::Named(Named::Backspace) if !query_empty => {
@@ -617,6 +693,79 @@ impl Guppy {
             self.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
             return;
         }
+        self.use_config(new);
+    }
+
+    /// Saves settings changed in the overlay and applies them right away.
+    fn set_config(&mut self, new: Config) {
+        if let Err(e) = new.save() {
+            self.dialog = Some(Dialog::Report { title: "Settings not saved", problems: vec![e.to_string()] });
+        }
+        self.use_config(new);
+    }
+
+    /// Enter/Space/←/→ on the selected settings row.
+    fn settings_activate(&mut self, dir: i32) {
+        let Some(Dialog::Settings { row, edit }) = &mut self.dialog else { return };
+        let row = *row;
+        if setting_is_text(row) {
+            let c = &self.config.start;
+            *edit = Some(if row == 7 { c.left.clone() } else { c.right.clone() });
+            return;
+        }
+        let mut new = self.config.clone();
+        setting_step(&mut new, row, dir);
+        self.set_config(new);
+    }
+
+    fn on_settings_key(&mut self, key: Key, typed: Option<&str>) {
+        let Some(Dialog::Settings { row, edit }) = &mut self.dialog else { return };
+        // Typing a start folder.
+        if let Some(text) = edit {
+            match key.as_ref() {
+                Key::Named(Named::Enter) => {
+                    let value = std::mem::take(text);
+                    let row = *row;
+                    *edit = None;
+                    let mut new = self.config.clone();
+                    if row == 7 { new.start.left = value } else { new.start.right = value }
+                    self.set_config(new);
+                }
+                Key::Named(Named::Escape) => *edit = None,
+                Key::Named(Named::Backspace) => {
+                    text.pop();
+                }
+                _ => {
+                    if let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) {
+                        text.push_str(t);
+                    }
+                }
+            }
+            return;
+        }
+        match key.as_ref() {
+            Key::Named(Named::ArrowDown) => *row = (*row + 1).min(SETTINGS.len() - 1),
+            Key::Named(Named::ArrowUp) => *row = row.saturating_sub(1),
+            Key::Named(Named::Home) => *row = 0,
+            Key::Named(Named::End) => *row = SETTINGS.len() - 1,
+            Key::Named(Named::Enter | Named::Space) | Key::Named(Named::ArrowRight) => self.settings_activate(1),
+            Key::Named(Named::ArrowLeft) => self.settings_activate(-1),
+            Key::Named(Named::Escape | Named::F9) => self.dialog = None,
+            // On a start-folder row, "." takes the folder currently shown in that pane.
+            Key::Character(".") if setting_is_text(*row) => {
+                let row = *row;
+                let mut new = self.config.clone();
+                let here = self.jumper.display(&self.panes[row - 7].path);
+                if row == 7 { new.start.left = here } else { new.start.right = here }
+                self.set_config(new);
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies new settings. View settings only change what differs from the
+    /// previous settings, so toggles made in the app are not overwritten.
+    fn use_config(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.config, new);
         let v = &self.config.view;
         if v.show_hidden != old.view.show_hidden {
@@ -671,6 +820,7 @@ impl Guppy {
                 Err(e) => self.dialog = Some(Dialog::NewDir { name, error: Some(e.to_string()) }),
             },
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
+            Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(Dialog::Report { .. } | Dialog::Help) | None => {}
         }
     }
@@ -684,6 +834,10 @@ impl Guppy {
     }
 
     fn on_dialog_key(&mut self, key: Key, typed: Option<&str>) {
+        if matches!(self.dialog, Some(Dialog::Settings { .. })) {
+            self.on_settings_key(key, typed);
+            return;
+        }
         match key.as_ref() {
             Key::Named(Named::Enter) => self.confirm_dialog(),
             Key::Named(Named::Escape) => self.cancel_dialog(),
@@ -1105,6 +1259,63 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Settings { row: sel, edit } => {
+                let mut list = column![].spacing(2);
+                let mut section = "";
+                for (i, (head, label)) in SETTINGS.iter().enumerate() {
+                    if *head != section {
+                        section = head;
+                        let gap = if i == 0 { 0 } else { 12 };
+                        list = list.push(
+                            container(text(*head).size(11).font(BOLD).color(rgb(t.accent))).padding(iced::Padding { top: gap as f32, bottom: 4.0, ..Default::default() }),
+                        );
+                    }
+                    let selected = i == *sel;
+                    let value = match edit {
+                        Some(e) if selected => format!("{e}▏"),
+                        _ => setting_value(&self.config, i),
+                    };
+                    let on = !matches!(value.as_str(), "off");
+                    let value_color = if selected { rgb(t.background) } else if on { rgb(t.bright) } else { fg };
+                    let label_color = if selected { rgb(t.background) } else { fg };
+                    list = list.push(
+                        button(
+                            row![
+                                text(*label).size(13).color(label_color).width(Length::Fill),
+                                text(value).size(13).font(BOLD).color(value_color).wrapping(iced::widget::text::Wrapping::None),
+                            ]
+                            .spacing(12),
+                        )
+                        .padding([5, 10])
+                        .width(Length::Fill)
+                        .on_press(Message::SettingClick(i))
+                        .style(move |_, status| button::Style {
+                            background: Some(if selected {
+                                rgb(t.accent)
+                            } else if matches!(status, button::Status::Hovered) {
+                                Color { a: 0.06, ..Color::WHITE }
+                            } else {
+                                Color::TRANSPARENT
+                            }.into()),
+                            border: Border::default().rounded(4),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                let hint = match edit {
+                    Some(_) => "type a path · empty = startup folder · Enter saves · Esc cancels",
+                    None if setting_is_text(*sel) => "Enter edits · . takes this pane's folder · Esc closes",
+                    None => "↑↓ choose · Space/←→ change · Esc closes",
+                };
+                let file = Config::path().map(|p| self.jumper.display(&p)).unwrap_or_default();
+                column![
+                    title("Settings".into()),
+                    list,
+                    column![small(hint.into()), text(format!("Saved to {file}")).size(11).color(Color { a: 0.6, ..fg })].spacing(4),
+                ]
+                .spacing(16)
+                .into()
+            }
             Dialog::Help => {
                 let section = |(head, keys): &(&'static str, &'static [(&'static str, &'static str)])| {
                     let mut c = column![text(*head).size(11).font(BOLD).color(rgb(t.accent))].spacing(5);
@@ -1147,7 +1358,11 @@ impl Guppy {
 
         let card = container(content)
             .padding(22)
-            .width(if matches!(dialog, Dialog::Help) { 760 } else { 480 })
+            .width(match dialog {
+                Dialog::Help => 760,
+                Dialog::Settings { .. } => 560,
+                _ => 480,
+            })
         .style(move |_| container::Style {
             background: Some(rgb(0x57534a).into()),
             border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
@@ -1224,6 +1439,7 @@ impl Guppy {
             self.icon_button(icons::SWAP, "Switch side (Tab)", Some(Message::SwitchSide)),
             iced::widget::Space::new().width(Length::Fill),
             self.icon_button(icons::HIDDEN, "Hidden files (Ctrl H)", Some(Message::ToggleHidden)),
+            self.icon_button(icons::SETTINGS, "Settings (F9)", Some(Message::OpenSettings)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);

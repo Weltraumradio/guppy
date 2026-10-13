@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub start: Start,
@@ -15,7 +15,7 @@ pub struct Config {
     pub network: Network,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Start {
     /// Left pane; empty = the directory Guppy was started in.
@@ -32,7 +32,7 @@ pub enum SortBy {
     Date,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct View {
     pub show_hidden: bool,
@@ -41,7 +41,7 @@ pub struct View {
     pub dir_sizes: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Confirm {
     pub copy: bool,
@@ -51,7 +51,7 @@ pub struct Confirm {
     pub delete: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
     /// Parallel accesses per folder-size computation on network drives.
@@ -111,7 +111,76 @@ delete = true      # permanent delete; turning this off is not recommended
 threads = 4        # parallel accesses per folder-size computation on network drives
 "#;
 
+impl SortBy {
+    pub fn name(self) -> &'static str {
+        match self {
+            SortBy::Name => "name",
+            SortBy::Size => "size",
+            SortBy::Date => "date",
+        }
+    }
+}
+
 impl Config {
+    /// The file contents for these settings, in the commented template layout.
+    pub fn to_toml(&self) -> String {
+        let q = |s: &str| toml::Value::String(s.to_string()).to_string();
+        let mut out = String::new();
+        // Walk the template and substitute each value, keeping all comments.
+        let mut section = "";
+        for line in TEMPLATE.lines() {
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = match name {
+                    "start" => "start",
+                    "view" => "view",
+                    "confirm" => "confirm",
+                    _ => "network",
+                };
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let Some((key, rest)) = line.split_once(" = ") else {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            };
+            let key = key.trim();
+            let value = match (section, key) {
+                ("start", "left") => q(&self.start.left),
+                ("start", "right") => q(&self.start.right),
+                ("view", "show_hidden") => self.view.show_hidden.to_string(),
+                ("view", "sort") => q(self.view.sort.name()),
+                ("view", "dir_sizes") => self.view.dir_sizes.to_string(),
+                ("confirm", "copy") => self.confirm.copy.to_string(),
+                ("confirm", "move") => self.confirm.move_.to_string(),
+                ("confirm", "trash") => self.confirm.trash.to_string(),
+                ("confirm", "delete") => self.confirm.delete.to_string(),
+                ("network", "threads") => self.network.threads.to_string(),
+                _ => rest.split('#').next().unwrap_or("").trim().to_string(),
+            };
+            let comment = rest.find('#').map(|i| &rest[i..]);
+            let head = format!("{key} = {value}");
+            match comment {
+                Some(c) => out.push_str(&format!("{head:<18} {c}\n")),
+                None => {
+                    out.push_str(&head);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Writes the settings (atomically via a temporary file).
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(path) = Self::path() else { return Ok(()) };
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, self.to_toml())?;
+        std::fs::rename(tmp, path)
+    }
+
     pub fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("guppy/config.toml"))
     }
@@ -158,5 +227,12 @@ mod tests {
         assert_eq!(c.view.sort, SortBy::Name);
         assert_eq!(c.network.threads, 4);
         assert!(toml::from_str::<Config>("[view]\nbogus = 1").is_err());
+        // Round trip through the commented layout.
+        let mut c = Config::default();
+        c.start.left = "~/a \"b\"".into();
+        c.view.sort = SortBy::Date;
+        c.confirm.trash = false;
+        c.network.threads = 7;
+        assert_eq!(toml::from_str::<Config>(&c.to_toml()).unwrap(), c);
     }
 }
