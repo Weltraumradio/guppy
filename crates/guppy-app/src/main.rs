@@ -1857,16 +1857,17 @@ impl Guppy {
             .filter(|(_, d)| here.starts_with(&d.path))
             .max_by_key(|(_, d)| d.path.as_os_str().len())
             .map_or(0, |(i, _)| i);
+        // Bookmarks come first in the list.
+        let cur = self.config.bookmarks.len() + cur;
         self.dialog = Some(Dialog::Drives { side, list, cur });
     }
 
     fn on_drives_key(&mut self, key: Key, m: keyboard::Modifiers, typed: Option<&str>) -> Task<Message> {
         let marks = self.config.bookmarks.len();
         let Some(Dialog::Drives { side, list, cur }) = &mut self.dialog else { return Task::none() };
-        let drives = list.len();
-        let total = drives + marks;
+        let total = list.len() + marks;
         // Selected bookmark, if the cursor is on one.
-        let mark = cur.checked_sub(drives).filter(|&b| b < marks);
+        let mark = Some(*cur).filter(|&b| b < marks);
         match key.as_ref() {
             Key::Named(Named::Escape) => self.dialog = None,
             // Alt+↑/↓ move a bookmark within the list.
@@ -1874,7 +1875,7 @@ impl Guppy {
                 if let Some(b) = mark {
                     let to = if dir == Named::ArrowUp { b.checked_sub(1) } else { Some(b + 1).filter(|&t| t < marks) };
                     if let Some(to) = to {
-                        *cur = drives + to;
+                        *cur = to;
                         let mut new = self.config.clone();
                         new.bookmarks.swap(b, to);
                         self.set_config(new);
@@ -1916,9 +1917,10 @@ impl Guppy {
     /// Opens the selected drive or bookmark in its pane, or with `other` in the other one.
     fn pick_drive(&mut self, other: bool) {
         let Some(Dialog::Drives { side, list, cur }) = self.dialog.take() else { return };
-        let target = match list.get(cur) {
-            Some(d) => Some(d.path.clone()),
-            None => self.config.bookmarks.get(cur - list.len()).map(|b| Config::resolve(&b.path, &self.panes[side].path)),
+        let marks = self.config.bookmarks.len();
+        let target = match self.config.bookmarks.get(cur) {
+            Some(b) => Some(Config::resolve(&b.path, &self.panes[side].path)),
+            None => list.get(cur - marks).map(|d| d.path.clone()),
         };
         if let Some(path) = target {
             self.active = if other { 1 - side } else { side };
@@ -1932,8 +1934,8 @@ impl Guppy {
         let cwd = here.clone();
         if let Some(b) = self.config.bookmarks.iter().position(|b| Config::resolve(&b.path, &cwd) == here) {
             self.open_drives(self.active);
-            if let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog {
-                *cur = list.len() + b;
+            if let Some(Dialog::Drives { cur, .. }) = &mut self.dialog {
+                *cur = b;
             }
             return;
         }
@@ -1957,8 +1959,8 @@ impl Guppy {
         // Back to the list, with this bookmark selected.
         if self.dialog.is_none() {
             self.open_drives(self.active);
-            if let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog {
-                *cur = list.len() + index;
+            if let Some(Dialog::Drives { cur, .. }) = &mut self.dialog {
+                *cur = index;
             }
         }
     }
@@ -2601,8 +2603,13 @@ impl Guppy {
                         ..Default::default()
                     }
                 };
+                let marks = self.config.bookmarks.len();
+                let heading = |label: &'static str, top: f32| {
+                    container(text(label).size(11).font(BOLD).color(rgb(t.accent))).padding(iced::Padding { top, bottom: 2.0, left: 10.0, right: 0.0 })
+                };
                 let mut rows = column![].spacing(4);
-                for (i, d) in list.iter().enumerate() {
+                for (n, d) in list.iter().enumerate() {
+                    let i = marks + n;
                     let on = i == *cur;
                     let main = if on { rgb(t.background) } else { rgb(t.bright) };
                     let dim = if on { rgb(t.background) } else { fg };
@@ -2641,12 +2648,13 @@ impl Guppy {
                         .style(row_style(on)),
                     );
                 }
-                rows = rows.push(container(text("BOOKMARKS").size(11).font(BOLD).color(rgb(t.accent))).padding(iced::Padding { top: 10.0, bottom: 2.0, left: 10.0, right: 0.0 }));
+                let drive_rows = rows;
+                let mut rows = column![heading("BOOKMARKS", 0.0)].spacing(4);
                 if self.config.bookmarks.is_empty() {
                     rows = rows.push(container(small("None yet · Ctrl+D bookmarks the current folder".into())).padding([2, 10]));
                 }
                 for (b, bm) in self.config.bookmarks.iter().enumerate() {
-                    let i = list.len() + b;
+                    let i = b;
                     let on = i == *cur;
                     let path = Config::resolve(&bm.path, &self.panes[*side].path);
                     // Unreachable targets are dimmed; network paths aren't probed (could hang).
@@ -2668,7 +2676,8 @@ impl Guppy {
                         .style(row_style(on)),
                     );
                 }
-                let hint = if cur.checked_sub(list.len()).is_some_and(|b| b < self.config.bookmarks.len()) {
+                let rows = rows.push(heading("DRIVES", 10.0)).push(drive_rows);
+                let hint = if *cur < marks {
                     "Enter opens · Shift+Enter in other pane · Del removes · F2 renames · Alt+↑↓ moves"
                 } else {
                     "↑↓ choose · Enter or 1–9 opens · Shift+Enter in other pane · Esc closes"
