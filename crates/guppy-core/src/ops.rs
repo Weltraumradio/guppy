@@ -164,7 +164,9 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     let job = Job::default();
     let j = job.clone();
     std::thread::spawn(move || {
+        let remote = target.as_deref().is_some_and(crate::remote::is_remote) || sources.iter().any(|s| crate::remote::is_remote(s));
         match kind {
+            _ if remote => remote_job(&j, kind, &sources, target.as_deref()),
             OpKind::Copy | OpKind::Move => {
                 let target = target.expect("target directory missing");
                 let archived = sources.first().filter(|s| s.symlink_metadata().is_err()).and_then(|s| crate::archive::split(s));
@@ -217,6 +219,82 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
+/// Copy, move or delete where a remote is involved; each entry is one rclone call.
+/// Deleting on a remote can't use the local trash: Google Drive keeps its own.
+fn remote_job(j: &Job, kind: OpKind, sources: &[PathBuf], target: Option<&Path>) {
+    use crate::remote;
+    let exists = |p: &Path| if remote::is_remote(p) { remote::stat(p).ok().flatten() } else { p.symlink_metadata().ok().map(|m| m.is_dir()) };
+    let Some(target) = target else {
+        j.0.total.store(sources.len() as u64, Ordering::Relaxed);
+        for src in sources {
+            if j.cancelled() {
+                break;
+            }
+            j.set_current(src);
+            let res = match exists(src) {
+                None => Err(io::Error::new(io::ErrorKind::NotFound, "no longer there")),
+                Some(dir) if remote::is_remote(src) => remote::delete(src, dir),
+                Some(_) => remove(src),
+            };
+            if let Err(e) = res {
+                j.problem(src, e);
+            }
+            j.add_done(1);
+        }
+        return;
+    };
+    let total = sources.iter().map(|s| if remote::is_remote(s) { remote::size(s) } else { tree_size(s) }).sum();
+    j.0.total.store(total, Ordering::Relaxed);
+    for src in sources {
+        if j.cancelled() {
+            break;
+        }
+        let Some(name) = src.file_name() else { continue };
+        let mut dst = target.join(name);
+        if dst.starts_with(src) {
+            j.problem(src, "cannot be copied into itself");
+            continue;
+        }
+        if let Some(dst_dir) = exists(&dst) {
+            let src_dir = exists(src).unwrap_or(false);
+            match j.resolve(src, &dst) {
+                Resolve::Skip => continue,
+                Resolve::KeepBoth => match (2..100).map(|n| numbered(&dst, n, dst_dir)).find(|c| exists(c).is_none()) {
+                    Some(free) => dst = free,
+                    None => continue,
+                },
+                Resolve::Overwrite if src_dir != dst_dir => {
+                    j.problem(src, "a file and a folder have the same name, not overwritten");
+                    continue;
+                }
+                Resolve::Overwrite => {}
+            }
+        }
+        j.set_current(src);
+        let base = j.0.done.load(Ordering::Relaxed);
+        let res = remote::transfer(src, &dst, kind == OpKind::Move, |b| {
+            j.0.done.store(base + b, Ordering::Relaxed);
+            !j.cancelled()
+        });
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+            Err(e) => j.problem(src, e),
+            Ok(()) if kind == OpKind::Move => j.step(Step::Moved { from: src.clone(), to: dst }),
+            Ok(()) => {}
+        }
+    }
+}
+
+/// `a.txt` → `a (n).txt`; folders keep dots in their name.
+fn numbered(p: &Path, n: u32, dir: bool) -> PathBuf {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && !dir => (&name[..dot], &name[dot..]),
+        _ => (name.as_str(), ""),
+    };
+    p.with_file_name(format!("{stem} ({n}){ext}"))
+}
+
 /// Original paths of everything in the trash (all drives).
 pub fn trash_contents() -> Result<Vec<PathBuf>, String> {
     let items = trash::os_limited::list().map_err(|e| e.to_string())?;
@@ -260,6 +338,11 @@ pub fn undo(steps: Vec<Step>) -> Job {
                 break;
             }
             match s {
+                Step::Moved { from, to } if crate::remote::is_remote(&from) || crate::remote::is_remote(&to) => {
+                    if let Err(e) = crate::remote::transfer(&to, &from, true, |_| !j.cancelled()) {
+                        j.problem(&to, e);
+                    }
+                }
                 Step::Moved { from, to } => {
                     // A merged folder was removed after its contents moved out.
                     if let Some(parent) = from.parent() {
@@ -348,6 +431,13 @@ pub fn rename(from: &Path, name: &str) -> io::Result<PathBuf> {
     if to == from {
         return Ok(to);
     }
+    if crate::remote::is_remote(from) {
+        if crate::remote::stat(&to)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file with that name already exists"));
+        }
+        crate::remote::transfer(from, &to, true, |_| true)?;
+        return Ok(to);
+    }
     // Only a change of case may hit "itself" on case-insensitive file systems.
     let same_entry = to.to_string_lossy().to_lowercase() == from.to_string_lossy().to_lowercase();
     if to.symlink_metadata().is_ok() && !same_entry {
@@ -363,6 +453,13 @@ pub fn make_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid name"));
     }
     let p = parent.join(name);
+    if crate::remote::is_remote(&p) {
+        if crate::remote::stat(&p)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "already exists"));
+        }
+        crate::remote::make_dir(&p)?;
+        return Ok(p);
+    }
     std::fs::create_dir(&p)?;
     Ok(p)
 }
@@ -644,4 +741,47 @@ mod tests {
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Copy and move through rclone, with a conflict; needs rclone (or `GUPPY_RCLONE`).
+#[test]
+fn remote_ops() {
+    if std::process::Command::new(std::env::var_os("GUPPY_RCLONE").unwrap_or("rclone".into())).arg("version").output().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("guppy-remote-ops-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("local")).unwrap();
+    std::fs::create_dir_all(root.join("remote")).unwrap();
+    std::fs::write(root.join("local/a.txt"), "abc").unwrap();
+    // SAFETY: only this test uses remote `u:`.
+    unsafe {
+        std::env::set_var("RCLONE_CONFIG_U_TYPE", "alias");
+        std::env::set_var("RCLONE_CONFIG_U_REMOTE", root.join("remote"));
+    }
+    let wait = |j: &Job| {
+        while !j.progress().finished {
+            if j.conflict().is_some() {
+                j.answer(Resolve::KeepBoth, false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(j.progress().problems.is_empty(), "{:?}", j.progress().problems);
+    };
+    let r = PathBuf::from("u:");
+    wait(&start(OpKind::Copy, vec![root.join("local/a.txt")], Some(r.clone())));
+    wait(&start(OpKind::Copy, vec![root.join("local/a.txt")], Some(r.clone())));
+    assert!(root.join("remote/a (2).txt").exists());
+    let d = make_dir(&r, "sub").unwrap();
+    let j = start(OpKind::Move, vec![r.join("a.txt")], Some(d.clone()));
+    wait(&j);
+    assert!(root.join("remote/sub/a.txt").exists() && !root.join("remote/a.txt").exists());
+    wait(&undo(j.steps()));
+    assert!(root.join("remote/a.txt").exists());
+    assert_eq!(rename(&r.join("a.txt"), "b.txt").unwrap(), r.join("b.txt"));
+    wait(&start(OpKind::Copy, vec![r.join("b.txt")], Some(root.join("local"))));
+    assert_eq!(std::fs::read_to_string(root.join("local/b.txt")).unwrap(), "abc");
+    wait(&start(OpKind::Delete, vec![r.join("sub"), r.join("b.txt")], None));
+    assert!(!root.join("remote/sub").exists() && !root.join("remote/b.txt").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }

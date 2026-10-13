@@ -43,6 +43,22 @@ const IMAGE_CONVERT: &[&str] = &["avif", "heic", "heif", "jxl", "psd", "xcf", "c
 
 /// Reads what the viewer shows. `quick` keeps text shorter for the quick view.
 pub fn load(path: &Path, quick: bool) -> ViewBody {
+    // On a remote: the viewer downloads the file first, the quick view doesn't.
+    if guppy_core::remote::is_remote(path) {
+        if quick {
+            return ViewBody::Other("Remote file · F3 downloads and shows it".into());
+        }
+        if let Ok(Some(true)) = guppy_core::remote::stat(path) {
+            return match guppy_core::remote::read_dir(path) {
+                Ok(list) => ViewBody::Dir(dir_lines(&list)),
+                Err(e) => ViewBody::Other(e.to_string()),
+            };
+        }
+        return match crate::temp_dir().and_then(|dir| guppy_core::remote::download(path, &dir)) {
+            Ok(local) => load(&local, quick),
+            Err(e) => ViewBody::Other(e.to_string()),
+        };
+    }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     // Inside an archive: a folder lists, a file is read through bsdtar.
     if path.symlink_metadata().is_err()

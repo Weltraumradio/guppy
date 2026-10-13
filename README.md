@@ -12,6 +12,14 @@ target/release/guppy-app
 Press F1 for all keys, Ctrl+P for the command palette. Settings live in
 `~/.config/guppy/config.toml` (written with comments on first start; F12 edits the common ones).
 
+## Remote folders (Google Drive, SFTP, S3, …)
+
+Guppy browses [rclone](https://rclone.org) remotes like local folders. Set one up once with
+`rclone config` (e.g. a Google Drive remote named `gdrive`); it then appears in the drive
+picker (Alt+F1 / Alt+F2), and `gdrive:/Some/Folder` works as a bookmark or start folder.
+Copy, move, rename, new folder and delete work in both directions, with progress; Enter and F3
+download a file first. Deleting on Google Drive moves to Drive's own trash.
+
 ## Benchmark
 
 Measured on 2026-10-13 with `GUPPY_BENCH=1 target/release/guppy-app`, which prints the time

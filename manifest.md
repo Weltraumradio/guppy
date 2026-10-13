@@ -17,7 +17,6 @@ Modern and elegant.
 
 Future ideas (not built yet):
 - Compare directories: diff left/right, mark differences, one-way sync
-- Remote pane over SFTP/SSH
 - Command line at the bottom (runs in the current folder, Ctrl+Enter inserts the name)
 - Tabs per pane (Ctrl+T), restored at startup
 - Multi-rename with patterns like [N]_[C].[E] and live preview

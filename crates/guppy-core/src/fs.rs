@@ -30,9 +30,16 @@ pub struct Entry {
     pub hidden: bool,
     /// Lives inside an archive (read-only, `path` is virtual).
     pub in_archive: bool,
+    /// Lives on an rclone remote (see [`crate::remote`]).
+    pub remote: bool,
 }
 
 impl Entry {
+    /// Not on a local filesystem: folder sizes come from the listing, nothing to watch.
+    pub fn is_virtual(&self) -> bool {
+        self.in_archive || self.remote
+    }
+
     pub fn is_dir(&self) -> bool {
         self.kind == EntryKind::Dir
     }
@@ -81,6 +88,7 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
                 path,
                 kind,
                 in_archive: false,
+                remote: false,
             }
         })
         .collect();

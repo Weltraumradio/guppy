@@ -180,6 +180,7 @@ pub fn read_dir(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
             size: 0,
             modified: None,
             in_archive: true,
+            remote: false,
         });
         if direct {
             e.kind = m.kind;
@@ -278,8 +279,11 @@ pub fn read_member(archive: &Path, inner: &Path, max: usize) -> io::Result<Vec<u
     Ok(buf)
 }
 
-/// Reads a folder on disk or inside an archive.
+/// Reads a folder on disk, inside an archive or on an rclone remote.
 pub fn read_path(path: &Path) -> io::Result<Vec<Entry>> {
+    if crate::remote::is_remote(path) {
+        return crate::remote::read_dir(path);
+    }
     if path.is_dir() {
         return crate::fs::read_dir(path);
     }

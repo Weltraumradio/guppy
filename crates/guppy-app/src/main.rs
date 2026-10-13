@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::{actions, archive, attrs};
+use guppy_core::{actions, archive, attrs, remote};
 use guppy_core::fs::{glob_match, human_date, human_size};
 use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
@@ -312,12 +312,24 @@ fn view_id() -> Id {
 /// Extracts a file from an archive into a temporary folder and opens it there.
 fn open_from_archive(path: &Path) -> Result<(), String> {
     let (archive, inner) = archive::split(path).ok_or("not inside an archive")?;
+    let dir = temp_dir().map_err(|e| e.to_string())?;
+    archive::extract(&archive, std::slice::from_ref(&inner), &dir, |_, _| true).map_err(|e| e.to_string())?;
+    guppy_core::platform::open(&dir.join(inner)).map_err(|e| e.to_string())
+}
+
+/// Downloads a remote file into a temporary folder and opens it there.
+fn open_from_remote(path: &Path) -> Result<(), String> {
+    let local = remote::download(path, &temp_dir().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    guppy_core::platform::open(&local).map_err(|e| e.to_string())
+}
+
+/// Fresh temporary folder for files taken out of archives or remotes.
+fn temp_dir() -> std::io::Result<PathBuf> {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("guppy-{}/{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    archive::extract(&archive, std::slice::from_ref(&inner), &dir, |_, _| true).map_err(|e| e.to_string())?;
-    guppy_core::platform::open(&dir.join(inner)).map_err(|e| e.to_string())
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Rows of the settings overlay, in display order: (section, label).
@@ -585,7 +597,7 @@ impl Sort {
 
 /// Size of an entry for display and sorting; folders come from the size computation.
 fn entry_size(e: &Entry, sizes: &DirSizes) -> Option<u64> {
-    if !e.is_dir() || e.in_archive {
+    if !e.is_dir() || e.is_virtual() {
         return Some(e.size);
     }
     match sizes.get(&e.path) {
@@ -616,6 +628,8 @@ struct Pane {
     network: bool,
     /// Showing the inside of an archive (read-only).
     archive: bool,
+    /// Showing a folder on an rclone remote.
+    remote: bool,
 }
 
 /// What happens after a folder has been read.
@@ -685,16 +699,19 @@ impl Pane {
             id: Id::new(id),
             network: false,
             archive: false,
+            remote: false,
         };
-        p.network = guppy_core::platform::is_network(&path);
+        p.remote = remote::is_remote(&path);
+        p.network = p.remote || guppy_core::platform::is_network(&path);
         p.path = path;
         p
     }
 
     /// Shows a freshly read folder.
     fn enter(&mut self, path: PathBuf, entries: Vec<Entry>) {
-        self.network = guppy_core::platform::is_network(&path);
-        self.archive = !path.is_dir();
+        self.remote = remote::is_remote(&path);
+        self.network = self.remote || guppy_core::platform::is_network(&path);
+        self.archive = !self.remote && !path.is_dir();
         self.entries = entries;
         self.path = path;
         self.cursor = 0;
@@ -792,7 +809,7 @@ impl Guppy {
             papers: [Paper::new(1), Paper::new(2)],
             scanlines: [Scanlines::default(), Scanlines::default()],
             sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
-            jumper: Jumper::load(),
+            jumper: { guppy_core::drives::prefetch_remotes(); Jumper::load() },
             jump: Vec::new(),
             jump_cur: 0,
             shot_wait: 0,
@@ -897,7 +914,7 @@ impl Guppy {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut dirs: Vec<PathBuf> = self.panes.iter().map(|p| p.path.clone()).collect();
+        let mut dirs: Vec<PathBuf> = self.panes.iter().filter(|p| !p.remote).map(|p| p.path.clone()).collect();
         if let Some(theme_dir) = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
             // The theme directory and its parent (Omarchy replaces it on switch).
             dirs.extend(theme_dir.parent().map(Path::to_path_buf));
@@ -1791,7 +1808,7 @@ impl Guppy {
 
     /// Opens the built-in editor for the file under the cursor.
     fn edit_current(&mut self) -> Task<Message> {
-        if self.read_only() {
+        if self.read_only() || self.local_only("Editing") {
             return Task::none();
         }
         let Some(e) = self.current() else { return Task::none() };
@@ -1811,7 +1828,7 @@ impl Guppy {
 
     /// Shift+F4: the configured external editor.
     fn edit_external(&mut self) {
-        if self.read_only() {
+        if self.read_only() || self.local_only("Editing") {
             return;
         }
         let Some(e) = self.current() else { return };
@@ -2013,8 +2030,8 @@ impl Guppy {
     fn run_action(&mut self, i: usize) {
         let Some(a) = self.config.actions.get(i) else { return };
         let p = &self.panes[self.active];
-        if p.archive {
-            self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Actions don't run inside archives.".into()] });
+        if p.archive || p.remote {
+            self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Actions only run on local folders.".into()] });
             return;
         }
         let visible = p.visible(self.show_hidden, &self.sizes);
@@ -2205,9 +2222,21 @@ impl Guppy {
         true
     }
 
+    /// Features that need local files; on a remote, says so and returns true.
+    fn local_only(&mut self, what: &str) -> bool {
+        if !self.panes.iter().enumerate().any(|(i, p)| p.remote && (i == self.active || what == "Links")) {
+            return false;
+        }
+        self.dialog = Some(Dialog::Report {
+            title: "Not on a remote",
+            problems: vec![format!("{what}: only for local files. Enter downloads and opens a file; F5 copies it here.")],
+        });
+        true
+    }
+
     /// Alt+Enter: permissions and owner of the selection.
     fn open_attrs(&mut self) {
-        if self.read_only() {
+        if self.read_only() || self.local_only("Permissions") {
             return;
         }
         let paths = self.selection();
@@ -2223,7 +2252,7 @@ impl Guppy {
 
     /// Ctrl+Shift+F5: links to the selection in the other pane's folder.
     fn make_links(&mut self) {
-        if self.read_only() {
+        if self.read_only() || self.local_only("Links") {
             return;
         }
         if self.panes[1 - self.active].archive {
@@ -2375,7 +2404,7 @@ impl Guppy {
             let len = visible.len();
             p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
             // Let running computations continue, request only what's missing.
-            if !self.config.view.dir_sizes || self.panes[side].archive {
+            if !self.config.view.dir_sizes || self.panes[side].archive || self.panes[side].remote {
                 return;
             }
             let p = &self.panes[side];
@@ -2403,7 +2432,7 @@ impl Guppy {
             let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == *came_from);
             self.panes[side].cursor = pos.unwrap_or(0);
         }
-        if matches!(after, After::Nav | After::Parent(_)) && !self.panes[side].archive {
+        if matches!(after, After::Nav | After::Parent(_)) && !self.panes[side].archive && !self.panes[side].remote {
             self.jumper.visit(&path);
         }
         self.request_sizes(side);
@@ -2468,7 +2497,7 @@ impl Guppy {
         let p = &mut self.panes[side];
         p.sizing.cancel();
         p.sizing = Cancel::default();
-        if !self.config.view.dir_sizes || p.archive {
+        if !self.config.view.dir_sizes || p.archive || p.remote {
             return;
         }
         let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
@@ -2491,7 +2520,7 @@ impl Guppy {
 
     fn go_parent(&mut self) {
         let p = &self.panes[self.active];
-        let Some(parent) = p.path.parent().map(Path::to_path_buf) else { return };
+        let Some(parent) = p.path.parent().filter(|q| !q.as_os_str().is_empty()).map(Path::to_path_buf) else { return };
         let came_from = p.path.clone();
         self.load(self.active, parent, After::Parent(came_from));
     }
@@ -2501,8 +2530,10 @@ impl Guppy {
     fn open_current(&mut self) -> Task<Message> {
         let Some(e) = self.current() else { return Task::none() };
         let path = e.path.clone();
-        if e.is_dir() || (!e.in_archive && guppy_core::archive::is_archive_name(&e.name)) {
+        if e.is_dir() || (!e.is_virtual() && guppy_core::archive::is_archive_name(&e.name)) {
             self.navigate(path);
+        } else if e.remote {
+            return Task::perform(smol::unblock(move || open_from_remote(&path)), Message::Opened);
         } else if e.in_archive {
             return Task::perform(smol::unblock(move || open_from_archive(&path)), Message::Opened);
         } else {
@@ -2946,7 +2977,7 @@ impl Guppy {
                     let on = i == *cur;
                     let path = Config::resolve(&bm.path, &self.panes[*side].path);
                     // Unreachable targets are dimmed; network paths aren't probed (could hang).
-                    let there = guppy_core::platform::is_network(&path) || path.exists() || guppy_core::archive::split(&path).is_some();
+                    let there = guppy_core::platform::is_network(&path) || remote::is_remote(&path) || path.exists() || guppy_core::archive::split(&path).is_some();
                     let main = if on { rgb(t.background) } else if there { rgb(t.bright) } else { rgb(t.muted) };
                     let dim = if on { rgb(t.background) } else if there { fg } else { rgb(t.muted) };
                     let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
@@ -3367,7 +3398,9 @@ impl Guppy {
             let dot = if marked { "●" } else { " " };
             let dot_color = if on_cursor { fg } else if marked { rgb(t.marked) } else { self.class_color(e.class()) };
             let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
-            let (size, pending) = match (e.is_dir() && !e.in_archive, self.sizes.get(&e.path)) {
+            let (size, pending) = match (e.is_dir() && !e.is_virtual(), self.sizes.get(&e.path)) {
+                // rclone doesn't know folder sizes.
+                (false, _) if e.remote && e.is_dir() => (String::new(), false),
                 (false, _) => (human_size(e.size), false),
                 (true, Some(DirSize::Done(n))) => (human_size(n), false),
                 // From the last run's cache, currently being verified.
@@ -3534,7 +3567,7 @@ impl Guppy {
                     }
                     s
                 }).unwrap_or_default()).size(11).font(BOLD).color(rgb(t.accent)),
-                text(if p.archive { "ARCHIVE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
+                text(if p.archive { "ARCHIVE · " } else if p.remote { "REMOTE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]
             .spacing(10),
@@ -3643,7 +3676,7 @@ impl Guppy {
         let count = visible.len();
         let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
         // Total of visible entries, once all folder sizes are known.
-        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir() && !e.in_archive, self.sizes.get(&e.path)) {
+        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir() && !e.is_virtual(), self.sizes.get(&e.path)) {
             (false, _) => Some(acc + e.size),
             (true, Some(DirSize::Done(n))) => Some(acc + n),
             _ => None,
