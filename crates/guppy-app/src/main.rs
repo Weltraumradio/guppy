@@ -55,6 +55,8 @@ fn rgb(c: u32) -> Color {
 enum Message {
     Key(keyboard::Event),
     Select(usize, usize),
+    /// Mouse entered a pane: it becomes the active one.
+    HoverPane(usize),
     Open(usize, usize),
     JumpTo(usize),
     Scrolled(usize, scrollable::Viewport),
@@ -849,6 +851,9 @@ impl Guppy {
                 return iced::window::latest().and_then(iced::window::screenshot).map(Message::Shot);
             }
             Message::Key(_) | Message::Tick => return Task::none(),
+            // Not while typing a name or with a dialog open (the mouse may just pass by).
+            Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() => self.active = side,
+            Message::HoverPane(_) => {}
             Message::Select(side, i) => {
                 self.rename = None;
                 self.active = side;
@@ -2327,9 +2332,9 @@ impl Guppy {
 
         let body: Element<'_, Message> = if active && self.jumping() { self.jump_view() } else { list.into() };
         let tone = if active { 0x57534a } else { 0x4f4b43 };
-        self.sheet(column![header, body].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
-            .width(Length::FillPortion(3))
-            .into()
+        let sheet = self.sheet(column![header, body].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
+            .width(Length::FillPortion(3));
+        mouse_area(sheet).on_enter(Message::HoverPane(side)).into()
     }
 
     /// Jump mode hit list, in place of the active pane's file list.
