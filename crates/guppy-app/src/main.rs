@@ -15,6 +15,7 @@ use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::{
+    text_editor,
     Id, button, column, container, mouse_area, row, scrollable, svg, text,
 };
 use iced::{Background, Border, Color, Element, Font, Length, Subscription, Task};
@@ -77,6 +78,11 @@ enum Message {
     ToggleHidden,
     OpenSettings,
     Viewed(PathBuf, ViewBody),
+    /// Built-in editor (F4): file read, typing, save, close.
+    EditLoaded(PathBuf, Result<String, String>),
+    EditAction(text_editor::Action),
+    EditSave,
+    EditClose,
     /// Click on a settings row: select it and change it one step.
     SettingClick(usize),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
@@ -93,6 +99,15 @@ fn is_jump(query: &str) -> bool {
 enum Dialog {
     Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
     NewDir { name: String, error: Option<String> },
+    /// Built-in editor (F4); `content` is `None` while the file loads.
+    Edit {
+        path: PathBuf,
+        content: Option<text_editor::Content>,
+        dirty: bool,
+        /// Esc with unsaved changes asks once; a second Esc discards.
+        closing: bool,
+        error: Option<String>,
+    },
     /// Viewer (F3) for the file under the cursor.
     View { path: PathBuf, body: ViewBody },
     Running { kind: OpKind, job: Job },
@@ -138,6 +153,23 @@ enum ViewBody {
 const VIEW_MAX: usize = 512 * 1024;
 /// Binary files: dumped up to this size (16 bytes per line).
 const HEX_MAX: usize = 64 * 1024;
+
+fn editor_id() -> Id {
+    Id::new("editor")
+}
+
+/// Reads a text file for the editor; refuses binary and very large files.
+fn load_edit(path: &Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() as usize > 4 * VIEW_MAX {
+        return Err(format!("Too large for the editor · {}", human_size(meta.len())));
+    }
+    let buf = std::fs::read(path).map_err(|e| e.to_string())?;
+    if buf.iter().take(8192).any(|&b| b == 0) {
+        return Err("Binary file, not editable here".into());
+    }
+    String::from_utf8(buf).map_err(|_| "Not UTF-8 text, not editable here".to_string())
+}
 
 fn view_id() -> Id {
     Id::new("viewer")
@@ -283,6 +315,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("F2", "rename"),
         ("F3", "view"),
         ("F4", "edit"),
+        ("Shift+F4", "external editor"),
         ("F5", "copy to other pane"),
         ("F6", "move to other pane"),
         ("F7", "new folder"),
@@ -621,6 +654,14 @@ impl Guppy {
                 self.on_rename_key(key, text.as_deref());
                 return Task::none();
             }
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if matches!(self.dialog, Some(Dialog::Edit { .. })) => {
+                // Only reaches here when the editor itself is not focused.
+                return match key.as_ref() {
+                    Key::Named(Named::Escape) => self.update(Message::EditClose),
+                    Key::Character("s") if modifiers.command() => self.update(Message::EditSave),
+                    _ => operation::focus(editor_id()),
+                };
+            }
             Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.dialog.is_some() => {
                 if matches!(self.dialog, Some(Dialog::View { .. })) {
                     return self.on_view_key(key);
@@ -715,6 +756,51 @@ impl Guppy {
                     *b = body;
                 }
             }
+            Message::EditLoaded(path, result) => {
+                if let Some(Dialog::Edit { path: p, content, .. }) = &mut self.dialog
+                    && *p == path
+                {
+                    match result {
+                        Ok(s) => {
+                            *content = Some(text_editor::Content::with_text(&s));
+                            return operation::focus(editor_id());
+                        }
+                        Err(e) => self.dialog = Some(Dialog::Report { title: "Not editable", problems: vec![e] }),
+                    }
+                }
+            }
+            Message::EditAction(action) => {
+                if let Some(Dialog::Edit { content: Some(c), dirty, closing, error, .. }) = &mut self.dialog {
+                    if action.is_edit() {
+                        *dirty = true;
+                        *closing = false;
+                        *error = None;
+                    }
+                    c.perform(action);
+                }
+            }
+            Message::EditSave => {
+                if let Some(Dialog::Edit { path, content: Some(c), dirty, closing, error }) = &mut self.dialog {
+                    match std::fs::write(&*path, c.text()) {
+                        Ok(()) => {
+                            *dirty = false;
+                            *closing = false;
+                            *error = None;
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
+                }
+            }
+            Message::EditClose => {
+                if let Some(Dialog::Edit { dirty, closing, .. }) = &mut self.dialog {
+                    if *dirty && !*closing {
+                        *closing = true;
+                    } else {
+                        self.dialog = None;
+                        self.reload(self.active);
+                    }
+                }
+            }
             Message::SettingClick(row) => {
                 if let Some(Dialog::Settings { row: sel, edit }) = &mut self.dialog {
                     *sel = row;
@@ -758,7 +844,8 @@ impl Guppy {
             Key::Named(Named::F1) => self.dialog = Some(Dialog::Help),
             Key::Named(Named::F2) => self.start_rename(),
             Key::Named(Named::F3) => return self.open_view(),
-            Key::Named(Named::F4) => self.edit_current(),
+            Key::Named(Named::F4) if m.shift() => self.edit_external(),
+            Key::Named(Named::F4) => return self.edit_current(),
             Key::Named(Named::F12) => return self.update(Message::OpenSettings),
             Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
@@ -954,7 +1041,7 @@ impl Guppy {
             },
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
-            Some(d @ Dialog::View { .. }) => self.dialog = Some(d),
+            Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
             Some(Dialog::Report { .. } | Dialog::Help) | None => {}
         }
     }
@@ -1049,7 +1136,25 @@ impl Guppy {
         }
     }
 
-    fn edit_current(&mut self) {
+    /// Opens the built-in editor for the file under the cursor.
+    fn edit_current(&mut self) -> Task<Message> {
+        let Some(e) = self.current() else { return Task::none() };
+        if e.is_dir() {
+            return Task::none();
+        }
+        let path = e.path.clone();
+        self.dialog = Some(Dialog::Edit { path: path.clone(), content: None, dirty: false, closing: false, error: None });
+        Task::perform(
+            async move {
+                let p = path.clone();
+                (path, smol::unblock(move || load_edit(&p)).await)
+            },
+            |(p, r)| Message::EditLoaded(p, r),
+        )
+    }
+
+    /// Shift+F4: the configured external editor.
+    fn edit_external(&mut self) {
         let Some(e) = self.current() else { return };
         if e.is_dir() {
             return;
@@ -1095,7 +1200,7 @@ impl Guppy {
                 let scroll = self.scroll_into_view();
                 return Task::batch([self.open_view(), scroll]);
             }
-            Key::Named(Named::F4) => self.edit_current(),
+            Key::Named(Named::F4) => return self.edit_current(),
             _ => {}
         }
         Task::none()
@@ -1502,6 +1607,57 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Edit { path, content, dirty, closing, error } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let body: Element<'_, Message> = match content {
+                    None => small("loading …".into()).into(),
+                    Some(c) => text_editor(c)
+                        .id(editor_id())
+                        .on_action(Message::EditAction)
+                        .key_binding(|k| {
+                            let ctrl_s = k.modifiers.command() && matches!(k.key.as_ref(), Key::Character("s"));
+                            match k.key.as_ref() {
+                                Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::EditClose)),
+                                _ if ctrl_s => Some(text_editor::Binding::Custom(Message::EditSave)),
+                                Key::Named(Named::Tab) if matches!(k.status, text_editor::Status::Focused { .. }) => {
+                                    Some(text_editor::Binding::Sequence(vec![text_editor::Binding::Insert(' '); 4]))
+                                }
+                                _ => text_editor::Binding::from_key_press(k),
+                            }
+                        })
+                        .font(FONT)
+                        .size(13)
+                        .height(Length::Fill)
+                        .padding(10)
+                        .style(move |_, _| text_editor::Style {
+                            background: Color { a: 0.25, ..Color::BLACK }.into(),
+                            border: Border::default().rounded(4),
+                            placeholder: rgb(t.foreground),
+                            value: rgb(t.bright),
+                            selection: Color { a: 0.35, ..rgb(t.accent) },
+                        })
+                        .into(),
+                };
+                let (status, status_color) = match (error, closing, dirty) {
+                    (Some(e), _, _) => (e.clone(), rgb(t.red)),
+                    (None, true, _) => ("Unsaved changes · Esc again discards · Ctrl+S saves".to_string(), rgb(t.red)),
+                    (None, false, true) => ("modified".to_string(), rgb(t.accent)),
+                    (None, false, false) => (String::new(), fg),
+                };
+                let pos = content.as_ref().map(|c| {
+                    let p = c.cursor().position;
+                    format!("{}:{}", p.line + 1, p.column + 1)
+                }).unwrap_or_default();
+                column![
+                    row![title(name), iced::widget::Space::new().width(Length::Fill), text(status).size(12).color(status_color), small(pos)]
+                        .align_y(iced::Alignment::Center)
+                        .spacing(12),
+                    body,
+                    small("Ctrl+S saves · Esc closes".into()),
+                ]
+                .spacing(14)
+                .into()
+            }
             Dialog::NewDir { name, error } => {
                 let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
                     .padding([8, 10])
@@ -1645,11 +1801,11 @@ impl Guppy {
             }
         };
 
-        let viewer = matches!(dialog, Dialog::View { .. });
+        let viewer = matches!(dialog, Dialog::View { .. } | Dialog::Edit { .. });
         let card = container(content)
             .padding(22)
             .width(match dialog {
-                Dialog::View { .. } => Length::Fill,
+                Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
                 Dialog::Help => Length::Fixed(760.0),
                 Dialog::Settings { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
