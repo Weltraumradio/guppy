@@ -63,6 +63,83 @@ pub fn remotes() -> Vec<String> {
     String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| l.ends_with(':')).map(String::from).collect()
 }
 
+/// Configured remotes with their type, e.g. `("gdrive:", "drive")`.
+/// An error means rclone itself is missing or broken.
+pub fn remotes_long() -> io::Result<Vec<(String, String)>> {
+    let out = run(rclone().args(["listremotes", "--long"]))?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.split_once(':').map(|(n, t)| (format!("{}:", n.trim()), t.trim().to_string())))
+        .collect())
+}
+
+/// Sets up Google Drive as remote `name` (without colon): rclone opens the browser
+/// for the Google login and waits for it. `cancel` stops waiting; a cancelled or
+/// failed setup leaves no half-made remote behind.
+pub fn connect_drive(name: &str, cancel: &std::sync::atomic::AtomicBool) -> io::Result<()> {
+    let mut cmd = rclone();
+    // The login waits for the browser indefinitely; it must not outlive Guppy.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only calls the async-signal-safe prctl between fork and exec.
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .args(["config", "create", name, "drive"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(missing)?;
+    // Collected on the side so a chatty rclone never blocks on a full pipe.
+    let mut stderr = child.stderr.take().expect("piped");
+    let errors = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = io::Read::read_to_string(&mut stderr, &mut s);
+        s
+    });
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let errors = errors.join().unwrap_or_default();
+    let ok = status.is_some_and(|s| s.success()) && remotes_long().is_ok_and(|r| r.iter().any(|(n, _)| n.trim_end_matches(':') == name));
+    if ok {
+        return Ok(());
+    }
+    let _ = forget(name);
+    match status {
+        None => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+        Some(_) => {
+            let line = errors.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("login did not complete");
+            Err(io::Error::other(line.split_once(" : ").map_or(line, |(_, m)| m).trim().to_string()))
+        }
+    }
+}
+
+/// Removes remote `name` from rclone's config; the files stay where they are.
+pub fn forget(name: &str) -> io::Result<()> {
+    run(rclone().args(["config", "delete", name.trim_end_matches(':')])).map(drop)
+}
+
+/// A free remote name: `gdrive`, `gdrive2`, …
+pub fn free_name(base: &str, taken: &[(String, String)]) -> String {
+    (1..)
+        .map(|n| if n == 1 { base.to_string() } else { format!("{base}{n}") })
+        .find(|c| !taken.iter().any(|(t, _)| t.trim_end_matches(':') == c))
+        .expect("some name is free")
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Item {
@@ -202,6 +279,36 @@ mod tests {
         assert_eq!(Path::new("gdrive:/a").parent(), Some(Path::new("gdrive:")));
     }
 
+    /// Cancelling the Google login leaves no remote behind; the browser is a stub.
+    #[test]
+    fn connect_cancelled() {
+        if rclone().arg("version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("guppy-connect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opener = dir.join("xdg-open");
+        std::fs::write(&opener, format!("#!/bin/sh\ntouch {}/opened\n", dir.display())).unwrap();
+        std::fs::set_permissions(&opener, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // SAFETY: the other tests only add RCLONE_CONFIG_* remotes, which work with any config file.
+        unsafe {
+            std::env::set_var("RCLONE_CONFIG", dir.join("rclone.conf"));
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let err = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            connect_drive("gtest", &cancel).unwrap_err()
+        });
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(dir.join("opened").exists(), "browser was not asked to open");
+        assert!(!remotes_long().unwrap().iter().any(|(n, _)| n == "gtest:"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Runs against a local folder posing as remote `t:`; needs rclone (or `GUPPY_RCLONE`).
     #[test]
     fn with_rclone() {
@@ -221,6 +328,8 @@ mod tests {
         let r = PathBuf::from("t:");
         assert!(is_remote(&r));
         assert!(remotes().contains(&"t:".to_string()));
+        assert!(remotes_long().unwrap().contains(&("t:".into(), "alias".into())));
+        assert_eq!(free_name("t", &remotes_long().unwrap()), "t2");
 
         transfer(&root.join("src/d"), &r.join("d"), false, |_| true).unwrap();
         let list = read_dir(&r).unwrap();

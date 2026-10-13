@@ -14,9 +14,11 @@ Press F1 for all keys, Ctrl+P for the command palette. Settings live in
 
 ## Remote folders (Google Drive, SFTP, S3, …)
 
-Guppy browses [rclone](https://rclone.org) remotes like local folders. Set one up once with
-`rclone config` (e.g. a Google Drive remote named `gdrive`); it then appears in the drive
-picker (Alt+F1 / Alt+F2), and `gdrive:/Some/Folder` works as a bookmark or start folder.
+Guppy browses [rclone](https://rclone.org) remotes like local folders. With rclone installed
+(`sudo pacman -S rclone`), Settings (F12) → Online storage → *Connect Google Drive* opens the
+Google login in the browser and adds the remote `gdrive`; Del there removes a connection.
+Other services (SFTP, S3, OneDrive, …) are added with `rclone config`. Remotes appear in the
+drive picker (Alt+F1 / Alt+F2), and `gdrive:/Some/Folder` works as a bookmark or start folder.
 Copy, move, rename, new folder and delete work in both directions, with progress; Enter and F3
 download a file first. Deleting on Google Drive moves to Drive's own trash.
 
