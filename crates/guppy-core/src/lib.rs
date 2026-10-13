@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod config;
+pub mod drives;
 pub mod du;
 pub mod fs;
 pub mod jump;

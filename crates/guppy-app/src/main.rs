@@ -111,6 +111,10 @@ enum Message {
     /// The cursor rested long enough: load the quick view (if still current).
     QuickDue(u64),
     QuickLoaded(PathBuf, ViewBody),
+    /// Click on a palette row: run that command.
+    PaletteRun(usize),
+    /// Click on a drive in the drive picker.
+    DrivePick(usize),
     /// Answer to "target already exists".
     Resolve(Resolve),
     /// Conflict dialog: the answer holds for all later conflicts of the job.
@@ -150,6 +154,10 @@ enum Dialog {
     Conflict { conflict: ops::Conflict, all: bool },
     /// Running and queued jobs.
     Jobs,
+    /// Command palette (Ctrl+P): typed query and selected hit.
+    Palette { query: String, cur: usize },
+    /// Drive picker (Alt+F1 / Alt+F2) for the pane `side`.
+    Drives { side: usize, list: Vec<guppy_core::drives::Drive>, cur: usize },
     /// Mark (`+`) or unmark (`-`) by wildcard pattern.
     Mark { add: bool, pattern: String },
     Report { title: &'static str, problems: Vec<String> },
@@ -341,6 +349,103 @@ fn setting_step(c: &mut Config, row: usize, dir: i32) {
     }
 }
 
+/// Everything the command palette offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cmd {
+    Copy,
+    Move,
+    Trash,
+    Delete,
+    NewDir,
+    Rename,
+    View,
+    Edit,
+    EditExternal,
+    Quick,
+    Mark,
+    Unmark,
+    Invert,
+    Hidden,
+    Sort,
+    Sizes,
+    Jump,
+    Back,
+    Forward,
+    Parent,
+    Home,
+    Switch,
+    DrivesLeft,
+    DrivesRight,
+    Jobs,
+    Look,
+    Settings,
+    Help,
+}
+
+/// Palette entries: (label, key, command).
+const COMMANDS: &[(&str, &str, Cmd)] = &[
+    ("Copy to other pane", "F5", Cmd::Copy),
+    ("Move to other pane", "F6", Cmd::Move),
+    ("Move to trash", "F8", Cmd::Trash),
+    ("Delete permanently", "Shift+F8", Cmd::Delete),
+    ("New folder", "F7", Cmd::NewDir),
+    ("Rename", "F2", Cmd::Rename),
+    ("View file", "F3", Cmd::View),
+    ("Edit file", "F4", Cmd::Edit),
+    ("Edit in external editor", "Shift+F4", Cmd::EditExternal),
+    ("Quick view in other pane", "Ctrl+Q", Cmd::Quick),
+    ("Mark by pattern", "+", Cmd::Mark),
+    ("Unmark by pattern", "-", Cmd::Unmark),
+    ("Invert marks", "*", Cmd::Invert),
+    ("Show / hide hidden files", "Ctrl+H", Cmd::Hidden),
+    ("Sort: name, size, date", "Ctrl+S", Cmd::Sort),
+    ("Recompute folder sizes", "Ctrl+R", Cmd::Sizes),
+    ("Jump to folder", "Ctrl+G", Cmd::Jump),
+    ("Back", "Alt+←", Cmd::Back),
+    ("Forward", "Alt+→", Cmd::Forward),
+    ("Parent folder", "Backspace", Cmd::Parent),
+    ("Home folder", "", Cmd::Home),
+    ("Switch pane", "Tab", Cmd::Switch),
+    ("Drives: left pane", "Alt+F1", Cmd::DrivesLeft),
+    ("Drives: right pane", "Alt+F2", Cmd::DrivesRight),
+    ("Running jobs", "Ctrl+J", Cmd::Jobs),
+    ("Switch look: paper / neon", "", Cmd::Look),
+    ("Settings", "F12", Cmd::Settings),
+    ("Key help", "F1", Cmd::Help),
+];
+
+/// Fuzzy score: all query characters in order; consecutive and word-start hits
+/// count more. `None` if they don't all appear.
+fn fuzzy(query: &str, label: &str) -> Option<i32> {
+    let label: Vec<char> = label.to_lowercase().chars().collect();
+    let mut score = 0;
+    let mut pos = 0;
+    let mut last: Option<usize> = None;
+    for q in query.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
+        let i = pos + label[pos..].iter().position(|&c| c == q)?;
+        score += 1;
+        if last.is_some_and(|l| l + 1 == i) {
+            score += 3;
+        }
+        if i == 0 || !label[i - 1].is_alphanumeric() {
+            score += 5;
+        }
+        last = Some(i);
+        pos = i + 1;
+    }
+    // Earlier and shorter matches first.
+    Some(score * 10 - last.unwrap_or(0) as i32 - label.len() as i32 / 4)
+}
+
+/// Palette hits for `query`, best first (all commands when empty).
+fn palette_hits(query: &str) -> Vec<usize> {
+    let mut hits: Vec<(i32, usize)> = COMMANDS.iter().enumerate().filter_map(|(i, (label, _, _))| fuzzy(query, label).map(|s| (s, i))).collect();
+    if !query.trim().is_empty() {
+        hits.sort_by_key(|(s, i)| (std::cmp::Reverse(*s), *i));
+    }
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
 /// Quick help sections: heading and (key, action).
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Navigation", &[
@@ -376,6 +481,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+V", "paste files here"),
         ("Ctrl+J", "running jobs"),
         ("Ctrl+Q", "quick view in other pane"),
+        ("Ctrl+P", "command palette"),
+        ("Alt+F1 / F2", "drives left / right"),
     ]),
     ("View", &[
         ("F1", "this help"),
@@ -681,6 +788,14 @@ impl Guppy {
                 g.dialog = Some(Dialog::Help { startup: true });
                 return (g, Task::none());
             }
+            if let Some(q) = d.strip_prefix("palette") {
+                g.dialog = Some(Dialog::Palette { query: q.trim_start_matches(':').to_string(), cur: 0 });
+                return (g, Task::none());
+            }
+            if d == "drives" {
+                g.open_drives(0);
+                return (g, Task::none());
+            }
             if d == "help" {
                 g.dialog = Some(Dialog::Help { startup: false });
                 return (g, Task::none());
@@ -873,6 +988,12 @@ impl Guppy {
                 if matches!(self.dialog, Some(Dialog::View { .. })) {
                     return self.on_view_key(key);
                 }
+                if matches!(self.dialog, Some(Dialog::Palette { .. })) {
+                    return self.on_palette_key(key, text.as_deref());
+                }
+                if matches!(self.dialog, Some(Dialog::Drives { .. })) {
+                    return self.on_drives_key(key, text.as_deref());
+                }
                 self.on_dialog_key(key, text.as_deref());
                 return Task::none();
             }
@@ -1026,6 +1147,18 @@ impl Guppy {
                 }
             }
             Message::OpenJobs => self.dialog = Some(Dialog::Jobs),
+            Message::PaletteRun(i) => {
+                self.dialog = None;
+                if let Some((_, _, cmd)) = COMMANDS.get(i) {
+                    return self.run_cmd(*cmd);
+                }
+            }
+            Message::DrivePick(i) => {
+                if let Some(Dialog::Drives { cur, .. }) = &mut self.dialog {
+                    *cur = i;
+                }
+                self.pick_drive();
+            }
             Message::ToggleQuick => {
                 self.quick = !self.quick;
                 self.quick_want = None;
@@ -1108,6 +1241,8 @@ impl Guppy {
             Key::Named(Named::PageUp) => move_to(cur.saturating_sub(page)),
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
+            Key::Named(Named::F1) if m.alt() => self.open_drives(0),
+            Key::Named(Named::F2) if m.alt() => self.open_drives(1),
             Key::Named(Named::F1) => self.dialog = Some(Dialog::Help { startup: false }),
             Key::Named(Named::F2) => {
                 if !self.read_only() {
@@ -1142,24 +1277,17 @@ impl Guppy {
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
             // The cursor keeps its row; the entries reorder beneath it.
-            Key::Character("s") if m.control() => {
-                let p = &mut self.panes[self.active];
-                p.sort = p.sort.next();
-            }
+            Key::Character("s") if m.control() => self.cycle_sort(),
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
             Key::Character("q") if m.control() => return self.update(Message::ToggleQuick),
+            Key::Character("p") if m.control() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
             _ if query_empty && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
                 self.dialog = Some(Dialog::Mark { add: typed == Some("+"), pattern: self.last_pattern.clone() });
             }
             _ if query_empty && !m.control() && !m.alt() && typed == Some("*") => self.invert_marks(),
-            Key::Character("r") if m.control() => {
-                let path = self.panes[self.active].path.clone();
-                self.sizes.invalidate(&path);
-                self.request_sizes(self.active);
-                self.reload(self.active);
-            }
+            Key::Character("r") if m.control() => self.recompute_sizes(),
             // Anything printable without Ctrl/Alt goes into the input.
             _ => match typed {
                 Some(t) if !m.control() && !m.alt() && !m.logo() && t.chars().all(|c| !c.is_control()) => {
@@ -1344,6 +1472,7 @@ impl Guppy {
             },
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
+            Some(d @ (Dialog::Palette { .. } | Dialog::Drives { .. })) => self.dialog = Some(d),
             Some(Dialog::Report { .. } | Dialog::Help { .. } | Dialog::Jobs) | None => {}
         }
     }
@@ -1421,7 +1550,7 @@ impl Guppy {
         }
         match &mut self.dialog {
             None => Some(&mut self.panes[self.active].query),
-            Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. }) => Some(name),
+            Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. } | Dialog::Palette { query: name, .. }) => Some(name),
             Some(Dialog::Settings { edit: Some(text), .. }) => Some(text),
             _ => None,
         }
@@ -1621,6 +1750,129 @@ impl Guppy {
             if !self.jobs.problems.is_empty() && self.dialog.is_none() {
                 self.dialog = Some(Dialog::Report { title: "Done, with notes", problems: std::mem::take(&mut self.jobs.problems) });
             }
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        let p = &mut self.panes[self.active];
+        p.sort = p.sort.next();
+    }
+
+    fn recompute_sizes(&mut self) {
+        let path = self.panes[self.active].path.clone();
+        self.sizes.invalidate(&path);
+        self.request_sizes(self.active);
+        self.reload(self.active);
+    }
+
+    fn on_palette_key(&mut self, key: Key, typed: Option<&str>) -> Task<Message> {
+        let Some(Dialog::Palette { query, cur }) = &mut self.dialog else { return Task::none() };
+        let len = palette_hits(query).len();
+        match key.as_ref() {
+            Key::Named(Named::Escape) => self.dialog = None,
+            Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(len.saturating_sub(1)),
+            Key::Named(Named::ArrowUp) => *cur = cur.saturating_sub(1),
+            Key::Named(Named::Enter) => {
+                let hit = palette_hits(query).get(*cur).copied();
+                self.dialog = None;
+                if let Some(i) = hit {
+                    return self.run_cmd(COMMANDS[i].2);
+                }
+            }
+            Key::Named(Named::Backspace) => {
+                query.pop();
+                *cur = 0;
+            }
+            _ => {
+                if let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) {
+                    query.push_str(t);
+                    *cur = 0;
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Runs a palette command as if its key had been pressed.
+    fn run_cmd(&mut self, cmd: Cmd) -> Task<Message> {
+        match cmd {
+            Cmd::Copy => self.ask(OpKind::Copy),
+            Cmd::Move => self.ask(OpKind::Move),
+            Cmd::Trash => self.ask(OpKind::Trash),
+            Cmd::Delete => self.ask(OpKind::Delete),
+            Cmd::NewDir => self.new_dir(),
+            Cmd::Rename => {
+                if !self.read_only() {
+                    self.start_rename();
+                }
+            }
+            Cmd::View => return self.open_view(),
+            Cmd::Edit => return self.edit_current(),
+            Cmd::EditExternal => self.edit_external(),
+            Cmd::Quick => return self.update(Message::ToggleQuick),
+            Cmd::Mark | Cmd::Unmark => self.dialog = Some(Dialog::Mark { add: cmd == Cmd::Mark, pattern: self.last_pattern.clone() }),
+            Cmd::Invert => self.invert_marks(),
+            Cmd::Hidden => return self.update(Message::ToggleHidden),
+            Cmd::Sort => self.cycle_sort(),
+            Cmd::Sizes => self.recompute_sizes(),
+            Cmd::Jump => self.set_query("~".into()),
+            Cmd::Back => self.history(true),
+            Cmd::Forward => self.history(false),
+            Cmd::Parent => self.go_parent(),
+            Cmd::Home => self.navigate(dirs_home()),
+            Cmd::Switch => self.active = 1 - self.active,
+            Cmd::DrivesLeft => self.open_drives(0),
+            Cmd::DrivesRight => self.open_drives(1),
+            Cmd::Jobs => self.dialog = Some(Dialog::Jobs),
+            Cmd::Look => {
+                let mut new = self.config.clone();
+                new.view.look = if new.view.look == Look::Paper { Look::Neon } else { Look::Paper };
+                self.set_config(new);
+            }
+            Cmd::Settings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
+            Cmd::Help => self.dialog = Some(Dialog::Help { startup: false }),
+        }
+        self.scroll_into_view()
+    }
+
+    /// Opens the drive picker for `side`, with the drive holding its folder selected.
+    fn open_drives(&mut self, side: usize) {
+        let list = guppy_core::drives::list();
+        let here = &self.panes[side].path;
+        let cur = list
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| here.starts_with(&d.path))
+            .max_by_key(|(_, d)| d.path.as_os_str().len())
+            .map_or(0, |(i, _)| i);
+        self.dialog = Some(Dialog::Drives { side, list, cur });
+    }
+
+    fn on_drives_key(&mut self, key: Key, typed: Option<&str>) -> Task<Message> {
+        let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog else { return Task::none() };
+        match key.as_ref() {
+            Key::Named(Named::Escape) => self.dialog = None,
+            Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(list.len().saturating_sub(1)),
+            Key::Named(Named::ArrowUp) => *cur = cur.saturating_sub(1),
+            Key::Named(Named::Home) => *cur = 0,
+            Key::Named(Named::End) => *cur = list.len().saturating_sub(1),
+            Key::Named(Named::Enter) => self.pick_drive(),
+            // 1–9 pick directly.
+            _ => {
+                if let Some(n) = typed.and_then(|t| t.parse::<usize>().ok()).filter(|n| (1..=list.len()).contains(n)) {
+                    *cur = n - 1;
+                    self.pick_drive();
+                }
+            }
+        }
+        self.scroll_into_view()
+    }
+
+    fn pick_drive(&mut self) {
+        let Some(Dialog::Drives { side, list, cur }) = self.dialog.take() else { return };
+        if let Some(d) = list.get(cur) {
+            self.active = side;
+            self.navigate(d.path.clone());
         }
     }
 
@@ -2188,6 +2440,108 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Palette { query, cur } => {
+                let hits = palette_hits(query);
+                let field = container(text(if query.is_empty() { "type a command …".to_string() } else { format!("{query}▏") }).size(13).color(if query.is_empty() { fg } else { rgb(t.bright) }))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                // A window of rows that keeps the selection visible.
+                const SHOWN: usize = 12;
+                let first = cur.saturating_sub(SHOWN - 1);
+                let mut list = column![].spacing(2);
+                for (n, &i) in hits.iter().enumerate().skip(first).take(SHOWN) {
+                    let (label, keys, _) = COMMANDS[i];
+                    let on = n == *cur;
+                    let color = if on { rgb(t.background) } else { rgb(t.bright) };
+                    list = list.push(
+                        button(row![text(label).size(13).color(color).width(Length::Fill), text(keys).size(12).color(if on { color } else { fg })].spacing(12))
+                            .padding([5, 10])
+                            .width(Length::Fill)
+                            .on_press(Message::PaletteRun(i))
+                            .style(move |_, status| button::Style {
+                                background: Some(if on {
+                                    rgb(t.accent)
+                                } else if matches!(status, button::Status::Hovered) {
+                                    Color { a: 0.06, ..Color::WHITE }
+                                } else {
+                                    Color::TRANSPARENT
+                                }
+                                .into()),
+                                border: Border::default().rounded(if self.neon() { 0 } else { 4 }),
+                                ..Default::default()
+                            }),
+                    );
+                }
+                if hits.is_empty() {
+                    list = list.push(small("No matching command".into()));
+                }
+                column![field, list, small("↑↓ choose · Enter runs · Esc closes".into())].spacing(12).into()
+            }
+            Dialog::Drives { side, list, cur } => {
+                let mut rows = column![].spacing(4);
+                for (i, d) in list.iter().enumerate() {
+                    let on = i == *cur;
+                    let main = if on { rgb(t.background) } else { rgb(t.bright) };
+                    let dim = if on { rgb(t.background) } else { fg };
+                    let (frac, space) = match d.space {
+                        Some((total, free)) if total > 0 => (
+                            (total - free) as f32 / total as f32,
+                            format!("{} free of {}", human_size(free), human_size(total)),
+                        ),
+                        _ => (0.0, if d.network { "network".to_string() } else { String::new() }),
+                    };
+                    let bar = iced::widget::progress_bar(0.0..=1.0, frac).girth(4).length(120).style(move |_| iced::widget::progress_bar::Style {
+                        background: Color { a: 0.25, ..Color::BLACK }.into(),
+                        bar: if on { rgb(t.background) } else if frac > 0.9 { rgb(t.red) } else { rgb(t.accent) }.into(),
+                        border: Border::default().rounded(2),
+                    });
+                    let info = column![
+                        row![
+                            text(format!("{}  {}", i + 1, d.label)).size(13).font(BOLD).color(main),
+                            text(d.fs.clone()).size(11).color(dim),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                        text(self.jumper.display(&d.path)).size(11).color(dim).wrapping(iced::widget::text::Wrapping::None),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill);
+                    rows = rows.push(
+                        button(
+                            row![info, column![bar, text(space).size(11).color(dim)].spacing(4).align_x(iced::Alignment::End)]
+                                .spacing(12)
+                                .align_y(iced::Alignment::Center),
+                        )
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .on_press(Message::DrivePick(i))
+                        .style(move |_, status| button::Style {
+                            background: Some(if on {
+                                rgb(t.accent)
+                            } else if matches!(status, button::Status::Hovered) {
+                                Color { a: 0.06, ..Color::WHITE }
+                            } else {
+                                Color::TRANSPARENT
+                            }
+                            .into()),
+                            border: Border::default().rounded(if self.neon() { 0 } else { 4 }),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                column![
+                    title(format!("Drives · {} pane", if *side == 0 { "left" } else { "right" })),
+                    scrollable(rows).height(Length::Shrink),
+                    small("↑↓ choose · Enter or 1–9 opens · Esc closes".into()),
+                ]
+                .spacing(14)
+                .into()
+            }
             Dialog::Mark { add, pattern } => {
                 let field = container(text(format!("{pattern}▏")).size(13).color(rgb(t.bright)))
                     .padding([8, 10])
@@ -2331,7 +2685,7 @@ impl Guppy {
             .width(match dialog {
                 Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
                 Dialog::Help { .. } => Length::Fixed(760.0),
-                Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } => Length::Fixed(560.0),
+                Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } | Dialog::Palette { .. } | Dialog::Drives { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
             })
             .height(if viewer { Length::Fill } else { Length::Shrink })
@@ -2879,4 +3233,20 @@ fn save_ppm(path: &std::ffi::OsStr, shot: &iced::window::Screenshot) {
     let mut out = format!("P6 {} {} 255\n", shot.size.width, shot.size.height).into_bytes();
     out.extend(shot.rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
     let _ = std::fs::write(path, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_finds_commands() {
+        let label = |q: &str| COMMANDS[palette_hits(q)[0]].0;
+        assert_eq!(label("copy"), "Copy to other pane");
+        assert_eq!(label("trash"), "Move to trash");
+        assert_eq!(label("hid"), "Show / hide hidden files");
+        assert_eq!(label("drv r"), "Drives: right pane");
+        assert!(palette_hits("zzzq").is_empty());
+        assert_eq!(palette_hits("").len(), COMMANDS.len());
+    }
 }
