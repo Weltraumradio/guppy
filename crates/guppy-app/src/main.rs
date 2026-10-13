@@ -604,7 +604,8 @@ impl Guppy {
         }
         for side in 0..2 {
             let dir = self.panes[side].path.clone();
-            let touched: Vec<&PathBuf> = paths.iter().filter(|p| p.parent() == Some(dir.as_path()) || **p == dir).collect();
+            // Ereignisse am Ordner selbst (z. B. Zeitstempel) ändern keine Größen.
+            let touched: Vec<&PathBuf> = paths.iter().filter(|p| p.parent() == Some(dir.as_path())).collect();
             if touched.is_empty() {
                 continue;
             }
@@ -632,7 +633,10 @@ impl Guppy {
             let len = p.visible(self.show_hidden, &self.sizes).len();
             p.cursor = p.cursor.min(len.saturating_sub(1));
         }
-        self.request_sizes(side);
+        // Laufende Berechnungen weiterlaufen lassen, nur Fehlendes nachfordern.
+        let p = &self.panes[side];
+        let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
+        self.sizes.request(dirs, p.sizing.clone());
     }
 
     fn set_query(&mut self, q: String) {

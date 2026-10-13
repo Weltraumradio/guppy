@@ -26,7 +26,8 @@ pub enum DirSize {
 #[derive(Default)]
 struct Inner {
     done: Mutex<HashMap<PathBuf, u64>>,
-    running: Mutex<HashMap<PathBuf, Arc<AtomicU64>>>,
+    /// Laufende Berechnungen: Zwischenstand und Abbruch-Signal der Anfrage.
+    running: Mutex<HashMap<PathBuf, (Arc<AtomicU64>, Cancel)>>,
     pending: AtomicUsize,
     /// Dauerhafter Cache: beim Start geladen, beim Beenden gespeichert.
     cached: Mutex<HashMap<PathBuf, u64>>,
@@ -101,15 +102,15 @@ impl DirSizes {
         if let Some(&n) = self.inner.done.lock().unwrap().get(dir) {
             return Some(DirSize::Done(n));
         }
-        if let Some(acc) = self.inner.running.lock().unwrap().get(dir) {
-            // Solange der Zwischenstand kleiner ist, zeigt der Cache den besseren Schätzwert.
-            let partial = acc.load(Ordering::Relaxed);
-            return match self.inner.cached.lock().unwrap().get(dir) {
-                Some(&n) if n > partial => Some(DirSize::Cached(n)),
-                _ => Some(DirSize::Partial(partial)),
-            };
+        let cached = self.inner.cached.lock().unwrap().get(dir).copied();
+        if let Some(n) = cached {
+            // Schätzwert bleibt stehen, bis das neue Ergebnis da ist; kein Hochzählen.
+            return Some(DirSize::Cached(n));
         }
-        self.inner.cached.lock().unwrap().get(dir).map(|&n| DirSize::Cached(n))
+        if let Some((acc, _)) = self.inner.running.lock().unwrap().get(dir) {
+            return Some(DirSize::Partial(acc.load(Ordering::Relaxed)));
+        }
+        None
     }
 
     /// Läuft gerade mindestens eine Berechnung?
@@ -122,7 +123,9 @@ impl DirSizes {
         let todo: Vec<PathBuf> = {
             let done = self.inner.done.lock().unwrap();
             let running = self.inner.running.lock().unwrap();
-            dirs.into_iter().filter(|d| !done.contains_key(d) && !running.contains_key(d)).collect()
+            // Abgebrochene, noch nicht beendete Läufe zählen nicht als laufend.
+            let active = |d: &PathBuf| running.get(d).is_some_and(|(_, c)| !c.is_cancelled());
+            dirs.into_iter().filter(|d| !done.contains_key(d) && !active(d)).collect()
         };
         if todo.is_empty() {
             return;
@@ -132,21 +135,34 @@ impl DirSizes {
         rayon::spawn(move || {
             todo.par_iter().for_each(|dir| {
                 let acc = Arc::new(AtomicU64::new(0));
-                me.inner.running.lock().unwrap().insert(dir.clone(), acc.clone());
+                me.inner.running.lock().unwrap().insert(dir.clone(), (acc.clone(), cancel.clone()));
                 let dev = std::fs::symlink_metadata(dir).map(|m| platform::device(&m)).unwrap_or(0);
                 let links = Mutex::new(HashSet::new());
                 me.walk(dir, dev, &cancel, &links, &acc);
-                me.inner.running.lock().unwrap().remove(dir);
+                {
+                    // Nur den eigenen Eintrag entfernen, nicht den eines neueren Laufs.
+                    let mut running = me.inner.running.lock().unwrap();
+                    if running.get(dir).is_some_and(|(a, _)| Arc::ptr_eq(a, &acc)) {
+                        running.remove(dir);
+                    }
+                }
                 me.inner.pending.fetch_sub(1, Ordering::Relaxed);
             });
         });
     }
 
-    /// Vergisst alles unter `dir` und die Summen der übergeordneten Ordner.
+    /// Markiert alles unter `dir` und die übergeordneten Ordner als veraltet.
+    /// Die alten Werte bleiben als Schätzwert sichtbar, bis neu gerechnet ist.
     pub fn invalidate(&self, dir: &Path) {
-        let keep = |p: &PathBuf, _: &mut u64| !p.starts_with(dir) && !dir.starts_with(p);
-        self.inner.done.lock().unwrap().retain(keep);
-        self.inner.cached.lock().unwrap().retain(keep);
+        let stale = |p: &PathBuf| p.starts_with(dir) || dir.starts_with(p);
+        let mut done = self.inner.done.lock().unwrap();
+        let mut cached = self.inner.cached.lock().unwrap();
+        done.retain(|p, n| {
+            if stale(p) {
+                cached.insert(p.clone(), *n);
+            }
+            !stale(p)
+        });
     }
 
     fn walk(
@@ -189,6 +205,7 @@ impl DirSizes {
             .sum();
         let total = files + sub?;
         self.inner.done.lock().unwrap().insert(dir.to_path_buf(), total);
+        self.inner.cached.lock().unwrap().remove(dir);
         Some(total)
     }
 }
