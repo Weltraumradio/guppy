@@ -1,3 +1,4 @@
+mod clip;
 mod icons;
 mod paper;
 mod watch;
@@ -85,6 +86,8 @@ enum Message {
     EditClose,
     /// Clipboard text for the text field that has the keyboard.
     Paste(Option<String>),
+    /// Files from the clipboard, and whether they were cut.
+    FilesPasted(Option<(Vec<PathBuf>, bool)>),
     /// Click on a settings row: select it and change it one step.
     SettingClick(usize),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
@@ -379,6 +382,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("F7", "new folder"),
         ("F8 Del", "move to trash"),
         ("Shift+F8/Del", "delete permanently"),
+        ("Ctrl+C / X", "copy / cut files to clipboard"),
+        ("Ctrl+V", "paste files here"),
     ]),
     ("View", &[
         ("F1", "this help"),
@@ -708,6 +713,33 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            // On the file list (empty search): files to / from the clipboard.
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if self.dialog.is_none()
+                    && self.rename.is_none()
+                    && self.panes[self.active].query.is_empty()
+                    && clip_key(&key, modifiers).is_some() =>
+            {
+                if clip_key(&key, modifiers) == Some('v') {
+                    return Task::perform(smol::unblock(clip::get), Message::FilesPasted);
+                }
+                let paths = self.selection();
+                if !paths.is_empty()
+                    && let Err(e) = clip::put(&paths, clip_key(&key, modifiers) == Some('x'))
+                {
+                    self.dialog = Some(Dialog::Report { title: "Clipboard", problems: vec![e] });
+                }
+                return Task::none();
+            }
+            Message::FilesPasted(None) => {}
+            Message::FilesPasted(Some((sources, cut))) => {
+                let target = self.panes[self.active].path.clone();
+                if sources.iter().all(|s| s.parent() == Some(target.as_path())) {
+                    self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["The files are already in this folder.".into()] });
+                } else {
+                    self.ask_with(if cut { OpKind::Move } else { OpKind::Copy }, sources, Some(target));
+                }
+            }
             // Copy / cut / paste in every one-line text field.
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
                 if clip_key(&key, modifiers).is_some() && self.field_mut().is_some() =>
@@ -1117,6 +1149,11 @@ impl Guppy {
             self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Source and target are the same folder.".into()] });
             return;
         }
+        self.ask_with(kind, sources, target);
+    }
+
+    /// Asks for confirmation (if configured), then runs the operation.
+    fn ask_with(&mut self, kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) {
         let c = &self.config.confirm;
         let confirm = match kind {
             OpKind::Copy => c.copy,

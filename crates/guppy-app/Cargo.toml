@@ -10,3 +10,4 @@ guppy-core = { version = "0.1.0", path = "../guppy-core" }
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "x11", "wayland", "svg", "canvas", "smol", "image-without-codecs"] }
 notify-debouncer-mini = "0.7.0"
 smol = "2"
+wl-clipboard-rs = "0.9.4"
