@@ -43,6 +43,9 @@ struct State {
     done: AtomicU64,
     finished: AtomicBool,
     cancel: AtomicBool,
+    paused: AtomicBool,
+    /// A running helper process (rclone), stopped and continued with the job.
+    child: std::sync::atomic::AtomicU32,
     current: Mutex<String>,
     problems: Mutex<Vec<String>>,
     /// Open question and its answer; `wake` signals both answers and cancelling.
@@ -101,6 +104,8 @@ impl Job {
 
     pub fn cancel(&self) {
         self.0.cancel.store(true, Ordering::Relaxed);
+        // Ends the helper right away, even a stopped one (and even when the app quits next).
+        self.end_child();
         let _guard = self.0.answer.lock().unwrap();
         self.0.wake.notify_all();
     }
@@ -120,6 +125,66 @@ impl Job {
         *self.0.asking.lock().unwrap() = None;
         *answer = Some(r);
         self.0.wake.notify_all();
+    }
+
+    /// Holds the job at the next file (or the next chunk of a large one) until [`Job::resume`].
+    pub fn pause(&self) {
+        self.0.paused.store(true, Ordering::Relaxed);
+        self.signal_child(true);
+    }
+
+    pub fn resume(&self) {
+        self.0.paused.store(false, Ordering::Relaxed);
+        self.signal_child(false);
+        let _guard = self.0.answer.lock().unwrap();
+        self.0.wake.notify_all();
+    }
+
+    pub fn paused(&self) -> bool {
+        self.0.paused.load(Ordering::Relaxed)
+    }
+
+    #[cfg(unix)]
+    fn signal_child(&self, stop: bool) {
+        let pid = self.0.child.load(Ordering::Relaxed);
+        if pid != 0 {
+            // SAFETY: plain kill(2) on a child we spawned and still own.
+            unsafe { libc::kill(pid as libc::pid_t, if stop { libc::SIGSTOP } else { libc::SIGCONT }) };
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn signal_child(&self, _stop: bool) {}
+
+    #[cfg(unix)]
+    fn end_child(&self) {
+        let pid = self.0.child.load(Ordering::Relaxed);
+        if pid != 0 {
+            // SAFETY: as in signal_child; TERM stays pending until CONT wakes it.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(pid as libc::pid_t, libc::SIGCONT);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn end_child(&self) {}
+
+    /// Registers the helper process (0 when it is gone); a paused job stops it right away.
+    fn set_child(&self, pid: u32) {
+        self.0.child.store(pid, Ordering::Relaxed);
+        if self.paused() {
+            self.signal_child(true);
+        }
+    }
+
+    /// Blocks while paused; returns early when cancelled.
+    fn hold(&self) {
+        let mut guard = self.0.answer.lock().unwrap();
+        while self.paused() && !self.cancelled() {
+            guard = self.0.wake.wait(guard).unwrap();
+        }
     }
 
     fn cancelled(&self) -> bool {
@@ -177,6 +242,7 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
                     let total = sources.iter().map(|s| tree_size(s)).sum();
                     j.0.total.store(total, Ordering::Relaxed);
                     for src in &sources {
+                        j.hold();
                         if j.cancelled() {
                             break;
                         }
@@ -196,6 +262,7 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
             OpKind::Trash | OpKind::Delete => {
                 j.0.total.store(sources.len() as u64, Ordering::Relaxed);
                 for src in &sources {
+                    j.hold();
                     if j.cancelled() {
                         break;
                     }
@@ -227,6 +294,7 @@ fn remote_job(j: &Job, kind: OpKind, sources: &[PathBuf], target: Option<&Path>)
     let Some(target) = target else {
         j.0.total.store(sources.len() as u64, Ordering::Relaxed);
         for src in sources {
+            j.hold();
             if j.cancelled() {
                 break;
             }
@@ -246,6 +314,7 @@ fn remote_job(j: &Job, kind: OpKind, sources: &[PathBuf], target: Option<&Path>)
     let total = sources.iter().map(|s| if remote::is_remote(s) { remote::size(s) } else { tree_size(s) }).sum();
     j.0.total.store(total, Ordering::Relaxed);
     for src in sources {
+        j.hold();
         if j.cancelled() {
             break;
         }
@@ -272,11 +341,12 @@ fn remote_job(j: &Job, kind: OpKind, sources: &[PathBuf], target: Option<&Path>)
         }
         j.set_current(src);
         let base = j.0.done.load(Ordering::Relaxed);
-        let res = remote::transfer(src, &dst, kind == OpKind::Move, |b| {
+        let res = remote::transfer(src, &dst, kind == OpKind::Move, |pid| j.set_child(pid), |b| {
             j.0.done.store(base + b, Ordering::Relaxed);
             !j.cancelled()
         });
         match res {
+            Err(_) if j.cancelled() => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
             Err(e) => j.problem(src, e),
             Ok(()) if kind == OpKind::Move => j.step(Step::Moved { from: src.clone(), to: dst }),
@@ -339,7 +409,7 @@ pub fn undo(steps: Vec<Step>) -> Job {
             }
             match s {
                 Step::Moved { from, to } if crate::remote::is_remote(&from) || crate::remote::is_remote(&to) => {
-                    if let Err(e) = crate::remote::transfer(&to, &from, true, |_| !j.cancelled()) {
+                    if let Err(e) = crate::remote::transfer(&to, &from, true, |pid| j.set_child(pid), |_| !j.cancelled()) {
                         j.problem(&to, e);
                     }
                 }
@@ -405,6 +475,7 @@ fn extract(job: &Job, archive: &Path, sources: &[PathBuf], target: &Path) {
     let res = crate::archive::extract(archive, &members, &tmp, |name, size| {
         *job.0.current.lock().unwrap() = name.rsplit('/').next().unwrap_or(name).to_string();
         job.add_done(size);
+        job.hold();
         !job.cancelled()
     });
     match res {
@@ -435,7 +506,7 @@ pub fn rename(from: &Path, name: &str) -> io::Result<PathBuf> {
         if crate::remote::stat(&to)?.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file with that name already exists"));
         }
-        crate::remote::transfer(from, &to, true, |_| true)?;
+        crate::remote::transfer(from, &to, true, |_| {}, |_| true)?;
         return Ok(to);
     }
     // Only a change of case may hit "itself" on case-insensitive file systems.
@@ -521,6 +592,7 @@ fn place(job: &Job, src: &Path, dst: &Path, src_dir: bool) -> io::Result<Place> 
 }
 
 fn move_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
+    job.hold();
     if job.cancelled() {
         return Ok(());
     }
@@ -561,6 +633,7 @@ fn move_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 fn copy_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
+    job.hold();
     if job.cancelled() {
         return Ok(());
     }
@@ -592,9 +665,39 @@ fn copy_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
         std::fs::set_permissions(&dst, m.permissions())?;
         return Ok(());
     }
+    if m.len() >= CHUNKED {
+        return copy_chunked(job, src, &dst);
+    }
     // On Linux std::fs::copy uses copy_file_range (a reflink on btrfs/XFS).
     std::fs::copy(src, &dst)?;
     job.add_done(m.len());
+    Ok(())
+}
+
+/// Files from this size on are copied in pieces, so progress, pausing and
+/// cancelling don't wait for the whole file.
+const CHUNKED: u64 = 64 << 20;
+
+/// Copies piece by piece; a cancelled copy leaves no half file behind.
+fn copy_chunked(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
+    use std::io::{Read, Write};
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; 4 << 20];
+    loop {
+        job.hold();
+        if job.cancelled() {
+            drop(to);
+            return std::fs::remove_file(dst);
+        }
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        to.write_all(&buf[..n])?;
+        job.add_done(n as u64);
+    }
+    to.set_permissions(from.metadata()?.permissions())?;
     Ok(())
 }
 
@@ -618,6 +721,36 @@ mod tests {
             }
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn pause_resume_cancel() {
+        let root = std::env::temp_dir().join(format!("guppy-pause-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let big: Vec<u8> = (0..CHUNKED + 12345).map(|i| (i % 251) as u8).collect();
+        std::fs::write(a.join("big"), &big).unwrap();
+
+        let job = start(OpKind::Copy, vec![a.join("big")], Some(b.clone()));
+        job.pause();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let p = job.progress();
+        assert!(job.paused() && !p.finished && p.done < p.total, "{} of {}", p.done, p.total);
+        job.resume();
+        let p = wait(&job);
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        assert_eq!(std::fs::read(b.join("big")).unwrap(), big);
+
+        // Cancelling a paused copy wakes it and leaves no half file.
+        std::fs::remove_file(b.join("big")).unwrap();
+        let job = start(OpKind::Copy, vec![a.join("big")], Some(b.clone()));
+        job.pause();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        job.cancel();
+        wait(&job);
+        assert!(!b.join("big").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

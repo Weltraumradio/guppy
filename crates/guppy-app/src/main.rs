@@ -146,6 +146,12 @@ enum Message {
     OpenJobs,
     /// Cancel the running job, or with `true` also everything queued.
     CancelJobs(bool),
+    /// Pause the running job, or resume it.
+    TogglePause,
+    /// Waiting job `n`: move it to the front of the queue.
+    QueueFirst(usize),
+    /// Waiting job `n`: take it out of the queue.
+    QueueDrop(usize),
     /// A file from an archive was extracted for opening (or failed).
     Opened(Result<(), String>),
     /// Trash contents read for "Empty trash".
@@ -433,6 +439,7 @@ enum Cmd {
     DrivesRight,
     Bookmark,
     Jobs,
+    PauseJob,
     Look,
     Settings,
     Help,
@@ -469,6 +476,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Drives & bookmarks: right pane", "Alt+F2", Cmd::DrivesRight),
     ("Bookmark this folder", "Ctrl+D", Cmd::Bookmark),
     ("Running jobs", "Ctrl+J", Cmd::Jobs),
+    ("Pause / resume job", "Ctrl+Shift+J", Cmd::PauseJob),
     ("Switch look: paper / neon", "", Cmd::Look),
     ("Settings", "F12", Cmd::Settings),
     ("Key help", "F1", Cmd::Help),
@@ -549,7 +557,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Shift+F8/Del", "delete permanently"),
         ("Ctrl+C / X", "copy / cut files to clipboard"),
         ("Ctrl+V", "paste files here"),
-        ("Ctrl+J", "running jobs"),
+        ("Ctrl+J", "running jobs (P pauses, Del cancels)"),
+        ("Ctrl+Shift+J", "pause / resume job"),
         ("Ctrl+Q", "quick view in other pane"),
         ("Ctrl+P", "command palette"),
         ("Alt+F1 / F2", "drives & bookmarks"),
@@ -1237,6 +1246,9 @@ impl Guppy {
                     self.dialog = Some(Dialog::Jobs);
                     return Task::none();
                 }
+                if let Some((_, job, _)) = &self.jobs.running {
+                    job.cancel();
+                }
                 let _ = self.sizes.save();
                 return iced::window::close(id);
             }
@@ -1339,6 +1351,19 @@ impl Guppy {
                 }
             }
             Message::OpenJobs => self.dialog = Some(Dialog::Jobs),
+            Message::TogglePause => {
+                if let Some((_, job, _)) = &self.jobs.running {
+                    if job.paused() { job.resume() } else { job.pause() }
+                }
+            }
+            Message::QueueFirst(n) => {
+                if let Some(j) = self.jobs.queue.remove(n) {
+                    self.jobs.queue.push_front(j);
+                }
+            }
+            Message::QueueDrop(n) => {
+                self.jobs.queue.remove(n);
+            }
             Message::PaletteRun(i) => {
                 self.dialog = None;
                 return self.run_palette(i);
@@ -1507,6 +1532,9 @@ impl Guppy {
             // The cursor keeps its row; the entries reorder beneath it.
             Key::Character("s") if m.control() => self.cycle_sort(),
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
+            Key::Character("j" | "J") if m.control() && m.shift() => {
+                let _ = self.update(Message::TogglePause);
+            }
             Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
             Key::Character("q") if m.control() => return self.update(Message::ToggleQuick),
             Key::Character("d") if m.control() => self.bookmark_here(),
@@ -1781,6 +1809,9 @@ impl Guppy {
                 let _ = self.update(Message::CancelJobs(false));
             }
             Key::Character("j") if matches!(self.dialog, Some(Dialog::Jobs)) => self.dialog = None,
+            Key::Character("p") | Key::Named(Named::Space) if matches!(self.dialog, Some(Dialog::Jobs)) => {
+                let _ = self.update(Message::TogglePause);
+            }
             Key::Character(c) if matches!(self.dialog, Some(Dialog::Conflict { .. })) => {
                 let msg = match c {
                     "o" => Message::Resolve(Resolve::Overwrite),
@@ -2192,6 +2223,9 @@ impl Guppy {
             Cmd::DrivesRight => self.open_drives(1),
             Cmd::Bookmark => self.bookmark_here(),
             Cmd::Jobs => self.dialog = Some(Dialog::Jobs),
+            Cmd::PauseJob => {
+                let _ = self.update(Message::TogglePause);
+            }
             Cmd::Look => {
                 let mut new = self.config.clone();
                 new.view.look = if new.view.look == Look::Paper { Look::Neon } else { Look::Paper };
@@ -2908,24 +2942,41 @@ impl Guppy {
                         } else {
                             format!("{} of {}", p.done, p.total)
                         };
-                        c = c.push(text(label.clone()).size(13).color(rgb(t.bright)));
+                        let label = if job.paused() { format!("{label} · paused") } else { label.clone() };
+                        c = c.push(text(label).size(13).color(rgb(if job.paused() { t.accent } else { t.bright })));
                         c = c.push(progress_bar(frac));
                         c = c.push(row![small(p.current), iced::widget::Space::new().width(Length::Fill), small(amount)]);
                     }
                     None => c = c.push(small("Nothing running.".into())),
                 }
                 if !self.jobs.queue.is_empty() {
-                    let waiting: Vec<String> = self.jobs.queue.iter().map(|(.., label)| format!("· {label}")).collect();
-                    c = c.push(column![text("WAITING").size(11).font(BOLD).color(rgb(t.accent)), small(waiting.join("\n"))].spacing(6));
+                    let chip = |label: &'static str, msg: Message| {
+                        button(text(label).size(11)).padding([2, 8]).on_press(msg).style(move |_, status| button::Style {
+                            background: matches!(status, button::Status::Hovered).then(|| Color { a: 0.08, ..Color::WHITE }.into()),
+                            text_color: fg,
+                            border: Border { color: Color { a: 0.2, ..Color::WHITE }, width: 1.0, radius: 4.0.into() },
+                            ..Default::default()
+                        })
+                    };
+                    let mut waiting = column![text("WAITING").size(11).font(BOLD).color(rgb(t.accent))].spacing(6);
+                    for (n, (.., label)) in self.jobs.queue.iter().enumerate() {
+                        let mut line = row![small(format!("· {label}")).width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
+                        if n > 0 {
+                            line = line.push(chip("Next", Message::QueueFirst(n)));
+                        }
+                        waiting = waiting.push(line.push(chip("Remove", Message::QueueDrop(n))));
+                    }
+                    c = c.push(waiting);
                 }
                 if self.close_armed {
                     c = c.push(text("Jobs are still running. Close the window again to quit and cancel them.").size(12).color(rgb(t.red)));
                 }
-                let mut buttons = row![small("Del cancels · Esc closes".into()), iced::widget::Space::new().width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
+                let mut buttons = row![small("P pauses · Del cancels · Esc closes".into()), iced::widget::Space::new().width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
                 if !self.jobs.queue.is_empty() {
                     buttons = buttons.push(btn("Cancel all", Message::CancelJobs(true), false));
                 }
-                if self.jobs.running.is_some() {
+                if let Some((_, job, _)) = &self.jobs.running {
+                    buttons = buttons.push(btn(if job.paused() { "Resume" } else { "Pause" }, Message::TogglePause, false));
                     buttons = buttons.push(btn("Cancel job", Message::CancelJobs(false), false));
                 }
                 c.push(buttons.push(btn("Close", Message::DialogCancel, true))).into()
@@ -3871,7 +3922,13 @@ impl Guppy {
                 };
                 let count = self.jobs.started + self.jobs.queue.len();
                 let of = if count > 1 { format!(" · {} of {count}", self.jobs.started) } else { String::new() };
-                let waiting = if job.conflict().is_some() { " · waiting for you" } else { "" };
+                let waiting = if job.conflict().is_some() {
+                    " · waiting for you"
+                } else if job.paused() {
+                    " · paused"
+                } else {
+                    ""
+                };
                 mouse_area(text(format!("{verb} {pct}%{of}{waiting}")).size(12).color(rgb(t.accent)).wrapping(iced::widget::text::Wrapping::None))
                     .on_press(Message::OpenJobs)
                     .interaction(iced::mouse::Interaction::Pointer)

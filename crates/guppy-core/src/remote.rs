@@ -224,7 +224,8 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
 
 /// Copies or moves `src` to exactly `dst` (either may be local or remote; folders
 /// are merged). `on_bytes` gets the bytes transferred so far and returns false to cancel.
-pub fn transfer(src: &Path, dst: &Path, mv: bool, mut on_bytes: impl FnMut(u64) -> bool) -> io::Result<()> {
+/// `on_child` gets rclone's pid once started and 0 when it is gone (for pausing it).
+pub fn transfer(src: &Path, dst: &Path, mv: bool, on_child: impl Fn(u32), mut on_bytes: impl FnMut(u64) -> bool) -> io::Result<()> {
     let mut child = rclone()
         .arg(if mv { "moveto" } else { "copyto" })
         .arg(arg(src)?)
@@ -234,6 +235,13 @@ pub fn transfer(src: &Path, dst: &Path, mv: bool, mut on_bytes: impl FnMut(u64) 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(missing)?;
+    on_child(child.id());
+    let res = follow(&mut child, &mut on_bytes);
+    on_child(0);
+    res
+}
+
+fn follow(child: &mut std::process::Child, on_bytes: &mut impl FnMut(u64) -> bool) -> io::Result<()> {
     let mut last_error = None;
     for line in io::BufReader::new(child.stderr.take().expect("piped")).lines() {
         let Ok(line) = line else { break };
@@ -260,7 +268,7 @@ pub fn transfer(src: &Path, dst: &Path, mv: bool, mut on_bytes: impl FnMut(u64) 
 pub fn download(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
     let local = dir.join(name);
-    transfer(path, &local, false, |_| true)?;
+    transfer(path, &local, false, |_| {}, |_| true)?;
     Ok(local)
 }
 
@@ -331,7 +339,7 @@ mod tests {
         assert!(remotes_long().unwrap().contains(&("t:".into(), "alias".into())));
         assert_eq!(free_name("t", &remotes_long().unwrap()), "t2");
 
-        transfer(&root.join("src/d"), &r.join("d"), false, |_| true).unwrap();
+        transfer(&root.join("src/d"), &r.join("d"), false, |_| {}, |_| true).unwrap();
         let list = read_dir(&r).unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].is_dir() && list[0].remote && list[0].path == r.join("d"));
@@ -344,7 +352,7 @@ mod tests {
         assert_eq!(size(&r.join("d")), 5);
 
         make_dir(&r.join("new")).unwrap();
-        transfer(&r.join("d/f.txt"), &r.join("new/g.txt"), true, |_| true).unwrap();
+        transfer(&r.join("d/f.txt"), &r.join("new/g.txt"), true, |_| {}, |_| true).unwrap();
         assert_eq!(stat(&r.join("d/f.txt")).unwrap(), None);
         let local = download(&r.join("new/g.txt"), &root).unwrap();
         assert_eq!(std::fs::read_to_string(local).unwrap(), "hello");
