@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod archive;
+pub mod attrs;
 pub mod config;
 pub mod drives;
 pub mod du;

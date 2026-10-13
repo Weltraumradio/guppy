@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::{actions, archive};
+use guppy_core::{actions, archive, attrs};
 use guppy_core::fs::{glob_match, human_date, human_size};
 use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
@@ -162,6 +162,8 @@ enum Dialog {
     Bookmark { path: PathBuf, name: String, edit: Option<usize> },
     /// Mark (`+`) or unmark (`-`) by wildcard pattern.
     Mark { add: bool, pattern: String },
+    /// Permissions and owner (Alt+Enter); `field`: 0 mode, 1 owner, 2 recursive.
+    Attrs { paths: Vec<PathBuf>, mode: String, owner: String, was: (String, String), field: usize, recursive: bool, error: Option<String> },
     Report { title: &'static str, problems: Vec<String> },
     /// Quick help listing all keys (F1); at startup with a "show again" checkbox.
     Help { startup: bool },
@@ -361,6 +363,8 @@ enum Cmd {
     NewDir,
     Rename,
     Undo,
+    Attrs,
+    Link,
     View,
     Edit,
     EditExternal,
@@ -395,6 +399,8 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("New folder", "F7", Cmd::NewDir),
     ("Rename", "F2", Cmd::Rename),
     ("Undo last move, rename or trash", "Ctrl+Z", Cmd::Undo),
+    ("Permissions & owner", "Alt+Enter", Cmd::Attrs),
+    ("Create symlink in other pane", "Ctrl+Shift+F5", Cmd::Link),
     ("View file", "F3", Cmd::View),
     ("Edit file", "F4", Cmd::Edit),
     ("Edit in external editor", "Shift+F4", Cmd::EditExternal),
@@ -489,6 +495,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("F7", "new folder"),
         ("F8 Del", "move to trash"),
         ("Ctrl+Z", "undo move, rename, trash"),
+        ("Alt+Enter", "permissions & owner"),
+        ("Ctrl+Shift+F5", "symlink in other pane"),
         ("Shift+F8/Del", "delete permanently"),
         ("Ctrl+C / X", "copy / cut files to clipboard"),
         ("Ctrl+V", "paste files here"),
@@ -796,6 +804,10 @@ impl Guppy {
             }
             if d == "rename" {
                 g.start_rename();
+                return (g, Task::none());
+            }
+            if d == "attrs" {
+                g.open_attrs();
                 return (g, Task::none());
             }
             if d == "settings" {
@@ -1273,6 +1285,7 @@ impl Guppy {
             Key::Named(Named::F4) => return self.edit_current(),
             Key::Named(Named::F12) => return self.update(Message::OpenSettings),
             Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
+            Key::Named(Named::Enter) if m.alt() && !jumping => self.open_attrs(),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => return self.open_current(),
             Key::Named(Named::Backspace) if !query_empty => {
@@ -1289,6 +1302,7 @@ impl Guppy {
             Key::Named(Named::Space) if query_empty => self.toggle_mark(),
             Key::Named(Named::ArrowLeft) if m.alt() => self.history(true),
             Key::Named(Named::ArrowRight) if m.alt() => self.history(false),
+            Key::Named(Named::F5) if m.control() && m.shift() => self.make_links(),
             Key::Named(Named::F5) => self.ask(OpKind::Copy),
             Key::Named(Named::F6) => self.ask(OpKind::Move),
             Key::Named(Named::F7) => self.new_dir(),
@@ -1492,6 +1506,29 @@ impl Guppy {
                 }
                 Err(e) => self.dialog = Some(Dialog::NewDir { name, error: Some(e.to_string()) }),
             },
+            Some(Dialog::Attrs { paths, mode, owner, was, field, recursive, .. }) => {
+                let mut change = attrs::Change { recursive, ..Default::default() };
+                let error = match attrs::parse_owner(&owner) {
+                    _ if mode != was.0 && attrs::parse_mode(&mode).is_none() => Some("Permissions: octal digits like 755 or 0644".to_string()),
+                    Ok((uid, gid)) => {
+                        change.mode = attrs::parse_mode(&mode).filter(|_| mode != was.0 || recursive);
+                        if owner != was.1 || recursive {
+                            (change.uid, change.gid) = (uid, gid);
+                        }
+                        None
+                    }
+                    Err(e) => Some(e),
+                };
+                if error.is_some() {
+                    self.dialog = Some(Dialog::Attrs { paths, mode, owner, was, field, recursive, error });
+                    return;
+                }
+                let problems = attrs::apply(&paths, &change);
+                self.reload(self.active);
+                if !problems.is_empty() {
+                    self.dialog = Some(Dialog::Report { title: "Not all changed", problems });
+                }
+            }
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
             Some(d @ (Dialog::Palette { .. } | Dialog::Drives { .. })) => self.dialog = Some(d),
@@ -1532,12 +1569,24 @@ impl Guppy {
                 };
                 let _ = self.update(msg);
             }
+            Key::Named(Named::Tab) if matches!(self.dialog, Some(Dialog::Attrs { .. })) => {
+                if let Some(Dialog::Attrs { field, .. }) = &mut self.dialog {
+                    *field = (*field + 1) % 3;
+                }
+            }
+            Key::Named(Named::Space) if matches!(self.dialog, Some(Dialog::Attrs { field: 2, .. })) => {
+                if let Some(Dialog::Attrs { recursive, .. }) = &mut self.dialog {
+                    *recursive = !*recursive;
+                }
+            }
             Key::Named(Named::Space) if matches!(self.dialog, Some(Dialog::Help { startup: true })) => {
                 let _ = self.update(Message::ToggleStartHelp);
             }
             _ => {
                 let (name, error) = match &mut self.dialog {
                     Some(Dialog::NewDir { name, error }) => (name, Some(error)),
+                    Some(Dialog::Attrs { mode, field: 0, error, .. }) => (mode, Some(error)),
+                    Some(Dialog::Attrs { owner, field: 1, error, .. }) => (owner, Some(error)),
                     Some(Dialog::Mark { pattern, .. } | Dialog::Bookmark { name: pattern, .. }) => (pattern, None),
                     _ => return,
                 };
@@ -1574,6 +1623,8 @@ impl Guppy {
             None => Some(&mut self.panes[self.active].query),
             Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. } | Dialog::Palette { query: name, .. } | Dialog::Bookmark { name, .. }) => Some(name),
             Some(Dialog::Settings { edit: Some(text), .. }) => Some(text),
+            Some(Dialog::Attrs { mode, field: 0, .. }) => Some(mode),
+            Some(Dialog::Attrs { owner, field: 1, .. }) => Some(owner),
             _ => None,
         }
     }
@@ -1895,6 +1946,8 @@ impl Guppy {
                 }
             }
             Cmd::Undo => self.undo(),
+            Cmd::Attrs => self.open_attrs(),
+            Cmd::Link => self.make_links(),
             Cmd::View => return self.open_view(),
             Cmd::Edit => return self.edit_current(),
             Cmd::EditExternal => self.edit_external(),
@@ -2053,6 +2106,43 @@ impl Guppy {
             problems: vec!["Copy (F5) extracts files to the other pane; Enter opens a file.".into()],
         });
         true
+    }
+
+    /// Alt+Enter: permissions and owner of the selection.
+    fn open_attrs(&mut self) {
+        if self.read_only() {
+            return;
+        }
+        let paths = self.selection();
+        let Some(first) = paths.first() else { return };
+        match attrs::read(first) {
+            Ok((mode, owner)) => {
+                let mode = format!("{mode:o}");
+                self.dialog = Some(Dialog::Attrs { paths, mode: mode.clone(), owner: owner.clone(), was: (mode, owner), field: 0, recursive: false, error: None });
+            }
+            Err(e) => self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec![e.to_string()] }),
+        }
+    }
+
+    /// Ctrl+Shift+F5: links to the selection in the other pane's folder.
+    fn make_links(&mut self) {
+        if self.read_only() {
+            return;
+        }
+        if self.panes[1 - self.active].archive {
+            self.dialog = Some(Dialog::Report { title: "Archive is read-only", problems: vec!["Links can't be created inside an archive.".into()] });
+            return;
+        }
+        let dir = self.panes[1 - self.active].path.clone();
+        let problems: Vec<String> = self
+            .selection()
+            .iter()
+            .filter_map(|p| attrs::symlink(p, &dir).err().map(|e| format!("{}: {e}", self.jumper.display(p))))
+            .collect();
+        self.reload(1 - self.active);
+        if !problems.is_empty() {
+            self.dialog = Some(Dialog::Report { title: "Not all linked", problems });
+        }
     }
 
     fn new_dir(&mut self) {
@@ -2792,6 +2882,41 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Attrs { paths, mode, owner, field, recursive, error, .. } => {
+                let input = |value: &str, on: bool| {
+                    container(text(if on { format!("{value}▏") } else { value.to_string() }).size(13).color(rgb(t.bright)))
+                        .padding([8, 10])
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                            border: Border { color: if on { rgb(t.accent) } else { Color::TRANSPARENT }, width: 1.0, radius: 4.0.into() },
+                            ..Default::default()
+                        })
+                };
+                let what = match paths.as_slice() {
+                    [one] => self.jumper.display(one),
+                    many => format!("{} items", many.len()),
+                };
+                let hint = attrs::parse_mode(mode).map(attrs::symbolic).unwrap_or_else(|| "?".into());
+                let check = if *recursive { "☑" } else { "☐" };
+                let check_color = if *field == 2 { rgb(t.accent) } else { fg };
+                let mut c = column![
+                    title("Permissions & owner".into()),
+                    small(what),
+                    row![
+                        column![small("Permissions".into()), input(mode, *field == 0), small(hint)].spacing(6).width(Length::Fill),
+                        column![small("Owner (user:group)".into()), input(owner, *field == 1)].spacing(6).width(Length::Fill),
+                    ]
+                    .spacing(12),
+                    text(format!("{check} Also everything inside folders (files keep their execute bits)")).size(12).color(check_color),
+                    small("Tab next field · Space toggles · changing the owner usually needs root".into()),
+                ]
+                .spacing(14);
+                if let Some(e) = error {
+                    c = c.push(text(e.clone()).size(12).color(rgb(t.red)));
+                }
+                c.push(buttons("Apply")).into()
+            }
             Dialog::Mark { add, pattern } => {
                 let field = container(text(format!("{pattern}▏")).size(13).color(rgb(t.bright)))
                     .padding([8, 10])
@@ -2935,7 +3060,7 @@ impl Guppy {
             .width(match dialog {
                 Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
                 Dialog::Help { .. } => Length::Fixed(760.0),
-                Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } | Dialog::Palette { .. } | Dialog::Drives { .. } => Length::Fixed(560.0),
+                Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } | Dialog::Palette { .. } | Dialog::Drives { .. } | Dialog::Attrs { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
             })
             .height(if viewer { Length::Fill } else { Length::Shrink })
