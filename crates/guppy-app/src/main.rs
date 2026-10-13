@@ -3,7 +3,7 @@ mod icons;
 mod paper;
 mod watch;
 
-use paper::Paper;
+use paper::{Paper, Scanlines};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::time::Duration;
 use guppy_core::archive;
 use guppy_core::fs::{glob_match, human_date, human_size};
 use guppy_core::ops::{self, Job, OpKind, Resolve};
-use guppy_core::config::SortBy;
+use guppy_core::config::{Look, SortBy};
 use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
@@ -46,6 +46,14 @@ fn main() -> iced::Result {
         // On close, save the size cache first.
         .exit_on_close_request(false)
         .run()
+}
+
+/// Colors for a look: neon is a fixed palette, paper follows the Omarchy theme.
+fn load_theme(look: Look) -> guppy_core::Theme {
+    match look {
+        Look::Paper => guppy_core::Theme::load(),
+        Look::Neon => guppy_core::Theme::neon(),
+    }
 }
 
 fn rgb(c: u32) -> Color {
@@ -364,6 +372,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ("Start folders", "Right pane"),
     ("Network drives", "Parallel accesses"),
     ("Startup", "Show key help"),
+    ("Appearance", "Look"),
 ];
 
 /// Rows 7 and 8 hold paths and are edited as text.
@@ -385,7 +394,8 @@ fn setting_value(c: &Config, row: usize) -> String {
         7 => path(&c.start.left),
         8 => path(&c.start.right),
         9 => c.network.threads.to_string(),
-        _ => on(c.start.help),
+        10 => on(c.start.help),
+        _ => c.view.look.name().to_string(),
     }
 }
 
@@ -406,6 +416,7 @@ fn setting_step(c: &mut Config, row: usize, dir: i32) {
         6 => flip(&mut c.confirm.delete),
         9 => c.network.threads = (c.network.threads as i32 + dir).clamp(1, 32) as usize,
         10 => flip(&mut c.start.help),
+        11 => c.view.look = if c.view.look == Look::Paper { Look::Neon } else { Look::Paper },
         _ => {}
     }
 }
@@ -633,6 +644,7 @@ struct Guppy {
     active: usize,
     show_hidden: bool,
     papers: [Paper; 2],
+    scanlines: [Scanlines; 2],
     sizes: DirSizes,
     jumper: Jumper,
     /// Jump mode hits and the selected row.
@@ -673,7 +685,7 @@ impl Guppy {
         let (config, config_error) = Config::load();
         guppy_core::du::set_network_threads(config.network.threads);
         let mut g = Self {
-            theme: guppy_core::Theme::load(),
+            theme: load_theme(config.view.look),
             panes: [
                 Pane::new(Config::resolve(&config.start.left, &cwd), "pane-left"),
                 Pane::new(Config::resolve(&config.start.right, &cwd), "pane-right"),
@@ -681,6 +693,7 @@ impl Guppy {
             active: 0,
             show_hidden: config.view.show_hidden,
             papers: [Paper::new(1), Paper::new(2)],
+            scanlines: [Scanlines::default(), Scanlines::default()],
             sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
             jumper: Jumper::load(),
             jump: Vec::new(),
@@ -1281,6 +1294,9 @@ impl Guppy {
             let sort = sort_from(v.sort);
             self.panes.iter_mut().for_each(|p| p.sort = sort);
         }
+        if v.look != old.view.look {
+            self.theme = load_theme(v.look);
+        }
         if v.dir_sizes && !old.view.dir_sizes {
             self.request_sizes(0);
             self.request_sizes(1);
@@ -1688,7 +1704,7 @@ impl Guppy {
     fn on_fs_changed(&mut self, paths: &[PathBuf]) {
         let theme_dir = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf));
         if theme_dir.is_some_and(|t| paths.iter().any(|p| p.starts_with(&t) || t.starts_with(p))) {
-            self.theme = guppy_core::Theme::load();
+            self.theme = load_theme(self.config.view.look);
         }
         if let Some(cfg) = Config::path()
             && paths.contains(&cfg)
@@ -2376,8 +2392,8 @@ impl Guppy {
             .height(if viewer { Length::Fill } else { Length::Shrink })
             .max_width(1400)
         .style(move |_| container::Style {
-            background: Some(rgb(0x57534a).into()),
-            border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
+            background: Some(rgb(t.sheet).into()),
+            border: Border { color: rgb(t.accent), width: 1.5, radius: self.radius().into() },
             ..Default::default()
         });
         Some(
@@ -2436,7 +2452,7 @@ impl Guppy {
         };
         let p = &self.panes[self.active];
         let bar = row![
-            text("◆").color(rgb(t.accent)).font(BOLD).size(13),
+            text(if self.neon() { ">_" } else { "◆" }).color(rgb(t.accent)).font(BOLD).size(13),
             iced::widget::Space::new().width(10),
             self.icon_button(icons::BACK, "Back (Alt ←)", (!p.back.is_empty()).then_some(Message::Back)),
             self.icon_button(icons::FORWARD, "Forward (Alt →)", (!p.forward.is_empty()).then_some(Message::Forward)),
@@ -2468,13 +2484,21 @@ impl Guppy {
             .into()
     }
 
+    fn neon(&self) -> bool {
+        self.config.view.look == Look::Neon
+    }
+
+    fn radius(&self) -> f32 {
+        if self.neon() { 0.0 } else { SHEET_RADIUS }
+    }
+
     fn class_color(&self, c: FileClass) -> Color {
         let t = &self.theme;
         match c {
             FileClass::Dir => rgb(t.bright),
-            FileClass::Code => rgb(0xe5a45a),
+            FileClass::Code => rgb(t.code),
             FileClass::Doc | FileClass::Other => rgb(t.foreground),
-            FileClass::Image => rgb(0xb69be0),
+            FileClass::Image => rgb(t.image),
             FileClass::Archive => rgb(t.red),
         }
     }
@@ -2486,6 +2510,7 @@ impl Guppy {
         let list = p.visible(self.show_hidden, &self.sizes);
         let max_size = list.iter().filter_map(|e| entry_size(e, &self.sizes)).max().unwrap_or(0);
 
+        let row_radius = if self.neon() { 0 } else { 3 };
         let rows = list.iter().enumerate().map(|(i, e)| {
             let marked = p.marked.contains(&e.path);
             let is_cur = i == p.cursor;
@@ -2610,7 +2635,7 @@ impl Guppy {
                     .center_y(ROW_H)
                     .style(move |_| container::Style {
                         background: bg.map(Background::Color),
-                        border: Border::default().rounded(3),
+                        border: Border::default().rounded(row_radius),
                         ..Default::default()
                     }),
             )
@@ -2628,6 +2653,7 @@ impl Guppy {
                             let state = if l.since.elapsed() >= LOAD_SLOW { "not responding · Esc cancels" } else { "loading …" };
                             format!("{} · {state}", l.path.display())
                         }
+                        _ if self.neon() => format!("» {}", p.path.display()),
                         _ => p.path.display().to_string(),
                     })
                         .size(12)
@@ -2678,8 +2704,10 @@ impl Guppy {
             .height(Length::Fill);
 
         let body: Element<'_, Message> = if active && self.jumping() { self.jump_view() } else { list.into() };
-        let tone = if active { 0x57534a } else { 0x4f4b43 };
-        let sheet = self.sheet(column![header, body].into(), &self.papers[side], tone, active.then_some(rgb(t.accent)))
+        let tone = if active { t.sheet } else { t.sheet_dim };
+        // Neon frames both panes; paper outlines only the active one.
+        let outline = if active { Some(rgb(t.accent)) } else { self.neon().then(|| rgb(t.muted)) };
+        let sheet = self.sheet(column![header, body].into(), side, tone, outline)
             .width(Length::FillPortion(3));
         mouse_area(sheet).on_enter(Message::HoverPane(side)).into()
     }
@@ -2716,25 +2744,21 @@ impl Guppy {
     }
 
     /// A sheet of paper: grain texture under the content, optionally with a colored border.
-    fn sheet<'a>(
-        &'a self,
-        content: Element<'a, Message>,
-        paper: &'a Paper,
-        tone: u32,
-        outline: Option<Color>,
-    ) -> container::Container<'a, Message> {
-        container(iced::widget::stack![
-            iced::widget::canvas(paper).width(Length::Fill).height(Length::Fill),
-            content,
-        ])
+    fn sheet<'a>(&'a self, content: Element<'a, Message>, side: usize, tone: u32, outline: Option<Color>) -> container::Container<'a, Message> {
+        let texture: Element<'a, Message> = if self.neon() {
+            iced::widget::canvas(&self.scanlines[side]).width(Length::Fill).height(Length::Fill).into()
+        } else {
+            iced::widget::canvas(&self.papers[side]).width(Length::Fill).height(Length::Fill).into()
+        };
+        container(iced::widget::stack![texture, content])
         .clip(true)
         .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(rgb(tone).into()),
             border: Border {
                 color: outline.unwrap_or(Color::TRANSPARENT),
-                width: 1.5,
-                radius: SHEET_RADIUS.into(),
+                width: if self.neon() { 1.0 } else { 1.5 },
+                radius: self.radius().into(),
             },
             ..Default::default()
         })
@@ -2766,7 +2790,7 @@ impl Guppy {
         let jumping = self.jumping();
         let (mode, mode_color) = if jumping { ("JUMP", rgb(t.accent)) } else { ("FILTER", dim) };
         let query: Element<'_, Message> = if p.query.is_empty() {
-            text("type to filter · ~ to jump").size(12).color(rgb(0x555555)).wrapping(iced::widget::text::Wrapping::None).into()
+            text("type to filter · ~ to jump").size(12).color(if self.neon() { rgb(t.light_foreground) } else { rgb(0x555555) }).wrapping(iced::widget::text::Wrapping::None).into()
         } else {
             text(format!("{}▏", p.query)).size(12).color(rgb(t.bright)).into()
         };
@@ -2778,8 +2802,8 @@ impl Guppy {
             .width(300)
             .padding([6, 10])
             .style(move |_| container::Style {
-                background: Some(rgb(0x1a1a1a).into()),
-                border: Border::default().rounded(6),
+                background: Some(if self.neon() { rgb(t.sheet) } else { rgb(0x1a1a1a) }.into()),
+                border: if self.neon() { Border { color: rgb(t.muted), width: 1.0, radius: 0.0.into() } } else { Border::default().rounded(6) },
                 ..Default::default()
             });
 

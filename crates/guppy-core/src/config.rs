@@ -49,6 +49,27 @@ pub struct View {
     pub sort: SortBy,
     /// Compute folder sizes automatically; otherwise only on Ctrl+R.
     pub dir_sizes: bool,
+    pub look: Look,
+}
+
+/// Overall appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Look {
+    /// Warm paper sheets in the Omarchy theme's colors.
+    #[default]
+    Paper,
+    /// Cyberpunk terminal: black glass, neon lines, scanlines.
+    Neon,
+}
+
+impl Look {
+    pub fn name(self) -> &'static str {
+        match self {
+            Look::Paper => "paper",
+            Look::Neon => "neon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -82,7 +103,7 @@ impl Default for Start {
 
 impl Default for View {
     fn default() -> Self {
-        Self { show_hidden: false, sort: SortBy::Name, dir_sizes: true }
+        Self { show_hidden: false, sort: SortBy::Name, dir_sizes: true, look: Look::Paper }
     }
 }
 
@@ -110,6 +131,7 @@ help = true        # show the key help at startup
 show_hidden = false
 sort = "name"      # "name", "size" or "date"
 dir_sizes = true   # compute folder sizes automatically (otherwise only on Ctrl+R)
+look = "paper"     # "paper" (Omarchy colors) or "neon" (cyberpunk terminal)
 
 [confirm]
 # Ask before these operations. Progress is shown either way.
@@ -168,6 +190,7 @@ impl Config {
                 ("view", "show_hidden") => self.view.show_hidden.to_string(),
                 ("view", "sort") => q(self.view.sort.name()),
                 ("view", "dir_sizes") => self.view.dir_sizes.to_string(),
+                ("view", "look") => q(self.view.look.name()),
                 ("confirm", "copy") => self.confirm.copy.to_string(),
                 ("confirm", "move") => self.confirm.move_.to_string(),
                 ("confirm", "trash") => self.confirm.trash.to_string(),

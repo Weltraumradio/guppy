@@ -19,6 +19,12 @@ pub struct Theme {
     pub bright: Rgb,
     pub red: Rgb,
     pub marked: Rgb,
+    /// Pane background, active and inactive.
+    pub sheet: Rgb,
+    pub sheet_dim: Rgb,
+    /// File-type colors.
+    pub code: Rgb,
+    pub image: Rgb,
 }
 
 impl Default for Theme {
@@ -36,6 +42,10 @@ impl Default for Theme {
             bright: 0xeaeaea,
             red: 0xd35f5f,
             marked: 0xffc107,
+            sheet: 0x57534a,
+            sheet_dim: 0x4f4b43,
+            code: 0xe5a45a,
+            image: 0xb69be0,
         }
     }
 }
@@ -87,6 +97,28 @@ impl Theme {
             bright: hex(&raw.bright_cyan).unwrap_or(d.bright),
             red: hex(&raw.red).unwrap_or(d.red),
             marked: hex(&raw.bright_green).unwrap_or(d.marked),
+            ..d
+        }
+    }
+
+    /// Fixed cyberpunk palette: near-black glass, cyan lines, magenta and yellow highlights.
+    pub fn neon() -> Self {
+        Self {
+            accent: 0x00f0ff,
+            background: 0x05060a,
+            dark_background: 0x05060a,
+            lighter_background: 0x121826,
+            selection: 0x1c2438,
+            muted: 0x26304a,
+            foreground: 0x8ea3c4,
+            light_foreground: 0x5b6d8f,
+            bright: 0xd8fbff,
+            red: 0xff2a6d,
+            marked: 0xf5e400,
+            sheet: 0x0a0d16,
+            sheet_dim: 0x080a11,
+            code: 0xff5fa2,
+            image: 0xb967ff,
         }
     }
 }
