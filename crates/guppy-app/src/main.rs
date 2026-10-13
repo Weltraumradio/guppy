@@ -647,13 +647,10 @@ impl Guppy {
             Key::Named(Named::F8 | Named::Delete) if m.shift() => self.ask(OpKind::Delete),
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
+            // The cursor keeps its row; the entries reorder beneath it.
             Key::Character("s") if m.control() => {
-                // Cursor stays on the same entry.
-                let path = self.current().map(|e| e.path.clone());
                 let p = &mut self.panes[self.active];
                 p.sort = p.sort.next();
-                let pos = self.panes[self.active].visible(self.show_hidden, &self.sizes).iter().position(|e| Some(&e.path) == path.as_ref());
-                self.panes[self.active].cursor = pos.unwrap_or(0);
             }
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("r") if m.control() => {
