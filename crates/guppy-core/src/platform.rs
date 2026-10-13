@@ -63,3 +63,28 @@ pub fn open(path: &Path) -> io::Result<()> {
 pub fn is_jump_prefix(c: char) -> bool {
     c == '~' || (cfg!(unix) && c == '/')
 }
+
+/// Liegt `path` auf einem Netzlaufwerk (NFS, SMB, SSHFS, WebDAV …)?
+/// Dort wird schonender gearbeitet: weniger parallele Zugriffe, flachere Suche.
+#[cfg(target_os = "linux")]
+pub fn is_network(path: &Path) -> bool {
+    const NET: &[&str] = &["nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "9p", "davfs", "fuse.sshfs", "fuse.rclone", "fuse.davfs2", "fuse.smbnetfs", "fuse.gvfsd-fuse"];
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else { return false };
+    // Der längste passende Einhängepunkt bestimmt das Dateisystem.
+    mounts
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split(' ');
+            let (_, mnt, fs) = (it.next()?, it.next()?, it.next()?);
+            // Leerzeichen sind in /proc/self/mounts als \040 kodiert.
+            let mnt = mnt.replace("\\040", " ");
+            path.starts_with(&mnt).then(|| (mnt.len(), NET.contains(&fs)))
+        })
+        .max_by_key(|(len, _)| *len)
+        .is_some_and(|(_, net)| net)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_network(_: &Path) -> bool {
+    false
+}

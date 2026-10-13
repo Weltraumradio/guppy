@@ -23,6 +23,9 @@ pub struct Jumper {
     /// Unterordner des aktuellen Ordners, im Hintergrund eingelesen.
     nearby: Arc<Mutex<(PathBuf, Vec<PathBuf>)>>,
     indexing: Arc<AtomicBool>,
+    /// Im Hintergrund geprüft, ob gespeicherte Ziele noch existieren; so blockiert
+    /// ein nicht erreichbares NAS nie die Suche.
+    alive: Arc<Mutex<HashMap<PathBuf, bool>>>,
     db: Option<PathBuf>,
     home: String,
 }
@@ -48,14 +51,31 @@ impl Jumper {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
+        let me = Self {
             visits,
             zoxide: load_zoxide(),
             nearby: Default::default(),
             indexing: Default::default(),
+            alive: Default::default(),
             db,
             home: std::env::var("HOME").unwrap_or_default(),
-        }
+        };
+        me.check_alive();
+        me
+    }
+
+    /// Prüft alle gespeicherten Ziele im Hintergrund, lokale zuerst.
+    fn check_alive(&self) {
+        let mut paths: Vec<PathBuf> = self.visits.keys().chain(self.zoxide.keys()).cloned().collect();
+        paths.sort_by_key(|p| crate::platform::is_network(p));
+        paths.dedup();
+        let alive = self.alive.clone();
+        std::thread::spawn(move || {
+            for p in paths {
+                let ok = p.is_dir();
+                alive.lock().unwrap().insert(p, ok);
+            }
+        });
     }
 
     pub fn visit(&mut self, dir: &Path) {
@@ -76,7 +96,7 @@ impl Jumper {
         let _ = std::fs::write(db, out);
     }
 
-    /// Liest Unterordner von `root` (bis Tiefe 4, max. 20 000) im Hintergrund ein.
+    /// Liest Unterordner von `root` (bis Tiefe 4, max. 20 000; im Netz Tiefe 2) im Hintergrund ein.
     pub fn index_nearby(&self, root: &Path) {
         if self.nearby.lock().unwrap().0 == root {
             return;
@@ -85,11 +105,13 @@ impl Jumper {
         let indexing = self.indexing.clone();
         indexing.store(true, Ordering::Relaxed);
         let root = root.to_path_buf();
+        // Auf Netzlaufwerken flacher suchen: jede Ebene kostet dort Netzwerk-Anfragen.
+        let (depth, max) = if crate::platform::is_network(&root) { (2, 5_000) } else { (4, 20_000) };
         *nearby.lock().unwrap() = (root.clone(), Vec::new());
         std::thread::spawn(move || {
             let mut found = Vec::new();
             let mut level = vec![root.clone()];
-            for _ in 0..4 {
+            for _ in 0..depth {
                 let mut next = Vec::new();
                 for dir in &level {
                     let Ok(rd) = std::fs::read_dir(dir) else { continue };
@@ -104,7 +126,7 @@ impl Jumper {
                     }
                 }
                 found.extend(next.iter().cloned());
-                if found.len() > 20_000 {
+                if found.len() > max {
                     break;
                 }
                 level = next;
@@ -142,7 +164,11 @@ impl Jumper {
         candidates.extend(self.nearby.lock().unwrap().1.iter().cloned());
         candidates.sort();
         candidates.dedup();
-        candidates.retain(|p| p.is_dir());
+        {
+            // Ungeprüfte Ziele bleiben drin; nur sicher verschwundene fallen weg.
+            let alive = self.alive.lock().unwrap();
+            candidates.retain(|p| alive.get(p) != Some(&false));
+        }
 
         let query = query.trim();
         if query.is_empty() {

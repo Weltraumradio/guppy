@@ -54,6 +54,14 @@ impl Cancel {
     }
 }
 
+/// Parallele Zugriffe pro Netzlaufwerk-Berechnung.
+const NET_THREADS: usize = 4;
+
+fn net_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(NET_THREADS).build().expect("Thread-Pool"))
+}
+
 impl DirSizes {
     /// Standardort des Caches, z. B. `~/.cache/guppy/sizes.tsv`.
     pub fn default_cache_file() -> Option<PathBuf> {
@@ -130,9 +138,10 @@ impl DirSizes {
         if todo.is_empty() {
             return;
         }
+        let todo_is_network = platform::is_network(&todo[0]);
         self.inner.pending.fetch_add(todo.len(), Ordering::Relaxed);
         let me = self.clone();
-        rayon::spawn(move || {
+        let job = move || {
             todo.par_iter().for_each(|dir| {
                 let acc = Arc::new(AtomicU64::new(0));
                 me.inner.running.lock().unwrap().insert(dir.clone(), (acc.clone(), cancel.clone()));
@@ -148,7 +157,14 @@ impl DirSizes {
                 }
                 me.inner.pending.fetch_sub(1, Ordering::Relaxed);
             });
-        });
+        };
+        // Netzlaufwerke: eigener kleiner Pool, damit das NAS nicht mit Dutzenden
+        // gleichzeitigen Anfragen überlastet wird und lokale Ordner nicht warten.
+        if todo_is_network {
+            net_pool().spawn(job);
+        } else {
+            rayon::spawn(job);
+        }
     }
 
     /// Markiert alles unter `dir` und die übergeordneten Ordner als veraltet.

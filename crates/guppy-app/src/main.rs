@@ -194,7 +194,37 @@ struct Pane {
     /// Ziel des weichen Scrollens; `None` = keine Animation.
     scroll_target: Option<f32>,
     id: Id,
+    /// Liegt auf einem Netzlaufwerk.
+    network: bool,
 }
+
+/// Was nach dem Einlesen eines Ordners passiert.
+#[derive(Clone)]
+enum After {
+    /// Startordner beim Programmstart.
+    Start,
+    Nav,
+    Back,
+    Forward,
+    /// Hoch, Cursor auf den Ordner, aus dem wir kamen.
+    Parent(PathBuf),
+    /// Gleicher Ordner, neu eingelesen; Cursor bleibt auf seinem Eintrag.
+    Reload,
+}
+
+/// Ordner, der gerade im Hintergrund eingelesen wird.
+struct Loading {
+    path: PathBuf,
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<Entry>>>,
+    since: std::time::Instant,
+    after: After,
+}
+
+/// So lange wird synchron auf das Einlesen gewartet; lokale Ordner sind fast immer
+/// schneller und erscheinen damit ohne Zwischenzustand.
+const LOAD_WAIT: Duration = Duration::from_millis(120);
+/// Ab dann gilt ein Ordner als „antwortet nicht“.
+const LOAD_SLOW: Duration = Duration::from_secs(3);
 
 impl Pane {
     fn new(path: PathBuf, id: &'static str) -> Self {
@@ -212,23 +242,24 @@ impl Pane {
             view_h: 400.0,
             scroll_target: None,
             id: Id::new(id),
+            network: false,
         };
-        p.load(path);
+        p.network = guppy_core::platform::is_network(&path);
+        p.path = path;
         p
     }
 
-    fn load(&mut self, path: PathBuf) {
-        // Unlesbare Ordner (Rechte) lassen die Ansicht unverändert.
-        if let Ok(entries) = guppy_core::read_dir(&path) {
-            self.entries = entries;
-            self.path = path;
-            self.cursor = 0;
-            self.marked.clear();
-            self.query.clear();
-            // Neuer Ordner beginnt oben, ohne Animation.
-            self.scroll_y = 0.0;
-            self.scroll_target = Some(0.0);
-        }
+    /// Zeigt einen frisch eingelesenen Ordner an.
+    fn enter(&mut self, path: PathBuf, entries: Vec<Entry>) {
+        self.network = guppy_core::platform::is_network(&path);
+        self.entries = entries;
+        self.path = path;
+        self.cursor = 0;
+        self.marked.clear();
+        self.query.clear();
+        // Neuer Ordner beginnt oben, ohne Animation.
+        self.scroll_y = 0.0;
+        self.scroll_target = Some(0.0);
     }
 
     fn visible(&self, hidden: bool, sizes: &DirSizes) -> Vec<&Entry> {
@@ -270,6 +301,8 @@ struct Guppy {
     /// Zeitpunkt, ab dem die Vorschau geladen wird.
     /// Letzte Cursorbewegung, um Tastenwiederholung zu erkennen.
     last_move: Option<std::time::Instant>,
+    /// Ordner, die pro Seite gerade eingelesen werden.
+    loads: [Option<Loading>; 2],
 }
 
 impl Guppy {
@@ -292,9 +325,12 @@ impl Guppy {
             last_frame: None,
             width: 1200.0,
             last_move: None,
+            loads: [None, None],
         };
-        g.request_sizes(0);
-        g.request_sizes(1);
+        for side in 0..2 {
+            let path = g.panes[side].path.clone();
+            g.load(side, path, After::Start);
+        }
         // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
@@ -353,7 +389,8 @@ impl Guppy {
         }
         // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
         let running = matches!(self.dialog, Some(Dialog::Running { .. }));
-        if self.sizes.busy() || self.jump_pending || running || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+        let loading = self.loads.iter().any(Option::is_some);
+        if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
             keys
@@ -396,6 +433,10 @@ impl Guppy {
                     self.update_jump();
                     self.jump_cur = cur.min(self.jump.len().saturating_sub(1));
                 }
+                return Task::none();
+            }
+            Message::Tick if self.loads.iter().any(Option::is_some) => {
+                self.poll_loads();
                 return Task::none();
             }
             Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending => {
@@ -495,6 +536,8 @@ impl Guppy {
                 self.set_query(q);
             }
             Key::Named(Named::Backspace) => self.go_parent(),
+            // Esc bricht zuerst einen hängenden Ordnerwechsel ab, dann die Suche.
+            Key::Named(Named::Escape) if self.loads[self.active].is_some() => self.loads[self.active] = None,
             Key::Named(Named::Escape) => self.set_query(String::new()),
             Key::Named(Named::Tab) => self.active = 1 - self.active,
             Key::Named(Named::Insert) => self.toggle_mark(),
@@ -520,6 +563,7 @@ impl Guppy {
                 let path = self.panes[self.active].path.clone();
                 self.sizes.invalidate(&path);
                 self.request_sizes(self.active);
+                self.reload(self.active);
             }
             // Alles Druckbare ohne Strg/Alt landet in der Eingabe.
             _ => match typed {
@@ -634,31 +678,98 @@ impl Guppy {
             for p in touched {
                 self.sizes.invalidate(p);
             }
-            // Cursor auf demselben Eintrag halten.
-            let keep = (side == self.active).then(|| self.current().map(|e| e.path.clone())).flatten();
             self.reload(side);
-            if let Some(keep) = keep {
-                let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == keep);
-                if let Some(i) = pos {
-                    self.panes[side].cursor = i;
-                }
+        }
+    }
+
+    /// Liest den Ordner neu ein und behält den Cursor auf seinem Eintrag.
+    fn reload(&mut self, side: usize) {
+        let path = self.panes[side].path.clone();
+        self.load(side, path, After::Reload);
+    }
+
+    /// Liest einen Ordner im Hintergrund ein. Ist er schnell da (lokal fast immer),
+    /// wird er sofort angezeigt; sonst bleibt die Oberfläche bedienbar, bis er kommt.
+    fn load(&mut self, side: usize, path: PathBuf, after: After) {
+        // Ein Neueinlesen ersetzt keinen laufenden Ordnerwechsel.
+        if matches!(after, After::Reload) && self.loads[side].is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(guppy_core::read_dir(&p));
+        });
+        match rx.recv_timeout(LOAD_WAIT) {
+            Ok(res) => {
+                self.loads[side] = None;
+                self.finish_load(side, path, res, after);
+            }
+            Err(_) => self.loads[side] = Some(Loading { path, rx, since: std::time::Instant::now(), after }),
+        }
+    }
+
+    fn poll_loads(&mut self) {
+        for side in 0..2 {
+            let Some(l) = &self.loads[side] else { continue };
+            if let Ok(res) = l.rx.try_recv() {
+                let l = self.loads[side].take().unwrap();
+                self.finish_load(side, l.path, res, l.after);
             }
         }
     }
 
-    /// Liest den Ordner neu ein und behält den Cursor so gut es geht.
-    fn reload(&mut self, side: usize) {
-        let p = &mut self.panes[side];
-        if let Ok(entries) = guppy_core::read_dir(&p.path) {
+    fn finish_load(&mut self, side: usize, path: PathBuf, res: std::io::Result<Vec<Entry>>, after: After) {
+        let entries = match res {
+            Ok(entries) => entries,
+            Err(e) => {
+                // Unlesbar (Rechte, NAS weg): Ansicht bleibt, wie sie war.
+                if !matches!(after, After::Reload | After::Start) {
+                    self.dialog = Some(Dialog::Report { problems: vec![format!("{}: {e}", self.jumper.display(&path))] });
+                }
+                return;
+            }
+        };
+        if let After::Reload = after {
+            let keep = self.panes[side].visible(self.show_hidden, &self.sizes).get(self.panes[side].cursor).map(|e| e.path.clone());
+            let p = &mut self.panes[side];
+            if p.path != path {
+                return;
+            }
             p.entries = entries;
-            p.marked.retain(|m| m.exists());
-            let len = p.visible(self.show_hidden, &self.sizes).len();
-            p.cursor = p.cursor.min(len.saturating_sub(1));
+            let names: HashSet<&PathBuf> = p.entries.iter().map(|e| &e.path).collect();
+            p.marked.retain(|m| names.contains(m));
+            let visible = p.visible(self.show_hidden, &self.sizes);
+            let pos = keep.and_then(|k| visible.iter().position(|e| e.path == k));
+            let len = visible.len();
+            p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
+            // Laufende Berechnungen weiterlaufen lassen, nur Fehlendes nachfordern.
+            let p = &self.panes[side];
+            let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
+            self.sizes.request(dirs, p.sizing.clone());
+            return;
         }
-        // Laufende Berechnungen weiterlaufen lassen, nur Fehlendes nachfordern.
-        let p = &self.panes[side];
-        let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
-        self.sizes.request(dirs, p.sizing.clone());
+        let p = &mut self.panes[side];
+        let old = std::mem::take(&mut p.path);
+        p.enter(path.clone(), entries);
+        let changed = old != path && !old.as_os_str().is_empty();
+        match &after {
+            After::Nav | After::Parent(_) if changed => {
+                p.back.push(old);
+                p.forward.clear();
+            }
+            After::Back => p.forward.push(old),
+            After::Forward => p.back.push(old),
+            _ => {}
+        }
+        if let After::Parent(came_from) = &after {
+            let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == *came_from);
+            self.panes[side].cursor = pos.unwrap_or(0);
+        }
+        if matches!(after, After::Nav | After::Parent(_)) {
+            self.jumper.visit(&path);
+        }
+        self.request_sizes(side);
     }
 
     fn set_query(&mut self, q: String) {
@@ -709,14 +820,8 @@ impl Guppy {
     }
 
     fn navigate(&mut self, path: PathBuf) {
-        let p = &mut self.panes[self.active];
-        let old = p.path.clone();
-        p.load(path);
-        if p.path != old {
-            p.back.push(old);
-            p.forward.clear();
-            self.jumper.visit(&self.panes[self.active].path);
-            self.request_sizes(self.active);
+        if path != self.panes[self.active].path {
+            self.load(self.active, path, After::Nav);
         }
     }
 
@@ -724,10 +829,7 @@ impl Guppy {
         let p = &mut self.panes[self.active];
         let target = if back { p.back.pop() } else { p.forward.pop() };
         if let Some(t) = target {
-            let old = p.path.clone();
-            p.load(t);
-            if back { p.forward.push(old) } else { p.back.push(old) }
-            self.request_sizes(self.active);
+            self.load(self.active, t, if back { After::Back } else { After::Forward });
         }
     }
 
@@ -735,12 +837,7 @@ impl Guppy {
         let p = &self.panes[self.active];
         let Some(parent) = p.path.parent().map(Path::to_path_buf) else { return };
         let came_from = p.path.clone();
-        self.navigate(parent);
-        // Cursor auf den Ordner setzen, aus dem wir kamen.
-        let p = &self.panes[self.active];
-        if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == came_from) {
-            self.panes[self.active].cursor = i;
-        }
+        self.load(self.active, parent, After::Parent(came_from));
     }
 
     fn open_current(&mut self) {
@@ -1192,13 +1289,21 @@ impl Guppy {
         let header = container(
             row![
                 container(
-                    text(p.path.display().to_string())
+                    text(match &self.loads[side] {
+                        // Ordnerwechsel, der noch auf das Dateisystem wartet.
+                        Some(l) if !matches!(l.after, After::Reload) => {
+                            let state = if l.since.elapsed() >= LOAD_SLOW { "antwortet nicht · Esc bricht ab" } else { "lädt …" };
+                            format!("{} · {state}", l.path.display())
+                        }
+                        _ => p.path.display().to_string(),
+                    })
                         .size(12)
                         .color(if active { rgb(t.accent) } else { rgb(t.foreground) })
                         .wrapping(iced::widget::text::Wrapping::None),
                 )
                 .width(Length::Fill)
                 .clip(true),
+                text(if p.network { "NETZ · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]
             .spacing(10),
