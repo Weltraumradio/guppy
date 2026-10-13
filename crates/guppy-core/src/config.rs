@@ -30,6 +30,8 @@ pub struct Start {
     pub left: String,
     /// Right pane; empty = the directory Guppy was started in.
     pub right: String,
+    /// Show the key help when Guppy starts.
+    pub help: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -74,7 +76,7 @@ impl Default for Config {
 
 impl Default for Start {
     fn default() -> Self {
-        Self { left: String::new(), right: "~".into() }
+        Self { left: String::new(), right: "~".into(), help: true }
     }
 }
 
@@ -102,6 +104,7 @@ const TEMPLATE: &str = r#"# Guppy settings. Every key is optional; delete a line
 [start]
 left = ""          # left pane: path, "~/…", or "" for the directory Guppy was started in
 right = "~"        # right pane
+help = true        # show the key help at startup
 
 [view]
 show_hidden = false
@@ -161,6 +164,7 @@ impl Config {
             let value = match (section, key) {
                 ("start", "left") => q(&self.start.left),
                 ("start", "right") => q(&self.start.right),
+                ("start", "help") => self.start.help.to_string(),
                 ("view", "show_hidden") => self.view.show_hidden.to_string(),
                 ("view", "sort") => q(self.view.sort.name()),
                 ("view", "dir_sizes") => self.view.dir_sizes.to_string(),

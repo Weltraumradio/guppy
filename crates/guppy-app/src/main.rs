@@ -90,6 +90,8 @@ enum Message {
     FilesPasted(Option<(Vec<PathBuf>, bool)>),
     /// Click on a settings row: select it and change it one step.
     SettingClick(usize),
+    /// Checkbox on the startup help: show it at every start.
+    ToggleStartHelp,
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
     /// computed, then exits.
     Shot(iced::window::Screenshot),
@@ -117,8 +119,8 @@ enum Dialog {
     View { path: PathBuf, body: ViewBody },
     Running { kind: OpKind, job: Job },
     Report { title: &'static str, problems: Vec<String> },
-    /// Quick help listing all keys (F1).
-    Help,
+    /// Quick help listing all keys (F1); at startup with a "show again" checkbox.
+    Help { startup: bool },
     /// Settings (F12): selected row, and the text being typed for path rows.
     Settings { row: usize, edit: Option<String> },
 }
@@ -309,6 +311,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ("Start folders", "Left pane"),
     ("Start folders", "Right pane"),
     ("Network drives", "Parallel accesses"),
+    ("Startup", "Show key help"),
 ];
 
 /// Rows 7 and 8 hold paths and are edited as text.
@@ -329,7 +332,8 @@ fn setting_value(c: &Config, row: usize) -> String {
         6 => on(c.confirm.delete),
         7 => path(&c.start.left),
         8 => path(&c.start.right),
-        _ => c.network.threads.to_string(),
+        9 => c.network.threads.to_string(),
+        _ => on(c.start.help),
     }
 }
 
@@ -349,6 +353,7 @@ fn setting_step(c: &mut Config, row: usize, dir: i32) {
         5 => flip(&mut c.confirm.trash),
         6 => flip(&mut c.confirm.delete),
         9 => c.network.threads = (c.network.threads as i32 + dir).clamp(1, 32) as usize,
+        10 => flip(&mut c.start.help),
         _ => {}
     }
 }
@@ -613,6 +618,8 @@ impl Guppy {
         g.panes.iter_mut().for_each(|p| p.sort = sort);
         if let Some(e) = config_error {
             g.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
+        } else if g.config.start.help && std::env::var_os("GUPPY_SCREENSHOT").is_none() {
+            g.dialog = Some(Dialog::Help { startup: true });
         }
         for side in 0..2 {
             let path = g.panes[side].path.clone();
@@ -639,8 +646,12 @@ impl Guppy {
                 g.dialog = Some(Dialog::Settings { row: 2, edit: None });
                 return (g, Task::none());
             }
+            if d == "splash" {
+                g.dialog = Some(Dialog::Help { startup: true });
+                return (g, Task::none());
+            }
             if d == "help" {
-                g.dialog = Some(Dialog::Help);
+                g.dialog = Some(Dialog::Help { startup: false });
                 return (g, Task::none());
             }
             g.ask(OpKind::Copy);
@@ -939,6 +950,11 @@ impl Guppy {
                     }
                 }
             }
+            Message::ToggleStartHelp => {
+                let mut new = self.config.clone();
+                new.start.help = !new.start.help;
+                self.set_config(new);
+            }
             Message::SettingClick(row) => {
                 if let Some(Dialog::Settings { row: sel, edit }) = &mut self.dialog {
                     *sel = row;
@@ -979,7 +995,7 @@ impl Guppy {
             Key::Named(Named::PageUp) => move_to(cur.saturating_sub(page)),
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
-            Key::Named(Named::F1) => self.dialog = Some(Dialog::Help),
+            Key::Named(Named::F1) => self.dialog = Some(Dialog::Help { startup: false }),
             Key::Named(Named::F2) => self.start_rename(),
             Key::Named(Named::F3) => return self.open_view(),
             Key::Named(Named::F4) if m.shift() => self.edit_external(),
@@ -1185,7 +1201,7 @@ impl Guppy {
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
-            Some(Dialog::Report { .. } | Dialog::Help) | None => {}
+            Some(Dialog::Report { .. } | Dialog::Help { .. }) | None => {}
         }
     }
 
@@ -1205,7 +1221,10 @@ impl Guppy {
         match key.as_ref() {
             Key::Named(Named::Enter) => self.confirm_dialog(),
             Key::Named(Named::Escape) => self.cancel_dialog(),
-            Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help)) => self.dialog = None,
+            Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help { .. })) => self.dialog = None,
+            Key::Named(Named::Space) if matches!(self.dialog, Some(Dialog::Help { startup: true })) => {
+                let _ = self.update(Message::ToggleStartHelp);
+            }
             _ => {
                 if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
                     match (key.as_ref(), typed) {
@@ -1931,7 +1950,7 @@ impl Guppy {
                 .spacing(16)
                 .into()
             }
-            Dialog::Help => {
+            Dialog::Help { startup } => {
                 let section = |(head, keys): &(&'static str, &'static [(&'static str, &'static str)])| {
                     let mut c = column![text(*head).size(11).font(BOLD).color(rgb(t.accent))].spacing(5);
                     for (k, what) in keys.iter() {
@@ -1950,7 +1969,29 @@ impl Guppy {
                         column![section(&HELP[2]), section(&HELP[3])].spacing(18).width(Length::Fill),
                     ]
                     .spacing(24),
-                    row![small("F1 or Esc closes".into()), iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)]
+                    row![
+                        if *startup {
+                            // Flat checkbox: small bordered box, filled when on.
+                            let on = self.config.start.help;
+                            let tick = container(text(if on { "✓" } else { "" }).size(11).color(rgb(t.background)))
+                                .center_x(15)
+                                .center_y(15)
+                                .style(move |_| container::Style {
+                                    background: on.then(|| rgb(t.accent).into()),
+                                    border: Border { color: rgb(t.accent), width: 1.0, radius: 3.0.into() },
+                                    ..Default::default()
+                                });
+                            Element::from(
+                                mouse_area(row![tick, small("Show at every start · Space".into())].spacing(8).align_y(iced::Alignment::Center))
+                                    .on_press(Message::ToggleStartHelp)
+                                    .interaction(iced::mouse::Interaction::Pointer),
+                            )
+                        } else {
+                            small("F1 or Esc closes".into()).into()
+                        },
+                        iced::widget::Space::new().width(Length::Fill),
+                        btn("OK", Message::DialogCancel, true)
+                    ]
                         .align_y(iced::Alignment::Center),
                 ]
                 .spacing(18)
@@ -1976,7 +2017,7 @@ impl Guppy {
             .padding(22)
             .width(match dialog {
                 Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
-                Dialog::Help => Length::Fixed(760.0),
+                Dialog::Help { .. } => Length::Fixed(760.0),
                 Dialog::Settings { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
             })
