@@ -184,7 +184,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("View", &[
         ("F1", "this help"),
-        ("F9 Ctrl+,", "settings"),
+        ("F9", "settings (also Ctrl+Comma)"),
         ("Ctrl+H", "hidden files"),
         ("Ctrl+S", "sort: name, size, date"),
         ("Ctrl+R", "recompute folder sizes"),
