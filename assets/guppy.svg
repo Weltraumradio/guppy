@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Base: dark tile, like the menu bar -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#1d1b19"/>
+  <!-- Two paper panes -->
+  <rect x="30" y="40" width="94" height="176" rx="14" fill="#5a524a"/>
+  <rect x="132" y="40" width="94" height="176" rx="14" fill="#4a443e"/>
+  <!-- Cursor row in the left pane, list lines -->
+  <rect x="38" y="58" width="78" height="14" rx="4" fill="#e8900f"/>
+  <g fill="#8a8178">
+    <rect x="44" y="84" width="52" height="7" rx="3.5"/>
+    <rect x="44" y="102" width="38" height="7" rx="3.5"/>
+    <rect x="146" y="62" width="46" height="7" rx="3.5"/>
+    <rect x="146" y="80" width="60" height="7" rx="3.5"/>
+  </g>
+  <!-- The guppy, swimming across both panes -->
+  <g transform="translate(140 150) rotate(-8)">
+    <!-- Tail: the big fan guppies are known for -->
+    <path d="M-30 0 C-52 -34 -84 -40 -96 -26 C-86 -10 -86 10 -96 26 C-84 40 -52 34 -30 0 Z" fill="#f2b441"/>
+    <path d="M-34 0 C-52 -18 -70 -22 -80 -14 M-34 0 L-84 0 M-34 0 C-52 18 -70 22 -80 14" stroke="#c96f08" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <!-- Body -->
+    <path d="M-36 0 C-24 -26 22 -30 52 -10 C62 -4 62 4 52 10 C22 30 -24 26 -36 0 Z" fill="#e8900f"/>
+    <!-- Dorsal fin -->
+    <path d="M-6 -21 C2 -40 22 -38 26 -20 Z" fill="#f2b441"/>
+    <!-- Eye -->
+    <circle cx="38" cy="-4" r="6.5" fill="#fff4e0"/>
+    <circle cx="40" cy="-4" r="3.2" fill="#1d1b19"/>
+  </g>
+</svg>
