@@ -1,4 +1,4 @@
-//! Strich-Icons für die Menüleiste (24×24, werden zur Laufzeit eingefärbt).
+//! Stroke icons for the menu bar (24×24, tinted at runtime).
 
 macro_rules! icon {
     ($name:ident, $body:literal) => {

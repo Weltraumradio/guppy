@@ -1,4 +1,4 @@
-//! Misst die Ordnergrößen-Berechnung: `cargo run --release --example du -- <ordner>`
+//! Benchmarks the directory size computation: `cargo run --release --example du -- <dir>`
 use guppy_core::{Cancel, DirSize, DirSizes};
 use std::time::Instant;
 
@@ -10,6 +10,6 @@ fn main() {
     while sizes.busy() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    let Some(DirSize::Done(n)) = sizes.get(&dir) else { panic!("keine Größe") };
+    let Some(DirSize::Done(n)) = sizes.get(&dir) else { panic!("no size") };
     println!("{}: {} in {:?}", dir.display(), guppy_core::fs::human_size(n), t.elapsed());
 }

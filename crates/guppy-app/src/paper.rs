@@ -1,4 +1,4 @@
-//! Papier-Struktur (Korn und Fasern), einmal gezeichnet und gecacht.
+//! Paper texture (grain and fibers), drawn once and cached.
 
 use iced::widget::canvas::{self, Cache, Frame, Geometry};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, mouse};
@@ -18,12 +18,12 @@ impl<Message> canvas::Program<Message> for Paper {
     type State = ();
 
     fn draw(&self, _: &(), renderer: &Renderer, _: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
-        // Cache zeichnet nur bei Größenänderung neu.
+        // The cache only redraws when the size changes.
         vec![self.cache.draw(renderer, bounds.size(), |frame: &mut Frame| grain(frame, self.seed))]
     }
 }
 
-/// Zufällige helle und dunkle Fasern, deterministisch pro Blatt.
+/// Random light and dark fibers, deterministic per sheet.
 fn grain(frame: &mut Frame, seed: u32) {
     let mut s = seed.wrapping_mul(2654435761).max(1);
     let mut rnd = || {
@@ -42,7 +42,7 @@ fn grain(frame: &mut Frame, seed: u32) {
         } else {
             Color { a: 0.02 + a * 0.045, ..Color::BLACK }
         };
-        // Vereinzelt längere, waagerechte Fasern.
+        // Occasional longer horizontal fibers.
         let w = if long { 2.0 + a * 2.0 } else { 1.0 };
         frame.fill_rectangle(Point::new(x, y), Size::new(w, 1.0), color);
     }

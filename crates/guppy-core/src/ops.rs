@@ -1,7 +1,7 @@
-//! Dateioperationen im Hintergrund: Kopieren, Verschieben, Papierkorb, Löschen,
-//! Ordner anlegen. Fortschritt und Abbruch laufen über [`Job`].
+//! Background file operations: copy, move, trash, delete, create directory.
+//! Progress and cancellation go through [`Job`].
 //!
-//! Bestehende Ziele werden nie überschrieben, sondern übersprungen und gemeldet.
+//! Existing targets are never overwritten; they are skipped and reported.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 pub enum OpKind {
     Copy,
     Move,
-    /// In den Papierkorb.
+    /// Move to trash.
     Trash,
-    /// Endgültig löschen.
+    /// Delete permanently.
     Delete,
 }
 
@@ -28,11 +28,11 @@ struct State {
     problems: Mutex<Vec<String>>,
 }
 
-/// Laufende Operation; `clone()` ist billig.
+/// Running operation; `clone()` is cheap.
 #[derive(Clone, Default)]
 pub struct Job(Arc<State>);
 
-/// Momentaufnahme für die Anzeige.
+/// Snapshot for display.
 #[derive(Debug, Clone)]
 pub struct Progress {
     pub total: u64,
@@ -71,15 +71,15 @@ impl Job {
     }
 }
 
-/// Startet eine Operation auf `sources`; `target` ist der Zielordner (Kopieren/Verschieben).
+/// Starts an operation on `sources`; `target` is the destination directory (copy/move).
 pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Job {
     let job = Job::default();
     let j = job.clone();
     std::thread::spawn(move || {
         match kind {
             OpKind::Copy | OpKind::Move => {
-                let target = target.expect("Zielordner fehlt");
-                // Fortschritt in Bytes: vorher zählen.
+                let target = target.expect("target directory missing");
+                // Progress in bytes: count up front.
                 let total = sources.iter().map(|s| tree_size(s)).sum();
                 j.0.total.store(total, Ordering::Relaxed);
                 for src in &sources {
@@ -89,12 +89,12 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
                     let Some(name) = src.file_name() else { continue };
                     let dst = target.join(name);
                     if dst.exists() || dst.symlink_metadata().is_ok() {
-                        j.problem(&dst, "existiert bereits, übersprungen");
+                        j.problem(&dst, "already exists, skipped");
                         j.0.done.fetch_add(tree_size(src), Ordering::Relaxed);
                         continue;
                     }
                     if dst.starts_with(src) {
-                        j.problem(src, "kann nicht in sich selbst kopiert werden");
+                        j.problem(src, "cannot be copied into itself");
                         continue;
                     }
                     let res = if kind == OpKind::Move { move_entry(&j, src, &dst) } else { copy_entry(&j, src, &dst) };
@@ -127,10 +127,10 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
-/// Legt einen neuen Ordner an; Fehler (z. B. existiert schon) gehen an den Aufrufer.
+/// Creates a new directory; errors (e.g. already exists) go to the caller.
 pub fn make_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
     if name.is_empty() || name.contains(std::path::MAIN_SEPARATOR) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ungültiger Name"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid name"));
     }
     let p = parent.join(name);
     std::fs::create_dir(&p)?;
@@ -153,7 +153,7 @@ fn remove(p: &Path) -> io::Result<()> {
 
 fn move_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
     job.set_current(src);
-    // Gleiches Dateisystem: sofort. Sonst kopieren und Quelle entfernen.
+    // Same filesystem: instant. Otherwise copy and remove the source.
     match std::fs::rename(src, dst) {
         Ok(()) => {
             job.0.done.fetch_add(tree_size(dst), Ordering::Relaxed);
@@ -191,7 +191,7 @@ fn copy_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
         std::fs::set_permissions(dst, m.permissions())?;
         return Ok(());
     }
-    // std::fs::copy nutzt unter Linux copy_file_range (auf btrfs/XFS als Reflink).
+    // On Linux std::fs::copy uses copy_file_range (a reflink on btrfs/XFS).
     std::fs::copy(src, dst)?;
     job.0.done.fetch_add(m.len(), Ordering::Relaxed);
     Ok(())
@@ -214,14 +214,14 @@ mod tests {
         let (a, b) = (root.join("a"), root.join("b"));
         std::fs::create_dir_all(a.join("sub")).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(a.join("sub/f"), "hallo").unwrap();
+        std::fs::write(a.join("sub/f"), "hello").unwrap();
 
         let p = wait(&start(OpKind::Copy, vec![a.join("sub")], Some(b.clone())));
         assert!(p.problems.is_empty(), "{:?}", p.problems);
-        assert_eq!(std::fs::read_to_string(b.join("sub/f")).unwrap(), "hallo");
+        assert_eq!(std::fs::read_to_string(b.join("sub/f")).unwrap(), "hello");
         assert_eq!((p.done, p.total), (5, 5));
 
-        // Zweites Kopieren: Ziel existiert, wird übersprungen statt überschrieben.
+        // Second copy: target exists, is skipped instead of overwritten.
         let p = wait(&start(OpKind::Copy, vec![a.join("sub")], Some(b.clone())));
         assert_eq!(p.problems.len(), 1);
 
@@ -229,11 +229,11 @@ mod tests {
         wait(&start(OpKind::Move, vec![a.join("sub")], Some(b.clone())));
         assert!(!a.join("sub").exists() && b.join("sub/f").exists());
 
-        assert!(make_dir(&a, "neu").is_ok());
-        assert!(make_dir(&a, "neu").is_err());
+        assert!(make_dir(&a, "new").is_ok());
+        assert!(make_dir(&a, "new").is_err());
 
-        wait(&start(OpKind::Delete, vec![b.join("sub"), a.join("neu")], None));
-        assert!(!b.join("sub").exists() && !a.join("neu").exists());
+        wait(&start(OpKind::Delete, vec![b.join("sub"), a.join("new")], None));
+        assert!(!b.join("sub").exists() && !a.join("new").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

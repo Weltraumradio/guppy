@@ -1,9 +1,9 @@
-//! Farben aus dem aktiven Omarchy-Theme (`colors.toml`), mit Matte Black als Rückfall.
+//! Colors from the active Omarchy theme (`colors.toml`), falling back to Matte Black.
 
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// RGB-Farbe als `0xRRGGBB`.
+/// RGB color as `0xRRGGBB`.
 pub type Rgb = u32;
 
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct Theme {
 }
 
 impl Default for Theme {
-    /// Omarchy „Matte Black“.
+    /// Omarchy "Matte Black".
     fn default() -> Self {
         Self {
             accent: 0xe68e0d,
@@ -64,7 +64,7 @@ impl Theme {
         dirs::state_dir().map(|d| d.join("omarchy/current/theme/colors.toml"))
     }
 
-    /// Lädt das Omarchy-Theme; fehlende Werte kommen aus dem Standard.
+    /// Loads the Omarchy theme; missing values come from the default.
     pub fn load() -> Self {
         Self::omarchy_path()
             .and_then(|p| std::fs::read_to_string(p).ok())

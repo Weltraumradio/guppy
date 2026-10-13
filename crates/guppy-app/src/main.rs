@@ -21,7 +21,7 @@ use iced::{Background, Border, Color, Element, Font, Length, Subscription, Task}
 const ROW_H: f32 = 26.0;
 const SHEET_RADIUS: f32 = 6.0;
 const JUMP_LIMIT: usize = 14;
-/// Eingebettet, damit Guppy auf jedem System gleich aussieht (Lizenz: fonts/OFL.txt).
+/// Embedded so Guppy looks the same on every system (license: fonts/OFL.txt).
 const FONT_REGULAR: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../fonts/JetBrainsMono-Bold.ttf");
 const FONT: Font = Font::with_name("JetBrains Mono");
@@ -39,7 +39,7 @@ fn main() -> iced::Result {
         .font(FONT_REGULAR)
         .font(FONT_BOLD)
         .default_font(FONT)
-        // Beim Schließen erst den Größen-Cache sichern.
+        // On close, save the size cache first.
         .exit_on_close_request(false)
         .run()
 }
@@ -55,12 +55,12 @@ enum Message {
     Open(usize, usize),
     JumpTo(usize),
     Scrolled(usize, scrollable::Viewport),
-    /// Ordnergrößen laufen noch: neu zeichnen.
+    /// Folder sizes still running: redraw.
     Tick,
-    /// Bildwechsel während weichen Scrollens.
+    /// Frame tick during smooth scrolling.
     Frame(std::time::Instant),
     Resized(iced::Size),
-    /// Dateien in einem offenen Ordner oder das Theme haben sich geändert.
+    /// Files in an open folder or the theme changed.
     FsChanged(Vec<PathBuf>),
     CloseRequested(iced::window::Id),
     Back,
@@ -74,76 +74,76 @@ enum Message {
     DialogConfirm,
     DialogCancel,
     ToggleHidden,
-    /// Entwickler-Hilfe: `GUPPY_SCREENSHOT=datei.ppm` speichert ein Bild, sobald die
-    /// Größen berechnet sind, und beendet.
+    /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
+    /// computed, then exits.
     Shot(iced::window::Screenshot),
 }
 
-/// Beginnt die Eingabe mit `~` (unter Unix auch `/`), wird gesprungen statt gefiltert.
+/// Input starting with `~` (on Unix also `/`) jumps instead of filtering.
 fn is_jump(query: &str) -> bool {
     query.chars().next().is_some_and(guppy_core::platform::is_jump_prefix)
 }
 
-/// Modaler Dialog über dem Fenster; solange er offen ist, gehen Tasten nur an ihn.
+/// Modal dialog over the window; while open, it receives all keys.
 enum Dialog {
     Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
     NewDir { name: String, error: Option<String> },
     Running { kind: OpKind, job: Job },
     Report { problems: Vec<String> },
-    /// Kurzhilfe mit allen Tasten (F1).
+    /// Quick help listing all keys (F1).
     Help,
 }
 
-/// Abschnitte der Kurzhilfe: Überschrift und (Taste, Funktion).
+/// Quick help sections: heading and (key, action).
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Navigation", &[
-        ("↑ ↓", "Cursor bewegen"),
-        ("Bild↑ Bild↓", "seitenweise"),
-        ("Pos1 Ende", "erster / letzter Eintrag"),
-        ("Enter", "öffnen / hinspringen"),
-        ("Backspace", "Suche kürzen, sonst Ordner hoch"),
-        ("Alt+← Alt+→", "Verlauf zurück / vor"),
-        ("Tab", "Pane wechseln"),
+        ("↑ ↓", "move cursor"),
+        ("PgUp PgDn", "page up / down"),
+        ("Home End", "first / last item"),
+        ("Enter", "open / jump there"),
+        ("Backspace", "shorten search, else folder up"),
+        ("Alt+← Alt+→", "history back / forward"),
+        ("Tab", "switch pane"),
     ]),
-    ("Suche", &[
-        ("a–z …", "aktives Pane filtern"),
-        ("~ oder /", "Ordner springen (unscharf)"),
-        ("Strg+G", "Sprungmodus öffnen"),
-        ("Esc", "Suche leeren"),
+    ("Search", &[
+        ("a–z …", "filter active pane"),
+        ("~ or /", "jump to folder (fuzzy)"),
+        ("Ctrl+G", "open jump mode"),
+        ("Esc", "clear search"),
     ]),
-    ("Dateien", &[
-        ("Einfg", "markieren und weiter"),
-        ("Leertaste", "markieren (bei leerer Suche)"),
-        ("F5", "kopieren ins andere Pane"),
-        ("F6", "verschieben ins andere Pane"),
-        ("F7", "neuer Ordner"),
-        ("F8 Entf", "in den Papierkorb"),
-        ("Shift+F8/Entf", "endgültig löschen"),
+    ("Files", &[
+        ("Insert", "mark and advance"),
+        ("Space", "mark (when search is empty)"),
+        ("F5", "copy to other pane"),
+        ("F6", "move to other pane"),
+        ("F7", "new folder"),
+        ("F8 Del", "move to trash"),
+        ("Shift+F8/Del", "delete permanently"),
     ]),
-    ("Ansicht", &[
-        ("F1", "diese Hilfe"),
-        ("Strg+H", "versteckte Dateien"),
-        ("Strg+S", "Sortierung: Name, Größe, Datum"),
-        ("Strg+R", "Ordnergrößen neu berechnen"),
+    ("View", &[
+        ("F1", "this help"),
+        ("Ctrl+H", "hidden files"),
+        ("Ctrl+S", "sort: name, size, date"),
+        ("Ctrl+R", "recompute folder sizes"),
     ]),
 ];
 
 fn op_verb(kind: OpKind) -> &'static str {
     match kind {
-        OpKind::Copy => "kopieren",
-        OpKind::Move => "verschieben",
-        OpKind::Trash => "in den Papierkorb legen",
-        OpKind::Delete => "endgültig löschen",
+        OpKind::Copy => "copy",
+        OpKind::Move => "move",
+        OpKind::Trash => "trash",
+        OpKind::Delete => "permanently delete",
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sort {
-    /// Ordner zuerst, dann alphabetisch.
+    /// Folders first, then alphabetical.
     Name,
-    /// Größte zuerst, Ordner und Dateien gemischt.
+    /// Largest first, folders and files mixed.
     Size,
-    /// Neueste zuerst.
+    /// Newest first.
     Date,
 }
 
@@ -159,13 +159,13 @@ impl Sort {
     fn label(self) -> &'static str {
         match self {
             Sort::Name => "Name",
-            Sort::Size => "Größe ↓",
-            Sort::Date => "Datum ↓",
+            Sort::Size => "Size ↓",
+            Sort::Date => "Date ↓",
         }
     }
 }
 
-/// Größe eines Eintrags für Anzeige und Sortierung; Ordner aus der Größenberechnung.
+/// Size of an entry for display and sorting; folders come from the size computation.
 fn entry_size(e: &Entry, sizes: &DirSizes) -> Option<u64> {
     if !e.is_dir() {
         return Some(e.size);
@@ -179,40 +179,40 @@ fn entry_size(e: &Entry, sizes: &DirSizes) -> Option<u64> {
 struct Pane {
     path: PathBuf,
     entries: Vec<Entry>,
-    /// Index in der *sichtbaren* Liste (nach Filter/versteckten Dateien).
+    /// Index into the *visible* list (after filter/hidden files).
     cursor: usize,
     marked: HashSet<PathBuf>,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
-    /// Getippte Eingabe: Filter, oder Sprungziel wenn sie mit `~`/`/` beginnt.
+    /// Typed input: a filter, or a jump target if it starts with `~`/`/`.
     query: String,
     sort: Sort,
-    /// Bricht die Größenberechnung ab, wenn das Pane den Ordner verlässt.
+    /// Cancels size computation when the pane leaves the folder.
     sizing: Cancel,
     scroll_y: f32,
     view_h: f32,
-    /// Ziel des weichen Scrollens; `None` = keine Animation.
+    /// Smooth scroll target; `None` = no animation.
     scroll_target: Option<f32>,
     id: Id,
-    /// Liegt auf einem Netzlaufwerk.
+    /// Located on a network drive.
     network: bool,
 }
 
-/// Was nach dem Einlesen eines Ordners passiert.
+/// What happens after a folder has been read.
 #[derive(Clone)]
 enum After {
-    /// Startordner beim Programmstart.
+    /// Initial folder at startup.
     Start,
     Nav,
     Back,
     Forward,
-    /// Hoch, Cursor auf den Ordner, aus dem wir kamen.
+    /// Up, with the cursor on the folder we came from.
     Parent(PathBuf),
-    /// Gleicher Ordner, neu eingelesen; Cursor bleibt auf seinem Eintrag.
+    /// Same folder, re-read; cursor stays on its entry.
     Reload,
 }
 
-/// Ordner, der gerade im Hintergrund eingelesen wird.
+/// Folder currently being read in the background.
 struct Loading {
     path: PathBuf,
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<Entry>>>,
@@ -220,10 +220,10 @@ struct Loading {
     after: After,
 }
 
-/// So lange wird synchron auf das Einlesen gewartet; lokale Ordner sind fast immer
-/// schneller und erscheinen damit ohne Zwischenzustand.
+/// How long to wait synchronously for a read; local folders are almost always
+/// faster and thus appear without an intermediate state.
 const LOAD_WAIT: Duration = Duration::from_millis(120);
-/// Ab dann gilt ein Ordner als „antwortet nicht“.
+/// After this, a folder counts as "not responding".
 const LOAD_SLOW: Duration = Duration::from_secs(3);
 
 impl Pane {
@@ -249,7 +249,7 @@ impl Pane {
         p
     }
 
-    /// Zeigt einen frisch eingelesenen Ordner an.
+    /// Shows a freshly read folder.
     fn enter(&mut self, path: PathBuf, entries: Vec<Entry>) {
         self.network = guppy_core::platform::is_network(&path);
         self.entries = entries;
@@ -257,7 +257,7 @@ impl Pane {
         self.cursor = 0;
         self.marked.clear();
         self.query.clear();
-        // Neuer Ordner beginnt oben, ohne Animation.
+        // A new folder starts at the top, without animation.
         self.scroll_y = 0.0;
         self.scroll_target = Some(0.0);
     }
@@ -270,7 +270,7 @@ impl Pane {
             .filter(|e| hidden || !e.hidden)
             .filter(|e| f.is_empty() || e.name.to_lowercase().contains(&f))
             .collect();
-        // `entries` ist bereits nach Name sortiert; sort_by ist stabil.
+        // `entries` is already sorted by name; sort_by is stable.
         match self.sort {
             Sort::Name => {}
             Sort::Size => v.sort_by_key(|e| std::cmp::Reverse(entry_size(e, sizes).unwrap_or(0))),
@@ -288,20 +288,19 @@ struct Guppy {
     papers: [Paper; 2],
     sizes: DirSizes,
     jumper: Jumper,
-    /// Treffer im Sprungmodus und die gewählte Zeile.
+    /// Jump mode hits and the selected row.
     jump: Vec<PathBuf>,
     jump_cur: usize,
     shot_wait: u8,
-    /// Sprungtreffer müssen nach dem Einlesen noch aufgefrischt werden.
+    /// Jump hits still need refreshing after indexing.
     jump_pending: bool,
     dialog: Option<Dialog>,
     last_frame: Option<std::time::Instant>,
-    /// Fensterbreite, für das anpassungsfähige Layout.
+    /// Window width, for the responsive layout.
     width: f32,
-    /// Zeitpunkt, ab dem die Vorschau geladen wird.
-    /// Letzte Cursorbewegung, um Tastenwiederholung zu erkennen.
+    /// Last cursor move, to detect key repeat.
     last_move: Option<std::time::Instant>,
-    /// Ordner, die pro Seite gerade eingelesen werden.
+    /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
 }
 
@@ -331,14 +330,14 @@ impl Guppy {
             let path = g.panes[side].path.clone();
             g.load(side, path, After::Start);
         }
-        // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
+        // Developer aid: preset input, e.g. `GUPPY_QUERY=~gu`.
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
         }
         if std::env::var("GUPPY_SORT").as_deref() == Ok("size") {
             g.panes.iter_mut().for_each(|p| p.sort = Sort::Size);
         }
-        // `GUPPY_DIALOG=copy` öffnet den Kopierdialog, `=run` bestätigt ihn auch.
+        // `GUPPY_DIALOG=copy` opens the copy dialog, `=run` also confirms it.
         if let Ok(d) = std::env::var("GUPPY_DIALOG") {
             if d == "help" {
                 g.dialog = Some(Dialog::Help);
@@ -374,7 +373,7 @@ impl Guppy {
     fn subscription(&self) -> Subscription<Message> {
         let mut dirs: Vec<PathBuf> = self.panes.iter().map(|p| p.path.clone()).collect();
         if let Some(theme_dir) = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
-            // Das Theme-Verzeichnis selbst und sein Elternordner (Omarchy tauscht es beim Wechsel aus).
+            // The theme directory and its parent (Omarchy replaces it on switch).
             dirs.extend(theme_dir.parent().map(Path::to_path_buf));
             dirs.push(theme_dir);
         }
@@ -387,7 +386,7 @@ impl Guppy {
         if self.panes.iter().any(|p| p.scroll_target.is_some()) {
             keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
         }
-        // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
+        // Only while sizes are computed; no idle ticking otherwise.
         let running = matches!(self.dialog, Some(Dialog::Running { .. }));
         let loading = self.loads.iter().any(Option::is_some);
         if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
@@ -402,7 +401,7 @@ impl Guppy {
         p.visible(self.show_hidden, &self.sizes).get(p.cursor).copied()
     }
 
-    /// Bei schmalem Fenster weicht die Datumsspalte.
+    /// In a narrow window the date column is dropped.
     fn show_dates(&self) -> bool {
         self.width >= 760.0
     }
@@ -425,8 +424,8 @@ impl Guppy {
                 return Task::none();
             }
             Message::Tick if self.jump_pending => {
-                // Unterordner-Index wächst: Treffer auffrischen, Auswahl behalten.
-                // Nach dem Ende des Einlesens ein letztes Mal.
+                // Subfolder index is growing: refresh hits, keep selection.
+                // One last time after indexing ends.
                 self.jump_pending = self.jumper.indexing();
                 if self.jumping() {
                     let cur = self.jump_cur;
@@ -440,7 +439,7 @@ impl Guppy {
                 return Task::none();
             }
             Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending => {
-                // Ein paar Takte warten, damit der letzte Stand gezeichnet ist.
+                // Wait a few ticks so the final state is drawn.
                 self.shot_wait += 1;
                 if self.shot_wait < 4 {
                     return Task::none();
@@ -477,8 +476,8 @@ impl Guppy {
             Message::Scrolled(side, vp) => {
                 let p = &mut self.panes[side];
                 p.view_h = vp.bounds().height;
-                // Während der Animation meldet die Liste die Position eines früheren Bildes;
-                // maßgeblich ist dann die eigene.
+                // During animation the list reports the position of an earlier frame;
+                // our own value is authoritative then.
                 if p.scroll_target.is_none() {
                     p.scroll_y = vp.absolute_offset().y;
                 }
@@ -508,7 +507,7 @@ impl Guppy {
         self.scroll_into_view()
     }
 
-    /// Tastatur-Konzept: Buchstaben filtern das aktive Pane, `~`/`/` am Anfang springt.
+    /// Keyboard model: letters filter the active pane, a leading `~`/`/` jumps.
     fn on_key(&mut self, key: Key, m: keyboard::Modifiers, typed: Option<&str>) -> Task<Message> {
         let jumping = self.jumping();
         let query_empty = self.panes[self.active].query.is_empty();
@@ -536,7 +535,7 @@ impl Guppy {
                 self.set_query(q);
             }
             Key::Named(Named::Backspace) => self.go_parent(),
-            // Esc bricht zuerst einen hängenden Ordnerwechsel ab, dann die Suche.
+            // Esc first cancels a pending folder change, then the search.
             Key::Named(Named::Escape) if self.loads[self.active].is_some() => self.loads[self.active] = None,
             Key::Named(Named::Escape) => self.set_query(String::new()),
             Key::Named(Named::Tab) => self.active = 1 - self.active,
@@ -551,7 +550,7 @@ impl Guppy {
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
             Key::Character("s") if m.control() => {
-                // Cursor bleibt auf demselben Eintrag.
+                // Cursor stays on the same entry.
                 let path = self.current().map(|e| e.path.clone());
                 let p = &mut self.panes[self.active];
                 p.sort = p.sort.next();
@@ -565,7 +564,7 @@ impl Guppy {
                 self.request_sizes(self.active);
                 self.reload(self.active);
             }
-            // Alles Druckbare ohne Strg/Alt landet in der Eingabe.
+            // Anything printable without Ctrl/Alt goes into the input.
             _ => match typed {
                 Some(t) if !m.control() && !m.alt() && !m.logo() && t.chars().all(|c| !c.is_control()) => {
                     let q = format!("{}{t}", self.panes[self.active].query);
@@ -577,7 +576,7 @@ impl Guppy {
         self.scroll_into_view()
     }
 
-    /// Ziel der Aktion: markierte sichtbare Einträge, sonst der unter dem Cursor.
+    /// Action target: marked visible entries, otherwise the one under the cursor.
     fn selection(&self) -> Vec<PathBuf> {
         let p = &self.panes[self.active];
         let visible = p.visible(self.show_hidden, &self.sizes);
@@ -595,7 +594,7 @@ impl Guppy {
         }
         let target = matches!(kind, OpKind::Copy | OpKind::Move).then(|| self.panes[1 - self.active].path.clone());
         if target.as_deref() == Some(self.panes[self.active].path.as_path()) {
-            self.dialog = Some(Dialog::Report { problems: vec!["Quelle und Ziel sind derselbe Ordner.".into()] });
+            self.dialog = Some(Dialog::Report { problems: vec!["Source and target are the same folder.".into()] });
             return;
         }
         self.dialog = Some(Dialog::Confirm { kind, sources, target });
@@ -623,7 +622,7 @@ impl Guppy {
 
     fn cancel_dialog(&mut self) {
         match &self.dialog {
-            // Laufende Operation abbrechen; der Dialog schließt, sobald sie steht.
+            // Cancel the running operation; the dialog closes once it stops.
             Some(Dialog::Running { job, .. }) => job.cancel(),
             _ => self.dialog = None,
         }
@@ -670,7 +669,7 @@ impl Guppy {
         }
         for side in 0..2 {
             let dir = self.panes[side].path.clone();
-            // Ereignisse am Ordner selbst (z. B. Zeitstempel) ändern keine Größen.
+            // Events on the folder itself (e.g. timestamps) don't change sizes.
             let touched: Vec<&PathBuf> = paths.iter().filter(|p| p.parent() == Some(dir.as_path())).collect();
             if touched.is_empty() {
                 continue;
@@ -682,16 +681,16 @@ impl Guppy {
         }
     }
 
-    /// Liest den Ordner neu ein und behält den Cursor auf seinem Eintrag.
+    /// Re-reads the folder and keeps the cursor on its entry.
     fn reload(&mut self, side: usize) {
         let path = self.panes[side].path.clone();
         self.load(side, path, After::Reload);
     }
 
-    /// Liest einen Ordner im Hintergrund ein. Ist er schnell da (lokal fast immer),
-    /// wird er sofort angezeigt; sonst bleibt die Oberfläche bedienbar, bis er kommt.
+    /// Reads a folder in the background. If it arrives quickly (almost always locally),
+    /// it is shown immediately; otherwise the UI stays usable until it arrives.
     fn load(&mut self, side: usize, path: PathBuf, after: After) {
-        // Ein Neueinlesen ersetzt keinen laufenden Ordnerwechsel.
+        // A reload never replaces a pending folder change.
         if matches!(after, After::Reload) && self.loads[side].is_some() {
             return;
         }
@@ -723,7 +722,7 @@ impl Guppy {
         let entries = match res {
             Ok(entries) => entries,
             Err(e) => {
-                // Unlesbar (Rechte, NAS weg): Ansicht bleibt, wie sie war.
+                // Unreadable (permissions, NAS gone): view stays as it was.
                 if !matches!(after, After::Reload | After::Start) {
                     self.dialog = Some(Dialog::Report { problems: vec![format!("{}: {e}", self.jumper.display(&path))] });
                 }
@@ -743,7 +742,7 @@ impl Guppy {
             let pos = keep.and_then(|k| visible.iter().position(|e| e.path == k));
             let len = visible.len();
             p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
-            // Laufende Berechnungen weiterlaufen lassen, nur Fehlendes nachfordern.
+            // Let running computations continue, request only what's missing.
             let p = &self.panes[side];
             let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
             self.sizes.request(dirs, p.sizing.clone());
@@ -790,7 +789,7 @@ impl Guppy {
         let q = &self.panes[self.active].query;
         let pattern = &q[1..];
         let mut hits = self.jumper.search(pattern, JUMP_LIMIT);
-        // Eingetippter Pfad, der existiert, steht ganz oben.
+        // A typed path that exists goes to the top.
         let typed = match q.strip_prefix('~') {
             Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
             None => PathBuf::from(q),
@@ -861,7 +860,7 @@ impl Guppy {
         p.cursor = p.cursor.min(len.saturating_sub(1));
     }
 
-    /// Hält den Cursor sichtbar, mit zwei Zeilen Abstand zum Rand; gescrollt wird weich.
+    /// Keeps the cursor visible with two rows of margin; scrolls smoothly.
     fn scroll_into_view(&mut self) -> Task<Message> {
         if self.jumping() {
             return Task::none();
@@ -869,12 +868,12 @@ impl Guppy {
         const MARGIN: f32 = 2.0 * ROW_H;
         let now = std::time::Instant::now();
         let p = &mut self.panes[self.active];
-        // Gegen das laufende Ziel rechnen, sonst springt es bei Tastenwiederholung zurück.
+        // Compute against the running target, else key repeat makes it jump back.
         let base = p.scroll_target.unwrap_or(p.scroll_y);
         let top = p.cursor as f32 * ROW_H;
         let margin = MARGIN.min(((p.view_h - ROW_H) / 2.0).max(0.0));
-        // Ziele auf ganze Zeilen runden, damit die Zeilen beim Scrollbeginn nicht
-        // um ein paar Pixel (Fensterhöhe modulo Zeilenhöhe) springen.
+        // Round targets to whole rows so rows don't jump a few pixels
+        // (window height modulo row height) when scrolling starts.
         let y = if top - margin < base {
             ((top - margin) / ROW_H).floor().max(0.0) * ROW_H
         } else if top + ROW_H + margin > base + p.view_h {
@@ -883,8 +882,8 @@ impl Guppy {
             self.last_move = Some(now);
             return Task::none();
         };
-        // Tastenwiederholung: Liste läuft im Takt der Tasten mit, der Cursor steht still.
-        // Animiert nachzuziehen erzeugt hier ein Sägezahn-Zittern (Cursor springt, Liste holt auf).
+        // Key repeat: the list moves in step with the keys, the cursor stays put.
+        // Animating here causes sawtooth jitter (cursor jumps, list catches up).
         let repeating = self.last_move.is_some_and(|t| now.duration_since(t) < Duration::from_millis(90));
         self.last_move = Some(now);
         if repeating {
@@ -897,9 +896,9 @@ impl Guppy {
         Task::none()
     }
 
-    /// Ein Animationsschritt: nähert sich dem Ziel exponentiell, unabhängig von der Bildrate.
+    /// One animation step: approaches the target exponentially, independent of frame rate.
     fn animate_scroll(&mut self, now: std::time::Instant) -> Task<Message> {
-        const TAU: f32 = 0.03; // Sekunden; kleiner = schneller
+        const TAU: f32 = 0.03; // seconds; smaller = faster
         let dt = self.last_frame.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
         self.last_frame = Some(now);
         let k = 1.0 - (-dt / TAU).exp();
@@ -907,7 +906,7 @@ impl Guppy {
         for p in &mut self.panes {
             let Some(target) = p.scroll_target else { continue };
             let mut y = p.scroll_y + (target - p.scroll_y) * k;
-            // Nie hinter dem Cursor herhinken: seine Zeile bleibt vollständig im Bild.
+            // Never lag behind the cursor: its row stays fully visible.
             let top = p.cursor as f32 * ROW_H;
             y = y.clamp((top + ROW_H - p.view_h).min(top), top);
             if (target - y).abs() < 0.5 {
@@ -920,7 +919,7 @@ impl Guppy {
         Task::batch(tasks)
     }
 
-    // ---------- Ansicht ----------
+    // ---------- View ----------
 
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
@@ -961,7 +960,7 @@ impl Guppy {
                 })
         };
         let buttons = |ok: &'static str| {
-            row![iced::widget::Space::new().width(Length::Fill), btn("Abbrechen", Message::DialogCancel, false), btn(ok, Message::DialogConfirm, true)]
+            row![iced::widget::Space::new().width(Length::Fill), btn("Cancel", Message::DialogCancel, false), btn(ok, Message::DialogConfirm, true)]
                 .spacing(8)
         };
         let names = |paths: &[PathBuf]| {
@@ -970,27 +969,27 @@ impl Guppy {
                 if p.is_dir() { format!("· {n}/") } else { format!("· {n}") }
             }).collect();
             if paths.len() > 6 {
-                lines.push(format!("  und {} weitere", paths.len() - 6));
+                lines.push(format!("  and {} more", paths.len() - 6));
             }
             small(lines.join("\n"))
         };
 
         let content: Element<'_, Message> = match dialog {
             Dialog::Confirm { kind, sources, target } => {
-                let what = if sources.len() == 1 { "1 Eintrag".to_string() } else { format!("{} Einträge", sources.len()) };
-                let mut c = column![title(format!("{what} {}", op_verb(*kind)))].spacing(14);
+                let what = if sources.len() == 1 { "1 item".to_string() } else { format!("{} items", sources.len()) };
+                let mut c = column![title(format!("{} {what}", capitalize(op_verb(*kind))))].spacing(14);
                 if let Some(target) = target {
-                    c = c.push(small(format!("nach {}", self.jumper.display(target))));
+                    c = c.push(small(format!("to {}", self.jumper.display(target))));
                 }
                 c = c.push(names(sources));
                 if *kind == OpKind::Delete {
-                    c = c.push(text("Kann nicht rückgängig gemacht werden.").size(12).color(rgb(t.red)));
+                    c = c.push(text("This cannot be undone.").size(12).color(rgb(t.red)));
                 }
                 let ok = match kind {
-                    OpKind::Copy => "Kopieren",
-                    OpKind::Move => "Verschieben",
-                    OpKind::Trash => "Papierkorb",
-                    OpKind::Delete => "Löschen",
+                    OpKind::Copy => "Copy",
+                    OpKind::Move => "Move",
+                    OpKind::Trash => "Trash",
+                    OpKind::Delete => "Delete",
                 };
                 c.push(buttons(ok)).into()
             }
@@ -1004,7 +1003,7 @@ impl Guppy {
                         ..Default::default()
                     });
                 let mut c = column![
-                    title("Neuer Ordner".into()),
+                    title("New folder".into()),
                     small(format!("in {}", self.jumper.display(&self.panes[self.active].path))),
                     field,
                 ]
@@ -1012,22 +1011,22 @@ impl Guppy {
                 if let Some(e) = error {
                     c = c.push(text(e.clone()).size(12).color(rgb(t.red)));
                 }
-                c.push(buttons("Anlegen")).into()
+                c.push(buttons("Create")).into()
             }
             Dialog::Running { kind, job } => {
                 let p = job.progress();
                 let frac = if p.total == 0 { 0.0 } else { p.done as f32 / p.total as f32 };
                 let amount = if matches!(kind, OpKind::Copy | OpKind::Move) {
-                    format!("{} von {}", human_size(p.done), human_size(p.total))
+                    format!("{} of {}", human_size(p.done), human_size(p.total))
                 } else {
-                    format!("{} von {}", p.done, p.total)
+                    format!("{} of {}", p.done, p.total)
                 };
                 column![
-                    title(format!("Wird {}", match kind {
-                        OpKind::Copy => "kopiert",
-                        OpKind::Move => "verschoben",
-                        OpKind::Trash => "in den Papierkorb gelegt",
-                        OpKind::Delete => "gelöscht",
+                    title(format!("{} …", match kind {
+                        OpKind::Copy => "Copying",
+                        OpKind::Move => "Moving",
+                        OpKind::Trash => "Moving to trash",
+                        OpKind::Delete => "Deleting",
                     })),
                     iced::widget::progress_bar(0.0..=1.0, frac).girth(6).style(move |_| iced::widget::progress_bar::Style {
                         background: Color { a: 0.25, ..Color::BLACK }.into(),
@@ -1035,7 +1034,7 @@ impl Guppy {
                         border: Border::default().rounded(3),
                     }),
                     row![small(p.current), iced::widget::Space::new().width(Length::Fill), small(amount)],
-                    row![iced::widget::Space::new().width(Length::Fill), btn("Abbrechen", Message::DialogCancel, false)],
+                    row![iced::widget::Space::new().width(Length::Fill), btn("Cancel", Message::DialogCancel, false)],
                 ]
                 .spacing(14)
                 .into()
@@ -1052,14 +1051,14 @@ impl Guppy {
                     c
                 };
                 column![
-                    title("Guppy · Tasten".into()),
-                    small("Alles geht per Tastatur. Tippen filtert das aktive Pane, ~ oder / springt zu einem Ordner. Ohne Markierung wirken Dateioperationen auf den Eintrag unter dem Cursor; Enter bestätigt, Esc bricht ab.".into()),
+                    title("Guppy · Keys".into()),
+                    small("Everything works from the keyboard. Typing filters the active pane, ~ or / jumps to a folder. Without marks, file operations act on the entry under the cursor; Enter confirms, Esc cancels.".into()),
                     row![
                         column![section(&HELP[0]), section(&HELP[1])].spacing(18).width(Length::Fill),
                         column![section(&HELP[2]), section(&HELP[3])].spacing(18).width(Length::Fill),
                     ]
                     .spacing(24),
-                    row![small("F1 oder Esc schließt".into()), iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)]
+                    row![small("F1 or Esc closes".into()), iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)]
                         .align_y(iced::Alignment::Center),
                 ]
                 .spacing(18)
@@ -1068,10 +1067,10 @@ impl Guppy {
             Dialog::Report { problems } => {
                 let mut lines: Vec<String> = problems.iter().take(8).cloned().collect();
                 if problems.len() > 8 {
-                    lines.push(format!("und {} weitere", problems.len() - 8));
+                    lines.push(format!("and {} more", problems.len() - 8));
                 }
                 column![
-                    title("Erledigt, mit Hinweisen".into()),
+                    title("Done, with notes".into()),
                     small(lines.join("\n")),
                     row![iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)],
                 ]
@@ -1145,20 +1144,20 @@ impl Guppy {
         let bar = row![
             text("◆").color(rgb(t.accent)).font(BOLD).size(13),
             iced::widget::Space::new().width(10),
-            self.icon_button(icons::BACK, "Zurück (Alt ←)", (!p.back.is_empty()).then_some(Message::Back)),
-            self.icon_button(icons::FORWARD, "Vor (Alt →)", (!p.forward.is_empty()).then_some(Message::Forward)),
-            self.icon_button(icons::UP, "Übergeordneter Ordner (⌫)", Some(Message::Parent)),
+            self.icon_button(icons::BACK, "Back (Alt ←)", (!p.back.is_empty()).then_some(Message::Back)),
+            self.icon_button(icons::FORWARD, "Forward (Alt →)", (!p.forward.is_empty()).then_some(Message::Forward)),
+            self.icon_button(icons::UP, "Parent folder (⌫)", Some(Message::Parent)),
             self.icon_button(icons::HOME, "Home", Some(Message::Home)),
             sep(),
-            self.icon_button(icons::NEW_DIR, "Neuer Ordner (F7)", Some(Message::NewDir)),
-            self.icon_button(icons::COPY, "Kopieren (F5)", Some(Message::Op(OpKind::Copy))),
-            self.icon_button(icons::MOVE, "Verschieben (F6)", Some(Message::Op(OpKind::Move))),
-            self.icon_button(icons::DELETE, "Papierkorb (F8 · Entf), endgültig mit Umschalt", Some(Message::Op(OpKind::Trash))),
+            self.icon_button(icons::NEW_DIR, "New folder (F7)", Some(Message::NewDir)),
+            self.icon_button(icons::COPY, "Copy (F5)", Some(Message::Op(OpKind::Copy))),
+            self.icon_button(icons::MOVE, "Move (F6)", Some(Message::Op(OpKind::Move))),
+            self.icon_button(icons::DELETE, "Trash (F8 · Del), permanently with Shift", Some(Message::Op(OpKind::Trash))),
             sep(),
-            self.icon_button(icons::MARK, "Markieren (Ins)", Some(Message::ToggleMark)),
-            self.icon_button(icons::SWAP, "Seite wechseln (Tab)", Some(Message::SwitchSide)),
+            self.icon_button(icons::MARK, "Mark (Ins)", Some(Message::ToggleMark)),
+            self.icon_button(icons::SWAP, "Switch side (Tab)", Some(Message::SwitchSide)),
             iced::widget::Space::new().width(Length::Fill),
-            self.icon_button(icons::HIDDEN, "Versteckte Dateien (Strg H)", Some(Message::ToggleHidden)),
+            self.icon_button(icons::HIDDEN, "Hidden files (Ctrl H)", Some(Message::ToggleHidden)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
@@ -1209,7 +1208,7 @@ impl Guppy {
             let (size, pending) = match (e.is_dir(), self.sizes.get(&e.path)) {
                 (false, _) => (human_size(e.size), false),
                 (true, Some(DirSize::Done(n))) => (human_size(n), false),
-                // Aus dem Cache des letzten Laufs, wird gerade überprüft.
+                // From the last run's cache, currently being verified.
                 (true, Some(DirSize::Cached(n))) => (format!("≈ {}", human_size(n)), true),
                 (true, Some(DirSize::Partial(n))) => (format!("… {}", human_size(n)), true),
                 (true, None) => ("…".to_string(), true),
@@ -1290,9 +1289,9 @@ impl Guppy {
             row![
                 container(
                     text(match &self.loads[side] {
-                        // Ordnerwechsel, der noch auf das Dateisystem wartet.
+                        // Folder change still waiting on the filesystem.
                         Some(l) if !matches!(l.after, After::Reload) => {
-                            let state = if l.since.elapsed() >= LOAD_SLOW { "antwortet nicht · Esc bricht ab" } else { "lädt …" };
+                            let state = if l.since.elapsed() >= LOAD_SLOW { "not responding · Esc cancels" } else { "loading …" };
                             format!("{} · {state}", l.path.display())
                         }
                         _ => p.path.display().to_string(),
@@ -1303,7 +1302,7 @@ impl Guppy {
                 )
                 .width(Length::Fill)
                 .clip(true),
-                text(if p.network { "NETZ · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
+                text(if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]
             .spacing(10),
@@ -1351,7 +1350,7 @@ impl Guppy {
             .into()
     }
 
-    /// Trefferliste im Sprungmodus, an Stelle der Dateiliste des aktiven Panes.
+    /// Jump mode hit list, in place of the active pane's file list.
     fn jump_view(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let rows = self.jump.iter().enumerate().map(|(i, path)| {
@@ -1373,16 +1372,16 @@ impl Guppy {
             .on_press(Message::JumpTo(i))
             .into()
         });
-        let hint = if self.jump.is_empty() { "Keine Treffer" } else { "↑↓ wählen · Enter springen · Esc zurück" };
+        let hint = if self.jump.is_empty() { "No matches" } else { "↑↓ select · Enter jump · Esc back" };
         column![
-            container(text("SPRINGEN NACH").size(11).color(rgb(t.foreground))).padding([4, 16]),
+            container(text("JUMP TO").size(11).color(rgb(t.foreground))).padding([4, 16]),
             column(rows).padding([0, 6]),
             container(text(hint).size(11).color(rgb(t.foreground))).padding([8, 16]),
         ]
         .into()
     }
 
-    /// Ein Blatt Papier: Korn-Struktur unter dem Inhalt, optional mit farbigem Rand.
+    /// A sheet of paper: grain texture under the content, optionally with a colored border.
     fn sheet<'a>(
         &'a self,
         content: Element<'a, Message>,
@@ -1413,7 +1412,7 @@ impl Guppy {
         let visible = p.visible(self.show_hidden, &self.sizes);
         let count = visible.len();
         let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
-        // Summe der sichtbaren Einträge, sobald alle Ordnergrößen feststehen.
+        // Total of visible entries, once all folder sizes are known.
         let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir(), self.sizes.get(&e.path)) {
             (false, _) => Some(acc + e.size),
             (true, Some(DirSize::Done(n))) => Some(acc + n),
@@ -1431,9 +1430,9 @@ impl Guppy {
             .height(15)
             .style(move |_, _| svg::Style { color: Some(dim) });
         let jumping = self.jumping();
-        let (mode, mode_color) = if jumping { ("SPRINGEN", rgb(t.accent)) } else { ("FILTER", dim) };
+        let (mode, mode_color) = if jumping { ("JUMP", rgb(t.accent)) } else { ("FILTER", dim) };
         let query: Element<'_, Message> = if p.query.is_empty() {
-            text("tippen filtert · ~ springt").size(12).color(rgb(0x555555)).wrapping(iced::widget::text::Wrapping::None).into()
+            text("type to filter · ~ to jump").size(12).color(rgb(0x555555)).wrapping(iced::widget::text::Wrapping::None).into()
         } else {
             text(format!("{}▏", p.query)).size(12).color(rgb(t.bright)).into()
         };
@@ -1455,7 +1454,7 @@ impl Guppy {
             iced::widget::Space::new().width(Length::Fill),
             text(cur).size(12).color(rgb(t.foreground)).wrapping(iced::widget::text::Wrapping::None),
             bar_sep(),
-            text(format!("{count} Einträge")).size(12).color(dim),
+            text(format!("{count} items")).size(12).color(dim),
             bar_sep(),
             text(match total {
                 Some(n) => format!("Σ {}", human_size(n)),
@@ -1465,9 +1464,9 @@ impl Guppy {
             .color(dim),
             bar_sep(),
             text(match (marked, hidden_marked) {
-                (0, _) => "nichts markiert".into(),
-                (m, 0) => format!("{m} markiert"),
-                (m, h) => format!("{m} markiert ({h} ausgeblendet)"),
+                (0, _) => "nothing marked".into(),
+                (m, 0) => format!("{m} marked"),
+                (m, h) => format!("{m} marked ({h} hidden)"),
             })
                 .size(12)
                 .color(if marked > 0 { rgb(t.marked) } else { dim }),
@@ -1486,6 +1485,11 @@ impl Guppy {
             })
             .into()
     }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn dirs_home() -> PathBuf {

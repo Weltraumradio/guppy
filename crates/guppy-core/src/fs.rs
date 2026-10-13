@@ -9,7 +9,7 @@ pub enum EntryKind {
     Symlink,
 }
 
-/// Grobe Einteilung für die Farbgebung in der Liste.
+/// Rough classification for coloring in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileClass {
     Dir,
@@ -55,7 +55,7 @@ impl Entry {
     }
 }
 
-/// Liest ein Verzeichnis: Ordner zuerst, dann alphabetisch ohne Groß-/Kleinschreibung.
+/// Reads a directory: directories first, then alphabetical, case-insensitive.
 pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -64,7 +64,7 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
             let name = de.file_name().to_string_lossy().into_owned();
             let ft = de.file_type().ok();
             let is_link = ft.is_some_and(|t| t.is_symlink());
-            // Für Symlinks zählt das Ziel (Ordner-Links sollen sich wie Ordner verhalten).
+            // For symlinks the target counts (links to directories should behave like directories).
             let meta = if is_link { std::fs::metadata(&path).ok() } else { de.metadata().ok() };
             let kind = match &meta {
                 Some(m) if m.is_dir() => EntryKind::Dir,
@@ -90,7 +90,7 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Menschenlesbare Größe im deutschen Format, z. B. `4,8 KB`.
+/// Human-readable size, e.g. `4.8 KB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
@@ -102,21 +102,21 @@ pub fn human_size(bytes: u64) -> String {
     if i == 0 {
         format!("{bytes} B")
     } else {
-        format!("{v:.1} {}", UNITS[i]).replace('.', ",")
+        format!("{v:.1} {}", UNITS[i])
     }
 }
 
-/// Kompaktes Änderungsdatum: `heute 21:17`, `12.10. 21:17` (dieses Jahr), sonst `12.10.2024`.
+/// Compact modification date: `today 21:17`, `Oct 12 21:17` (this year), otherwise `2024-10-12`.
 pub fn human_date(t: SystemTime) -> String {
     use chrono::{DateTime, Datelike, Local};
     let t: DateTime<Local> = t.into();
     let now = Local::now();
     if t.date_naive() == now.date_naive() {
-        t.format("heute %H:%M").to_string()
+        t.format("today %H:%M").to_string()
     } else if t.year() == now.year() {
-        t.format("%d.%m. %H:%M").to_string()
+        t.format("%b %d %H:%M").to_string()
     } else {
-        t.format("%d.%m.%Y").to_string()
+        t.format("%Y-%m-%d").to_string()
     }
 }
 
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(human_size(214), "214 B");
-        assert_eq!(human_size(4915), "4,8 KB");
+        assert_eq!(human_size(4915), "4.8 KB");
     }
 
     #[test]

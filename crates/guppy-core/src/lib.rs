@@ -1,4 +1,4 @@
-//! Guppy-Kern: Dateisystem-Zugriff, Ordnergrößen, Sprungziele und Theme, ohne GUI-Abhängigkeiten.
+//! Guppy core: filesystem access, directory sizes, jump targets and theme, with no GUI dependencies.
 
 pub mod du;
 pub mod fs;

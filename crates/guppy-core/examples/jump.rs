@@ -1,4 +1,4 @@
-//! Zeigt Sprungziele: `cargo run --release --example jump -- <suche> [ordner]`
+//! Shows jump targets: `cargo run --release --example jump -- <query> [dir]`
 fn main() {
     let mut args = std::env::args().skip(1);
     let q = args.next().unwrap_or_default();

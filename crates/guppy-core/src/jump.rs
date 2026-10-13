@@ -1,5 +1,5 @@
-//! Ordner-Sprungziele: häufig/kürzlich besuchte Ordner (eigene Liste plus
-//! zoxide, falls installiert) und Unterordner des aktuellen Ordners, unscharf durchsucht.
+//! Directory jump targets: frequently/recently visited directories (own list plus
+//! zoxide, if installed) and subdirectories of the current directory, fuzzy-searched.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,13 +18,13 @@ struct Visit {
 
 pub struct Jumper {
     visits: HashMap<PathBuf, Visit>,
-    /// Punkte aus zoxide, falls vorhanden.
+    /// Scores from zoxide, if available.
     zoxide: HashMap<PathBuf, f64>,
-    /// Unterordner des aktuellen Ordners, im Hintergrund eingelesen.
+    /// Subdirectories of the current directory, scanned in the background.
     nearby: Arc<Mutex<(PathBuf, Vec<PathBuf>)>>,
     indexing: Arc<AtomicBool>,
-    /// Im Hintergrund geprüft, ob gespeicherte Ziele noch existieren; so blockiert
-    /// ein nicht erreichbares NAS nie die Suche.
+    /// Checked in the background whether stored targets still exist, so an
+    /// unreachable NAS never blocks the search.
     alive: Arc<Mutex<HashMap<PathBuf, bool>>>,
     db: Option<PathBuf>,
     home: String,
@@ -64,7 +64,7 @@ impl Jumper {
         me
     }
 
-    /// Prüft alle gespeicherten Ziele im Hintergrund, lokale zuerst.
+    /// Checks all stored targets in the background, local ones first.
     fn check_alive(&self) {
         let mut paths: Vec<PathBuf> = self.visits.keys().chain(self.zoxide.keys()).cloned().collect();
         paths.sort_by_key(|p| crate::platform::is_network(p));
@@ -96,7 +96,7 @@ impl Jumper {
         let _ = std::fs::write(db, out);
     }
 
-    /// Liest Unterordner von `root` (bis Tiefe 4, max. 20 000; im Netz Tiefe 2) im Hintergrund ein.
+    /// Scans subdirectories of `root` in the background (depth 4, max 20,000; depth 2 on network drives).
     pub fn index_nearby(&self, root: &Path) {
         if self.nearby.lock().unwrap().0 == root {
             return;
@@ -105,7 +105,7 @@ impl Jumper {
         let indexing = self.indexing.clone();
         indexing.store(true, Ordering::Relaxed);
         let root = root.to_path_buf();
-        // Auf Netzlaufwerken flacher suchen: jede Ebene kostet dort Netzwerk-Anfragen.
+        // Search shallower on network drives: every level costs network requests there.
         let (depth, max) = if crate::platform::is_network(&root) { (2, 5_000) } else { (4, 20_000) };
         *nearby.lock().unwrap() = (root.clone(), Vec::new());
         std::thread::spawn(move || {
@@ -118,7 +118,7 @@ impl Jumper {
                     for e in rd.flatten() {
                         let name = e.file_name();
                         let name = name.to_string_lossy();
-                        // Versteckte Ordner und Build-Artefakte sind selten Sprungziele.
+                        // Hidden directories and build artifacts are rarely jump targets.
                         let skip = crate::platform::is_hidden(&name, None) || matches!(&*name, "target" | "node_modules" | "__pycache__");
                         if !skip && e.file_type().is_ok_and(|t| t.is_dir()) {
                             next.push(e.path());
@@ -139,7 +139,7 @@ impl Jumper {
         });
     }
 
-    /// Werden gerade Unterordner eingelesen?
+    /// Are subdirectories currently being scanned?
     pub fn indexing(&self) -> bool {
         self.indexing.load(Ordering::Relaxed)
     }
@@ -158,14 +158,14 @@ impl Jumper {
         own + self.zoxide.get(p).copied().unwrap_or(0.0)
     }
 
-    /// Sucht Ordner zu `query`. Leere Suche: nach Häufigkeit sortiert.
+    /// Finds directories matching `query`. Empty query: sorted by frecency.
     pub fn search(&self, query: &str, limit: usize) -> Vec<PathBuf> {
         let mut candidates: Vec<PathBuf> = self.visits.keys().chain(self.zoxide.keys()).cloned().collect();
         candidates.extend(self.nearby.lock().unwrap().1.iter().cloned());
         candidates.sort();
         candidates.dedup();
         {
-            // Ungeprüfte Ziele bleiben drin; nur sicher verschwundene fallen weg.
+            // Unchecked targets stay; only ones known to be gone are dropped.
             let alive = self.alive.lock().unwrap();
             candidates.retain(|p| alive.get(p) != Some(&false));
         }
@@ -185,7 +185,7 @@ impl Jumper {
             .filter_map(|p| {
                 let shown = self.display(&p);
                 let s = pattern.score(Utf32Str::new(&shown, &mut buf), &mut matcher)?;
-                // Unschärfe-Treffer zählt, Häufigkeit gibt den Ausschlag bei Gleichstand.
+                // Fuzzy score counts; frecency breaks ties.
                 Some((s as f64 + 25.0 * (1.0 + self.frecency(&p)).ln(), p))
             })
             .collect();
@@ -193,7 +193,7 @@ impl Jumper {
         scored.into_iter().take(limit).map(|(_, p)| p).collect()
     }
 
-    /// Pfad mit `~` statt Home-Verzeichnis.
+    /// Path with `~` instead of the home directory.
     pub fn display(&self, p: &Path) -> String {
         let s = p.display().to_string();
         match s.strip_prefix(&self.home) {

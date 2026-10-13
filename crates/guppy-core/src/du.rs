@@ -1,8 +1,8 @@
-//! Ordnergrößen: parallel berechnet, abbrechbar, Ergebnisse für alle Panes geteilt.
+//! Directory sizes: computed in parallel, cancellable, results shared across all panes.
 //!
-//! Gezählt wird die nominelle Dateigröße. Hardlinks zählen pro angefragtem
-//! Ordner nur einmal, andere Dateisysteme (z. B. `/proc`, Mounts) werden nicht
-//! betreten (siehe [`crate::platform`]).
+//! Counts nominal file size. Hard links count only once per requested
+//! directory; other filesystems (e.g. `/proc`, mounts) are not entered
+//! (see [`crate::platform`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,32 +15,32 @@ use crate::platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirSize {
-    /// Fertig berechnet.
+    /// Fully computed.
     Done(u64),
-    /// Berechnung läuft, bisher gezählt.
+    /// Computation running; counted so far.
     Partial(u64),
-    /// Wert aus dem letzten Programmlauf; wird im Hintergrund überprüft.
+    /// Value from the previous run; being re-checked in the background.
     Cached(u64),
 }
 
 #[derive(Default)]
 struct Inner {
     done: Mutex<HashMap<PathBuf, u64>>,
-    /// Laufende Berechnungen: Zwischenstand und Abbruch-Signal der Anfrage.
+    /// Running computations: progress and the request's cancel signal.
     running: Mutex<HashMap<PathBuf, (Arc<AtomicU64>, Cancel)>>,
     pending: AtomicUsize,
-    /// Dauerhafter Cache: beim Start geladen, beim Beenden gespeichert.
+    /// Persistent cache: loaded at startup, saved on exit.
     cached: Mutex<HashMap<PathBuf, u64>>,
     cache_file: Option<PathBuf>,
 }
 
-/// Teilbarer Größen-Speicher; `clone()` ist billig.
+/// Shareable size store; `clone()` is cheap.
 #[derive(Clone, Default)]
 pub struct DirSizes {
     inner: Arc<Inner>,
 }
 
-/// Abbruch-Signal für eine Anfrage, z. B. wenn das Pane den Ordner verlässt.
+/// Cancel signal for a request, e.g. when the pane leaves the directory.
 #[derive(Clone, Default)]
 pub struct Cancel(Arc<AtomicBool>);
 
@@ -54,21 +54,21 @@ impl Cancel {
     }
 }
 
-/// Parallele Zugriffe pro Netzlaufwerk-Berechnung.
+/// Parallel accesses per network-drive computation.
 const NET_THREADS: usize = 4;
 
 fn net_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(NET_THREADS).build().expect("Thread-Pool"))
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(NET_THREADS).build().expect("thread pool"))
 }
 
 impl DirSizes {
-    /// Standardort des Caches, z. B. `~/.cache/guppy/sizes.tsv`.
+    /// Default cache location, e.g. `~/.cache/guppy/sizes.tsv`.
     pub fn default_cache_file() -> Option<PathBuf> {
         dirs::cache_dir().map(|d| d.join("guppy/sizes.tsv"))
     }
 
-    /// Mit dauerhaftem Cache in `file` (Zeilen `größe<TAB>pfad`).
+    /// With a persistent cache in `file` (lines `size<TAB>path`).
     pub fn with_cache(file: PathBuf) -> Self {
         let cached = std::fs::read_to_string(&file)
             .map(|s| {
@@ -85,7 +85,7 @@ impl DirSizes {
         }
     }
 
-    /// Schreibt alle bekannten Größen in den Cache (atomar über eine Zwischendatei).
+    /// Writes all known sizes to the cache (atomically via a temp file).
     pub fn save(&self) -> std::io::Result<()> {
         let Some(file) = &self.inner.cache_file else { return Ok(()) };
         let mut all = self.inner.cached.lock().unwrap().clone();
@@ -93,7 +93,7 @@ impl DirSizes {
         let mut out = String::new();
         for (p, n) in &all {
             let p = p.to_string_lossy();
-            // Pfade mit Zeilenumbruch passen nicht ins Zeilenformat.
+            // Paths containing newlines don't fit the line format.
             if !p.contains('\n') {
                 out.push_str(&format!("{n}\t{p}\n"));
             }
@@ -112,7 +112,7 @@ impl DirSizes {
         }
         let cached = self.inner.cached.lock().unwrap().get(dir).copied();
         if let Some(n) = cached {
-            // Schätzwert bleibt stehen, bis das neue Ergebnis da ist; kein Hochzählen.
+            // Keep the estimate until the new result is in; no counting up.
             return Some(DirSize::Cached(n));
         }
         if let Some((acc, _)) = self.inner.running.lock().unwrap().get(dir) {
@@ -121,17 +121,17 @@ impl DirSizes {
         None
     }
 
-    /// Läuft gerade mindestens eine Berechnung?
+    /// Is at least one computation running?
     pub fn busy(&self) -> bool {
         self.inner.pending.load(Ordering::Relaxed) > 0
     }
 
-    /// Berechnet die Größen der Ordner im Hintergrund; bekannte werden übersprungen.
+    /// Computes directory sizes in the background; known ones are skipped.
     pub fn request(&self, dirs: Vec<PathBuf>, cancel: Cancel) {
         let todo: Vec<PathBuf> = {
             let done = self.inner.done.lock().unwrap();
             let running = self.inner.running.lock().unwrap();
-            // Abgebrochene, noch nicht beendete Läufe zählen nicht als laufend.
+            // Cancelled runs that haven't finished yet don't count as running.
             let active = |d: &PathBuf| running.get(d).is_some_and(|(_, c)| !c.is_cancelled());
             dirs.into_iter().filter(|d| !done.contains_key(d) && !active(d)).collect()
         };
@@ -149,7 +149,7 @@ impl DirSizes {
                 let links = Mutex::new(HashSet::new());
                 me.walk(dir, dev, &cancel, &links, &acc);
                 {
-                    // Nur den eigenen Eintrag entfernen, nicht den eines neueren Laufs.
+                    // Remove only our own entry, not that of a newer run.
                     let mut running = me.inner.running.lock().unwrap();
                     if running.get(dir).is_some_and(|(a, _)| Arc::ptr_eq(a, &acc)) {
                         running.remove(dir);
@@ -158,8 +158,8 @@ impl DirSizes {
                 me.inner.pending.fetch_sub(1, Ordering::Relaxed);
             });
         };
-        // Netzlaufwerke: eigener kleiner Pool, damit das NAS nicht mit Dutzenden
-        // gleichzeitigen Anfragen überlastet wird und lokale Ordner nicht warten.
+        // Network drives: separate small pool so the NAS isn't flooded with dozens
+        // of concurrent requests and local directories don't have to wait.
         if todo_is_network {
             net_pool().spawn(job);
         } else {
@@ -167,8 +167,8 @@ impl DirSizes {
         }
     }
 
-    /// Markiert alles unter `dir` und die übergeordneten Ordner als veraltet.
-    /// Die alten Werte bleiben als Schätzwert sichtbar, bis neu gerechnet ist.
+    /// Marks everything under `dir` and its parent directories as stale.
+    /// Old values stay visible as estimates until recomputed.
     pub fn invalidate(&self, dir: &Path) {
         let stale = |p: &PathBuf| p.starts_with(dir) || dir.starts_with(p);
         let mut done = self.inner.done.lock().unwrap();
@@ -201,14 +201,14 @@ impl DirSizes {
         let mut files = 0u64;
         let mut subdirs = Vec::new();
         for e in rd.flatten() {
-            // DirEntry::metadata folgt keinen Symlinks.
+            // DirEntry::metadata does not follow symlinks.
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {
                 if platform::device(&m) == dev {
                     subdirs.push(e.path());
                 }
             } else if platform::hardlink_key(&m).is_some_and(|k| !links.lock().unwrap().insert(k)) {
-                // Hardlink schon gezählt.
+                // Hard link already counted.
             } else {
                 files += m.len();
             }
