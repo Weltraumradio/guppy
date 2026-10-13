@@ -93,7 +93,6 @@ fn is_jump(query: &str) -> bool {
 enum Dialog {
     Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
     NewDir { name: String, error: Option<String> },
-    Rename { from: PathBuf, name: String, error: Option<String> },
     /// Viewer (F3) for the file under the cursor.
     View { path: PathBuf, body: ViewBody },
     Running { kind: OpKind, job: Job },
@@ -102,6 +101,22 @@ enum Dialog {
     Help,
     /// Settings (F12): selected row, and the text being typed for path rows.
     Settings { row: usize, edit: Option<String> },
+}
+
+/// F2: the name being edited in place, in the cursor row of `side`.
+struct Rename {
+    side: usize,
+    from: PathBuf,
+    name: String,
+    /// Caret position in chars.
+    caret: usize,
+    error: Option<String>,
+}
+
+impl Rename {
+    fn byte(&self, i: usize) -> usize {
+        self.name.char_indices().nth(i).map_or(self.name.len(), |(b, _)| b)
+    }
 }
 
 /// What the viewer shows.
@@ -423,6 +438,7 @@ struct Guppy {
     /// Jump hits still need refreshing after indexing.
     jump_pending: bool,
     dialog: Option<Dialog>,
+    rename: Option<Rename>,
     last_frame: Option<std::time::Instant>,
     /// Window width, for the responsive layout.
     width: f32,
@@ -463,6 +479,7 @@ impl Guppy {
             shot_wait: 0,
             jump_pending: false,
             dialog: None,
+            rename: None,
             last_frame: None,
             width: 1200.0,
             last_move: None,
@@ -573,6 +590,10 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.rename.is_some() => {
+                self.on_rename_key(key, text.as_deref());
+                return Task::none();
+            }
             Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.dialog.is_some() => {
                 if matches!(self.dialog, Some(Dialog::View { .. })) {
                     return self.on_view_key(key);
@@ -612,10 +633,12 @@ impl Guppy {
             }
             Message::Key(_) | Message::Tick => return Task::none(),
             Message::Select(side, i) => {
+                self.rename = None;
                 self.active = side;
                 self.panes[side].cursor = i;
             }
             Message::Open(side, i) => {
+                self.rename = None;
                 self.active = side;
                 self.panes[side].cursor = i;
                 self.open_current();
@@ -905,16 +928,6 @@ impl Guppy {
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ Dialog::View { .. }) => self.dialog = Some(d),
-            Some(Dialog::Rename { from, name, .. }) => match ops::rename(&from, name.trim()) {
-                Ok(to) => {
-                    self.reload(self.active);
-                    let p = &self.panes[self.active];
-                    if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == to) {
-                        self.panes[self.active].cursor = i;
-                    }
-                }
-                Err(e) => self.dialog = Some(Dialog::Rename { from, name, error: Some(e.to_string()) }),
-            },
             Some(Dialog::Report { .. } | Dialog::Help) | None => {}
         }
     }
@@ -937,7 +950,7 @@ impl Guppy {
             Key::Named(Named::Escape) => self.cancel_dialog(),
             Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help)) => self.dialog = None,
             _ => {
-                if let Some(Dialog::NewDir { name, error } | Dialog::Rename { name, error, .. }) = &mut self.dialog {
+                if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
                     match (key.as_ref(), typed) {
                         (Key::Named(Named::Backspace), _) => {
                             name.pop();
@@ -951,9 +964,61 @@ impl Guppy {
         }
     }
 
+    /// Starts editing the name in place, caret before the extension.
     fn start_rename(&mut self) {
-        if let Some(e) = self.current() {
-            self.dialog = Some(Dialog::Rename { from: e.path.clone(), name: e.name.clone(), error: None });
+        let Some(e) = self.current() else { return };
+        let stem = match e.name.rfind('.') {
+            Some(dot) if dot > 0 && !e.is_dir() => e.name[..dot].chars().count(),
+            _ => e.name.chars().count(),
+        };
+        self.rename = Some(Rename { side: self.active, from: e.path.clone(), name: e.name.clone(), caret: stem, error: None });
+    }
+
+    fn on_rename_key(&mut self, key: Key, typed: Option<&str>) {
+        let Some(r) = &mut self.rename else { return };
+        let len = r.name.chars().count();
+        match key.as_ref() {
+            Key::Named(Named::Escape) => self.rename = None,
+            Key::Named(Named::Enter) => self.finish_rename(),
+            Key::Named(Named::ArrowLeft) => r.caret = r.caret.saturating_sub(1),
+            Key::Named(Named::ArrowRight) => r.caret = (r.caret + 1).min(len),
+            Key::Named(Named::Home) => r.caret = 0,
+            Key::Named(Named::End) => r.caret = len,
+            Key::Named(Named::Backspace) if r.caret > 0 => {
+                r.caret -= 1;
+                let b = r.byte(r.caret);
+                r.name.remove(b);
+                r.error = None;
+            }
+            Key::Named(Named::Delete) if r.caret < len => {
+                let b = r.byte(r.caret);
+                r.name.remove(b);
+                r.error = None;
+            }
+            _ => {
+                if let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) {
+                    let b = r.byte(r.caret);
+                    r.name.insert_str(b, t);
+                    r.caret += t.chars().count();
+                    r.error = None;
+                }
+            }
+        }
+    }
+
+    fn finish_rename(&mut self) {
+        let Some(r) = &mut self.rename else { return };
+        match ops::rename(&r.from, r.name.trim()) {
+            Ok(to) => {
+                let side = r.side;
+                self.rename = None;
+                self.reload(side);
+                let p = &self.panes[side];
+                if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == to) {
+                    self.panes[side].cursor = i;
+                }
+            }
+            Err(e) => r.error = Some(e.to_string()),
         }
     }
 
@@ -1365,22 +1430,6 @@ impl Guppy {
                 };
                 c.push(buttons(ok)).into()
             }
-            Dialog::Rename { from, name, error } => {
-                let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
-                    .padding([8, 10])
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
-                        border: Border::default().rounded(4),
-                        ..Default::default()
-                    });
-                let old = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut c = column![title("Rename".into()), small(old), field].spacing(14);
-                if let Some(e) = error {
-                    c = c.push(text(e.clone()).size(12).color(rgb(t.red)));
-                }
-                c.push(buttons("Rename")).into()
-            }
             Dialog::View { path, body } => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
                 let meta = std::fs::symlink_metadata(path).ok();
@@ -1726,18 +1775,41 @@ impl Guppy {
                     ..Default::default()
                 })
             });
+            let font = if e.is_dir() { BOLD } else { FONT };
+            let editing = self.rename.as_ref().filter(|r| r.side == side && is_cur && r.from == e.path);
+            let name: Element<'_, Message> = match editing {
+                // Name being edited: plain field with a caret, inside the row.
+                Some(r) => {
+                    let b = r.byte(r.caret);
+                    let part = |s: &str| text(s.to_string()).color(rgb(t.bright)).size(13).font(font).wrapping(iced::widget::text::Wrapping::None);
+                    let caret = container(iced::widget::Space::new().width(2).height(15)).style(move |_| container::Style {
+                        background: Some(rgb(t.accent).into()),
+                        ..Default::default()
+                    });
+                    container(row![part(&r.name[..b]), caret, part(&r.name[b..])].align_y(iced::Alignment::Center))
+                        .padding([2, 6])
+                        .style(move |_| container::Style {
+                            background: Some(rgb(t.dark_background).into()),
+                            border: Border::default().rounded(3),
+                            ..Default::default()
+                        })
+                        .into()
+                }
+                None => text(name).color(fg).size(13).font(font).wrapping(iced::widget::text::Wrapping::None).into(),
+            };
+            let (size, size_color) = match editing.and_then(|r| r.error.clone()) {
+                Some(err) => (err, rgb(t.red)),
+                None => (size, if on_cursor { fg } else if pending { rgb(t.light_foreground) } else { rgb(t.foreground) }),
+            };
             let mut line = row![
                 text(dot).color(dot_color).size(12).width(14),
-                container(
-                    text(name).color(fg).size(13).font(if e.is_dir() { BOLD } else { FONT })
-                        .wrapping(iced::widget::text::Wrapping::None),
-                )
+                container(name)
                 .width(Length::Fill)
                 .clip(true),
                 text(size)
-                    .color(if on_cursor { fg } else if pending { rgb(t.light_foreground) } else { rgb(t.foreground) })
+                    .color(size_color)
                     .size(12)
-                    .width(84)
+                    .width(if editing.is_some_and(|r| r.error.is_some()) { Length::Shrink } else { Length::Fixed(84.0) })
                     .align_x(iced::alignment::Horizontal::Right),
             ]
             .spacing(8)
