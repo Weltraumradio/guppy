@@ -54,12 +54,17 @@ impl Cancel {
     }
 }
 
-/// Parallel accesses per network-drive computation.
-const NET_THREADS: usize = 4;
+/// Parallel accesses per network-drive computation; set once at startup.
+static NET_THREADS: AtomicUsize = AtomicUsize::new(4);
+
+/// Sets the parallelism for network drives; only effective before the first use.
+pub fn set_network_threads(n: usize) {
+    NET_THREADS.store(n.max(1), Ordering::Relaxed);
+}
 
 fn net_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(NET_THREADS).build().expect("thread pool"))
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(NET_THREADS.load(Ordering::Relaxed)).build().expect("thread pool"))
 }
 
 impl DirSizes {

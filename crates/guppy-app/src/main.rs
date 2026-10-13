@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use guppy_core::fs::{human_date, human_size};
 use guppy_core::ops::{self, Job, OpKind};
-use guppy_core::{Cancel, DirSize, DirSizes, Entry, FileClass, Jumper};
+use guppy_core::config::SortBy;
+use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::{
@@ -89,7 +90,7 @@ enum Dialog {
     Confirm { kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf> },
     NewDir { name: String, error: Option<String> },
     Running { kind: OpKind, job: Job },
-    Report { problems: Vec<String> },
+    Report { title: &'static str, problems: Vec<String> },
     /// Quick help listing all keys (F1).
     Help,
 }
@@ -302,17 +303,31 @@ struct Guppy {
     last_move: Option<std::time::Instant>,
     /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
+    config: Config,
+}
+
+fn sort_from(s: SortBy) -> Sort {
+    match s {
+        SortBy::Name => Sort::Name,
+        SortBy::Size => Sort::Size,
+        SortBy::Date => Sort::Date,
+    }
 }
 
 impl Guppy {
     fn new() -> (Self, Task<Message>) {
         let home = dirs_home();
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+        let (config, config_error) = Config::load();
+        guppy_core::du::set_network_threads(config.network.threads);
         let mut g = Self {
             theme: guppy_core::Theme::load(),
-            panes: [Pane::new(cwd, "pane-left"), Pane::new(home, "pane-right")],
+            panes: [
+                Pane::new(Config::resolve(&config.start.left, &cwd), "pane-left"),
+                Pane::new(Config::resolve(&config.start.right, &cwd), "pane-right"),
+            ],
             active: 0,
-            show_hidden: false,
+            show_hidden: config.view.show_hidden,
             papers: [Paper::new(1), Paper::new(2)],
             sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
             jumper: Jumper::load(),
@@ -325,7 +340,13 @@ impl Guppy {
             width: 1200.0,
             last_move: None,
             loads: [None, None],
+            config,
         };
+        let sort = sort_from(g.config.view.sort);
+        g.panes.iter_mut().for_each(|p| p.sort = sort);
+        if let Some(e) = config_error {
+            g.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
+        }
         for side in 0..2 {
             let path = g.panes[side].path.clone();
             g.load(side, path, After::Start);
@@ -377,6 +398,7 @@ impl Guppy {
             dirs.extend(theme_dir.parent().map(Path::to_path_buf));
             dirs.push(theme_dir);
         }
+        dirs.extend(Config::path().and_then(|p| p.parent().map(Path::to_path_buf)));
         let mut keys = Subscription::batch([
             keyboard::listen().map(Message::Key),
             iced::window::resize_events().map(|(_, size)| Message::Resized(size)),
@@ -587,6 +609,29 @@ impl Guppy {
         visible.get(p.cursor).map(|e| vec![e.path.clone()]).unwrap_or_default()
     }
 
+    /// Takes over a changed config file. View settings only apply when they
+    /// changed in the file, so toggles made in the app are not overwritten.
+    fn apply_config(&mut self) {
+        let (new, error) = Config::load();
+        if let Some(e) = error {
+            self.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
+            return;
+        }
+        let old = std::mem::replace(&mut self.config, new);
+        let v = &self.config.view;
+        if v.show_hidden != old.view.show_hidden {
+            self.show_hidden = v.show_hidden;
+        }
+        if v.sort != old.view.sort {
+            let sort = sort_from(v.sort);
+            self.panes.iter_mut().for_each(|p| p.sort = sort);
+        }
+        if v.dir_sizes && !old.view.dir_sizes {
+            self.request_sizes(0);
+            self.request_sizes(1);
+        }
+    }
+
     fn ask(&mut self, kind: OpKind) {
         let sources = self.selection();
         if sources.is_empty() {
@@ -594,10 +639,20 @@ impl Guppy {
         }
         let target = matches!(kind, OpKind::Copy | OpKind::Move).then(|| self.panes[1 - self.active].path.clone());
         if target.as_deref() == Some(self.panes[self.active].path.as_path()) {
-            self.dialog = Some(Dialog::Report { problems: vec!["Source and target are the same folder.".into()] });
+            self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Source and target are the same folder.".into()] });
             return;
         }
+        let c = &self.config.confirm;
+        let confirm = match kind {
+            OpKind::Copy => c.copy,
+            OpKind::Move => c.move_,
+            OpKind::Trash => c.trash,
+            OpKind::Delete => c.delete,
+        };
         self.dialog = Some(Dialog::Confirm { kind, sources, target });
+        if !confirm {
+            self.confirm_dialog();
+        }
     }
 
     fn confirm_dialog(&mut self) {
@@ -654,7 +709,7 @@ impl Guppy {
         if !progress.finished {
             return;
         }
-        self.dialog = (!progress.problems.is_empty()).then_some(Dialog::Report { problems: progress.problems });
+        self.dialog = (!progress.problems.is_empty()).then_some(Dialog::Report { title: "Done, with notes", problems: progress.problems });
         for side in 0..2 {
             let path = self.panes[side].path.clone();
             self.sizes.invalidate(&path);
@@ -666,6 +721,11 @@ impl Guppy {
         let theme_dir = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf));
         if theme_dir.is_some_and(|t| paths.iter().any(|p| p.starts_with(&t) || t.starts_with(p))) {
             self.theme = guppy_core::Theme::load();
+        }
+        if let Some(cfg) = Config::path()
+            && paths.contains(&cfg)
+        {
+            self.apply_config();
         }
         for side in 0..2 {
             let dir = self.panes[side].path.clone();
@@ -724,7 +784,7 @@ impl Guppy {
             Err(e) => {
                 // Unreadable (permissions, NAS gone): view stays as it was.
                 if !matches!(after, After::Reload | After::Start) {
-                    self.dialog = Some(Dialog::Report { problems: vec![format!("{}: {e}", self.jumper.display(&path))] });
+                    self.dialog = Some(Dialog::Report { title: "Folder not readable", problems: vec![format!("{}: {e}", self.jumper.display(&path))] });
                 }
                 return;
             }
@@ -743,6 +803,9 @@ impl Guppy {
             let len = visible.len();
             p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
             // Let running computations continue, request only what's missing.
+            if !self.config.view.dir_sizes {
+                return;
+            }
             let p = &self.panes[side];
             let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
             self.sizes.request(dirs, p.sizing.clone());
@@ -814,6 +877,9 @@ impl Guppy {
         let p = &mut self.panes[side];
         p.sizing.cancel();
         p.sizing = Cancel::default();
+        if !self.config.view.dir_sizes {
+            return;
+        }
         let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
         self.sizes.request(dirs, p.sizing.clone());
     }
@@ -1064,13 +1130,13 @@ impl Guppy {
                 .spacing(18)
                 .into()
             }
-            Dialog::Report { problems } => {
+            Dialog::Report { title: heading, problems } => {
                 let mut lines: Vec<String> = problems.iter().take(8).cloned().collect();
                 if problems.len() > 8 {
                     lines.push(format!("and {} more", problems.len() - 8));
                 }
                 column![
-                    title("Done, with notes".into()),
+                    title(heading.to_string()),
                     small(lines.join("\n")),
                     row![iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)],
                 ]
