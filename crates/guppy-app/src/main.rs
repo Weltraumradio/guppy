@@ -1526,6 +1526,11 @@ impl Guppy {
 
     /// Asks for confirmation (if configured), then runs the operation.
     fn ask_with(&mut self, kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) {
+        // The trash can't take itself or its contents: delete permanently, always asking first.
+        if kind == OpKind::Trash && sources.iter().any(|p| ops::in_trash(p)) {
+            self.dialog = Some(Dialog::Confirm { kind: OpKind::Delete, sources, target });
+            return;
+        }
         let c = &self.config.confirm;
         let confirm = match kind {
             OpKind::Copy => c.copy,

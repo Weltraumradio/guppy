@@ -217,6 +217,24 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
+/// Lies in a trash folder (`~/.local/share/Trash`, `.Trash-1000` on drives), or is one.
+pub fn in_trash(p: &Path) -> bool {
+    let mut prev = None;
+    p.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        let hit = name.starts_with(".Trash") || (name == "Trash" && prev.as_deref() == Some("share"));
+        prev = Some(name.into_owned());
+        hit
+    })
+}
+
+#[test]
+fn trash_paths() {
+    assert!(in_trash(Path::new("/home/kc/.local/share/Trash/files")));
+    assert!(in_trash(Path::new("/mnt/pool1/.Trash-1000/files/x")));
+    assert!(!in_trash(Path::new("/home/kc/Trash/x")));
+}
+
 /// Reverses `steps`, last first: moves entries back and restores trashed ones.
 /// A move back asks like any other move if the old place is taken again.
 pub fn undo(steps: Vec<Step>) -> Job {
