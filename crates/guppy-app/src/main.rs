@@ -1,9 +1,11 @@
 mod clip;
 mod icons;
 mod paper;
+mod preview;
 mod watch;
 
 use paper::{Paper, Scanlines};
+use preview::ViewBody;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,7 @@ use std::time::Duration;
 
 use guppy_core::archive;
 use guppy_core::fs::{glob_match, human_date, human_size};
+use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
 use guppy_core::config::{Look, SortBy};
 use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
@@ -103,6 +106,11 @@ enum Message {
     SettingClick(usize),
     /// Checkbox on the startup help: show it at every start.
     ToggleStartHelp,
+    /// Ctrl+Q: show the entry under the cursor in the other pane.
+    ToggleQuick,
+    /// The cursor rested long enough: load the quick view (if still current).
+    QuickDue(u64),
+    QuickLoaded(PathBuf, ViewBody),
     /// Answer to "target already exists".
     Resolve(Resolve),
     /// Conflict dialog: the answer holds for all later conflicts of the job.
@@ -209,26 +217,6 @@ impl Rename {
     }
 }
 
-/// What the viewer shows.
-#[derive(Debug, Clone)]
-enum ViewBody {
-    Loading,
-    Text { text: String, truncated: bool },
-    /// Binary file as a hex dump.
-    Hex { text: String, truncated: bool },
-    Image,
-    Svg,
-    /// Folder: its entries, one per line.
-    Dir(String),
-    /// Not displayable; a short description instead.
-    Other(String),
-}
-
-/// The viewer shows at most this much of a text file.
-const VIEW_MAX: usize = 512 * 1024;
-/// Binary files: dumped up to this size (16 bytes per line).
-const HEX_MAX: usize = 64 * 1024;
-
 /// Ctrl+C / Ctrl+X / Ctrl+V and Shift+Insert, as 'c', 'x', 'v'.
 fn clip_key(key: &Key, m: keyboard::Modifiers) -> Option<char> {
     match key.as_ref() {
@@ -250,7 +238,7 @@ fn editor_id() -> Id {
 /// Reads a text file for the editor; refuses binary and very large files.
 fn load_edit(path: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if meta.len() as usize > 4 * VIEW_MAX {
+    if meta.len() as usize > 4 * preview::VIEW_MAX {
         return Err(format!("Too large for the editor · {}", human_size(meta.len())));
     }
     let buf = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -258,6 +246,22 @@ fn load_edit(path: &Path) -> Result<String, String> {
         return Err("Binary file, not editable here".into());
     }
     String::from_utf8(buf).map_err(|_| "Not UTF-8 text, not editable here".to_string())
+}
+
+fn quick_id() -> Id {
+    Id::new("quick")
+}
+
+/// Size and date of a file on disk, for viewer headers.
+fn file_info(path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => "folder".to_string(),
+        Ok(m) => {
+            let date = m.modified().ok().map(|t: SystemTime| human_date(t)).unwrap_or_default();
+            format!("{} · {date}", human_size(m.len()))
+        }
+        Err(_) => String::new(),
+    }
 }
 
 fn view_id() -> Id {
@@ -273,90 +277,6 @@ fn open_from_archive(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     archive::extract(&archive, std::slice::from_ref(&inner), &dir, |_, _| true).map_err(|e| e.to_string())?;
     guppy_core::platform::open(&dir.join(inner)).map_err(|e| e.to_string())
-}
-
-/// Reads what the viewer shows; runs off the UI thread (slow drives, big files).
-fn load_view(path: &Path) -> ViewBody {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    // Inside an archive: a folder lists, a file is read through bsdtar.
-    if path.symlink_metadata().is_err()
-        && let Some((arch, inner)) = archive::split(path)
-    {
-        if let Ok(list) = archive::read_dir(&arch, &inner) {
-            return ViewBody::Dir(dir_lines(&list));
-        }
-        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") {
-            return ViewBody::Other("Image inside an archive · Enter opens it".into());
-        }
-        return match archive::read_member(&arch, &inner, VIEW_MAX) {
-            Ok(buf) => view_bytes(buf, archive::size_of(&arch, &inner) as usize),
-            Err(e) => ViewBody::Other(e.to_string()),
-        };
-    }
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) => return ViewBody::Other(e.to_string()),
-    };
-    if meta.is_dir() {
-        return match guppy_core::read_dir(path) {
-            Ok(list) => ViewBody::Dir(dir_lines(&list)),
-            Err(e) => ViewBody::Other(e.to_string()),
-        };
-    }
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" => return ViewBody::Image,
-        "svg" => return ViewBody::Svg,
-        _ => {}
-    }
-    use std::io::Read;
-    let mut buf = Vec::new();
-    let read = std::fs::File::open(path).and_then(|f| f.take(VIEW_MAX as u64).read_to_end(&mut buf));
-    if let Err(e) = read {
-        return ViewBody::Other(e.to_string());
-    }
-    view_bytes(buf, meta.len() as usize)
-}
-
-/// A folder's entries for the viewer, one per line.
-fn dir_lines(list: &[Entry]) -> String {
-    list.iter().map(|c| if c.is_dir() { format!("{}/", c.name) } else { format!("{:<40} {:>10}", c.name, human_size(c.size)) }).collect::<Vec<_>>().join("\n")
-}
-
-/// Text or hex dump of the first bytes of a file of `len` bytes.
-fn view_bytes(mut buf: Vec<u8>, len: usize) -> ViewBody {
-    // NUL bytes in the first few KB: treat as binary.
-    if buf.iter().take(8192).any(|&b| b == 0) {
-        buf.truncate(HEX_MAX);
-        return ViewBody::Hex { text: hex_dump(&buf), truncated: len > HEX_MAX };
-    }
-    let text = match String::from_utf8(buf) {
-        Ok(s) => s,
-        // Cut-off multi-byte character at the end of the buffer.
-        Err(e) => String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to().max(e.as_bytes().len().saturating_sub(4))]).into_owned(),
-    };
-    ViewBody::Text { text: text.replace('\t', "    "), truncated: len > VIEW_MAX }
-}
-
-/// Offset, 16 bytes in hex (split in two groups), then printable ASCII.
-fn hex_dump(buf: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(buf.len() / 16 * 80 + 80);
-    for (n, chunk) in buf.chunks(16).enumerate() {
-        let _ = write!(out, "{:08x}  ", n * 16);
-        for i in 0..16 {
-            match chunk.get(i) {
-                Some(b) => { let _ = write!(out, "{b:02x} "); }
-                None => out.push_str("   "),
-            }
-            if i == 7 {
-                out.push(' ');
-            }
-        }
-        out.push(' ');
-        out.extend(chunk.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '·' }));
-        out.push('\n');
-    }
-    out
 }
 
 /// Rows of the settings overlay, in display order: (section, label).
@@ -455,6 +375,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+C / X", "copy / cut files to clipboard"),
         ("Ctrl+V", "paste files here"),
         ("Ctrl+J", "running jobs"),
+        ("Ctrl+Q", "quick view in other pane"),
     ]),
     ("View", &[
         ("F1", "this help"),
@@ -664,6 +585,13 @@ struct Guppy {
     loads: [Option<Loading>; 2],
     config: Config,
     jobs: Jobs,
+    /// Quick view on: the other pane shows the entry under the cursor.
+    quick: bool,
+    /// Entry the quick view should show, and what it shows now.
+    quick_want: Option<PathBuf>,
+    quick_view: Option<(PathBuf, ViewBody)>,
+    /// Counts cursor changes, so only the latest one loads.
+    quick_gen: u64,
     /// Last pattern used with `+` / `-`.
     last_pattern: String,
     /// Window close was requested while jobs run; the next request quits.
@@ -708,6 +636,10 @@ impl Guppy {
             loads: [None, None],
             config,
             jobs: Jobs::default(),
+            quick: false,
+            quick_want: None,
+            quick_view: None,
+            quick_gen: 0,
             last_pattern: "*".into(),
             close_armed: false,
         };
@@ -726,6 +658,8 @@ impl Guppy {
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
         }
+        // `GUPPY_QUICK=1` starts with the quick view open.
+        g.quick = std::env::var_os("GUPPY_QUICK").is_some();
         if std::env::var("GUPPY_SORT").as_deref() == Ok("size") {
             g.panes.iter_mut().for_each(|p| p.sort = Sort::Size);
         }
@@ -820,6 +754,26 @@ impl Guppy {
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
+        let task = self.handle(msg);
+        Task::batch([task, self.sync_quick()])
+    }
+
+    /// Follows the cursor: after a short rest, loads the entry for the quick view.
+    fn sync_quick(&mut self) -> Task<Message> {
+        if !self.quick {
+            return Task::none();
+        }
+        let want = if self.jumping() { None } else { self.current().map(|e| e.path.clone()) };
+        if want == self.quick_want {
+            return Task::none();
+        }
+        self.quick_want = want;
+        self.quick_gen += 1;
+        let generation = self.quick_gen;
+        Task::perform(smol::Timer::after(Duration::from_millis(90)), move |_| Message::QuickDue(generation))
+    }
+
+    fn handle(&mut self, msg: Message) -> Task<Message> {
         if matches!(msg, Message::Tick) {
             self.poll_jobs();
         }
@@ -950,7 +904,7 @@ impl Guppy {
             }
             Message::Key(_) | Message::Tick => return Task::none(),
             // Not while typing a name or with a dialog open (the mouse may just pass by).
-            Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() => self.active = side,
+            Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() && !self.quick => self.active = side,
             Message::HoverPane(_) => {}
             Message::Select(side, i) => {
                 self.rename = None;
@@ -1072,6 +1026,30 @@ impl Guppy {
                 }
             }
             Message::OpenJobs => self.dialog = Some(Dialog::Jobs),
+            Message::ToggleQuick => {
+                self.quick = !self.quick;
+                self.quick_want = None;
+                self.quick_view = None;
+            }
+            Message::QuickDue(generation) => {
+                if generation == self.quick_gen
+                    && let Some(path) = self.quick_want.clone()
+                {
+                    return Task::perform(
+                        async move {
+                            let p = path.clone();
+                            (path, smol::unblock(move || preview::load(&p, true)).await)
+                        },
+                        |(p, b)| Message::QuickLoaded(p, b),
+                    );
+                }
+            }
+            Message::QuickLoaded(path, body) => {
+                if self.quick_want.as_ref() == Some(&path) {
+                    self.quick_view = Some((path, body));
+                    return operation::scroll_to(quick_id(), AbsoluteOffset { x: None, y: Some(0.0) });
+                }
+            }
             Message::CancelJobs(everything) => {
                 if everything {
                     self.jobs.queue.clear();
@@ -1170,6 +1148,7 @@ impl Guppy {
             }
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
+            Key::Character("q") if m.control() => return self.update(Message::ToggleQuick),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
             _ if query_empty && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
                 self.dialog = Some(Dialog::Mark { add: typed == Some("+"), pattern: self.last_pattern.clone() });
@@ -1553,7 +1532,7 @@ impl Guppy {
             Task::perform(
                 async move {
                     let p = path.clone();
-                    (path, smol::unblock(move || load_view(&p)).await)
+                    (path, smol::unblock(move || preview::load(&p, false)).await)
                 },
                 |(p, b)| Message::Viewed(p, b),
             ),
@@ -1978,7 +1957,8 @@ impl Guppy {
 
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
-        let body = row![self.pane_view(0), self.pane_view(1)].spacing(22);
+        let side_view = |side: usize| if self.quick && side != self.active { self.quick_pane(side) } else { self.pane_view(side) };
+        let body = row![side_view(0), side_view(1)].spacing(22);
         let desk = container(body)
             .padding([16, 18])
             .height(Length::Fill)
@@ -2057,44 +2037,9 @@ impl Guppy {
             }
             Dialog::View { path, body } => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                let meta = std::fs::symlink_metadata(path).ok();
-                let info = match &meta {
-                    Some(m) if m.is_dir() => "folder".to_string(),
-                    Some(m) => {
-                        let date = m.modified().ok().map(|t| human_date(t.into())).unwrap_or_default();
-                        format!("{} · {date}", human_size(m.len()))
-                    }
-                    None => String::new(),
-                };
-                let mono = |s: String| text(s).size(12).font(FONT).color(rgb(t.bright));
-                let content: Element<'_, Message> = match body {
-                    ViewBody::Loading => small("loading …".into()).into(),
-                    ViewBody::Text { text: s, truncated } => {
-                        let mut c = column![mono(s.clone())];
-                        if *truncated {
-                            c = c.push(small(format!("… only the first {} are shown", human_size(VIEW_MAX as u64))));
-                        }
-                        c.into()
-                    }
-                    ViewBody::Hex { text: s, truncated } => {
-                        let mut c = column![mono(s.clone())];
-                        if *truncated {
-                            c = c.push(small(format!("… only the first {} are shown", human_size(HEX_MAX as u64))));
-                        }
-                        c.into()
-                    }
-                    ViewBody::Dir(s) => mono(s.clone()).into(),
-                    ViewBody::Image => container(iced::widget::image(iced::widget::image::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown))
-                        .center_x(Length::Fill)
-                        .into(),
-                    ViewBody::Svg => container(svg(svg::Handle::from_path(path)).width(Length::Shrink).height(Length::Shrink))
-                        .center_x(Length::Fill)
-                        .into(),
-                    ViewBody::Other(s) => small(s.clone()).into(),
-                };
                 column![
-                    row![title(name), iced::widget::Space::new().width(Length::Fill), small(info)].align_y(iced::Alignment::Center).spacing(12),
-                    scrollable(content).id(view_id()).height(Length::Fill).width(Length::Fill),
+                    row![title(name), iced::widget::Space::new().width(Length::Fill), small(file_info(path))].align_y(iced::Alignment::Center).spacing(12),
+                    self.body_view(path, body, view_id()),
                     small("↑↓ PgUp PgDn scroll · ←→ previous / next · F4 edit · Esc closes".into()),
                 ]
                 .spacing(14)
@@ -2406,6 +2351,60 @@ impl Guppy {
                 })
                 .into(),
         )
+    }
+
+    /// The content of a viewer: pictures fit the area, text scrolls.
+    fn body_view<'a>(&'a self, path: &'a Path, body: &'a ViewBody, id: Id) -> Element<'a, Message> {
+        let t = &self.theme;
+        let small = |s: String| text(s).size(12).color(rgb(t.foreground));
+        let mono = |s: &str| text(s.to_string()).size(12).font(FONT).color(rgb(t.bright));
+        let scroll = |c: Element<'a, Message>| scrollable(c).id(id.clone()).height(Length::Fill).width(Length::Fill).into();
+        let fit = |c: Element<'a, Message>| container(c).center(Length::Fill).into();
+        match body {
+            ViewBody::Loading => small("loading …".into()).into(),
+            ViewBody::Text { text: s, truncated } | ViewBody::Hex { text: s, truncated } => {
+                let mut c = column![mono(s)];
+                if *truncated {
+                    c = c.push(small("… the rest is not shown · F3 shows more".into()));
+                }
+                scroll(c.into())
+            }
+            ViewBody::Dir(s) => scroll(mono(s).into()),
+            ViewBody::Image => fit(iced::widget::image(iced::widget::image::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown).into()),
+            ViewBody::Svg => fit(svg(svg::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown).into()),
+            ViewBody::Picture { image, caption } => column![
+                container(iced::widget::image(image.clone()).content_fit(iced::ContentFit::ScaleDown)).center(Length::Fill),
+                small(caption.clone()),
+            ]
+            .spacing(10)
+            .into(),
+            ViewBody::Other(s) => fit(small(s.clone()).into()),
+        }
+    }
+
+    /// Quick view: the other pane's sheet showing the entry under the cursor.
+    fn quick_pane(&self, side: usize) -> Element<'_, Message> {
+        let t = &self.theme;
+        let (name, info) = match &self.quick_view {
+            Some((p, _)) => (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), file_info(p)),
+            None => (String::new(), String::new()),
+        };
+        let header = container(
+            row![
+                text(if self.neon() { "» PREVIEW" } else { "PREVIEW" }).size(11).font(BOLD).color(rgb(t.accent)),
+                container(text(name).size(12).color(rgb(t.bright)).wrapping(iced::widget::text::Wrapping::None)).width(Length::Fill).clip(true),
+                text(info).size(11).color(rgb(t.foreground)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([10, 10]);
+        let body: Element<'_, Message> = match &self.quick_view {
+            Some((p, b)) => container(self.body_view(p, b, quick_id())).padding([4, 14]).height(Length::Fill).into(),
+            None => container(text("Ctrl+Q closes the preview").size(12).color(rgb(t.foreground))).center(Length::Fill).into(),
+        };
+        let outline = self.neon().then(|| rgb(t.muted));
+        self.sheet(column![header, body].into(), side, t.sheet_dim, outline).width(Length::FillPortion(3)).into()
     }
 
     fn icon_button(&self, data: &'static str, label: &'static str, msg: Option<Message>) -> Element<'_, Message> {
