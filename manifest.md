@@ -14,3 +14,21 @@ Look:
 Modern and elegant.
 
 
+
+Future ideas (not built yet):
+- Compare directories: diff left/right, mark differences, one-way sync
+- Remote pane over SFTP/SSH
+- Command line at the bottom (runs in the current folder, Ctrl+Enter inserts the name)
+- Hotlist / bookmarks (Ctrl+D)
+- Tabs per pane (Ctrl+T), restored at startup
+- Multi-rename with patterns like [N]_[C].[E] and live preview
+- Undo for the last file operation (move, rename, trash)
+- Edit permissions / owner, create symlinks
+- Quick view in the other pane (Ctrl+Q)
+- Drive / mount picker with fill level (Alt+F1 / Alt+F2)
+- Command palette (Ctrl+P), fuzzy over all actions
+- Git status in the file list
+- Drag & drop to and from other apps (Wayland)
+- Startup-time / memory benchmark in the README
+- User actions in config.toml (key -> shell command with %f)
+- Nested archives, writing into archives, image preview inside archives

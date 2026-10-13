@@ -28,6 +28,8 @@ pub struct Entry {
     pub size: u64,
     pub modified: Option<SystemTime>,
     pub hidden: bool,
+    /// Lives inside an archive (read-only, `path` is virtual).
+    pub in_archive: bool,
 }
 
 impl Entry {
@@ -78,16 +80,47 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<Entry>> {
                 name,
                 path,
                 kind,
+                in_archive: false,
             }
         })
         .collect();
 
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+/// Directories first, then alphabetical, case-insensitive.
+pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_dir()
             .cmp(&a.is_dir())
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(entries)
+}
+
+/// Case-insensitive wildcard match: `*` any run of characters, `?` one character.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    // Greedy with backtracking to the last `*`.
+    let (mut i, mut j) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while j < n.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == n[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some((i, j));
+            i += 1;
+        } else if let Some((si, sj)) = star {
+            i = si + 1;
+            j = sj + 1;
+            star = Some((si, sj + 1));
+        } else {
+            return false;
+        }
+    }
+    p[i..].iter().all(|&c| c == '*')
 }
 
 /// Human-readable size, e.g. `4.8 KB`.
@@ -128,6 +161,16 @@ mod tests {
     fn sizes() {
         assert_eq!(human_size(214), "214 B");
         assert_eq!(human_size(4915), "4.8 KB");
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob_match("*.JPG", "Urlaub.jpg"));
+        assert!(glob_match("a?c*", "abcdef"));
+        assert!(glob_match("*", ""));
+        assert!(!glob_match("*.jpg", "x.jpeg"));
+        assert!(glob_match("*a*b", "xaab"));
+        assert!(!glob_match("?", ""));
     }
 
     #[test]

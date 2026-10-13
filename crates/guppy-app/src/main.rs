@@ -9,8 +9,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::fs::{human_date, human_size};
-use guppy_core::ops::{self, Job, OpKind};
+use guppy_core::archive;
+use guppy_core::fs::{glob_match, human_date, human_size};
+use guppy_core::ops::{self, Job, OpKind, Resolve};
 use guppy_core::config::SortBy;
 use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
@@ -94,6 +95,16 @@ enum Message {
     SettingClick(usize),
     /// Checkbox on the startup help: show it at every start.
     ToggleStartHelp,
+    /// Answer to "target already exists".
+    Resolve(Resolve),
+    /// Conflict dialog: the answer holds for all later conflicts of the job.
+    ToggleAll,
+    /// Open the job list (also Ctrl+J).
+    OpenJobs,
+    /// Cancel the running job, or with `true` also everything queued.
+    CancelJobs(bool),
+    /// A file from an archive was extracted for opening (or failed).
+    Opened(Result<(), String>),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
     /// computed, then exits.
     Shot(iced::window::Screenshot),
@@ -119,7 +130,12 @@ enum Dialog {
     },
     /// Viewer (F3) for the file under the cursor.
     View { path: PathBuf, body: ViewBody },
-    Running { kind: OpKind, job: Job },
+    /// The running job hit an existing target; `all` = apply the answer to the rest.
+    Conflict { conflict: ops::Conflict, all: bool },
+    /// Running and queued jobs.
+    Jobs,
+    /// Mark (`+`) or unmark (`-`) by wildcard pattern.
+    Mark { add: bool, pattern: String },
     Report { title: &'static str, problems: Vec<String> },
     /// Quick help listing all keys (F1); at startup with a "show again" checkbox.
     Help { startup: bool },
@@ -240,18 +256,42 @@ fn view_id() -> Id {
     Id::new("viewer")
 }
 
+/// Extracts a file from an archive into a temporary folder and opens it there.
+fn open_from_archive(path: &Path) -> Result<(), String> {
+    let (archive, inner) = archive::split(path).ok_or("not inside an archive")?;
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("guppy-{}/{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    archive::extract(&archive, std::slice::from_ref(&inner), &dir, |_, _| true).map_err(|e| e.to_string())?;
+    guppy_core::platform::open(&dir.join(inner)).map_err(|e| e.to_string())
+}
+
 /// Reads what the viewer shows; runs off the UI thread (slow drives, big files).
 fn load_view(path: &Path) -> ViewBody {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // Inside an archive: a folder lists, a file is read through bsdtar.
+    if path.symlink_metadata().is_err()
+        && let Some((arch, inner)) = archive::split(path)
+    {
+        if let Ok(list) = archive::read_dir(&arch, &inner) {
+            return ViewBody::Dir(dir_lines(&list));
+        }
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") {
+            return ViewBody::Other("Image inside an archive · Enter opens it".into());
+        }
+        return match archive::read_member(&arch, &inner, VIEW_MAX) {
+            Ok(buf) => view_bytes(buf, archive::size_of(&arch, &inner) as usize),
+            Err(e) => ViewBody::Other(e.to_string()),
+        };
+    }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => return ViewBody::Other(e.to_string()),
     };
     if meta.is_dir() {
         return match guppy_core::read_dir(path) {
-            Ok(list) => ViewBody::Dir(
-                list.iter().map(|c| if c.is_dir() { format!("{}/", c.name) } else { format!("{:<40} {:>10}", c.name, human_size(c.size)) }).collect::<Vec<_>>().join("\n"),
-            ),
+            Ok(list) => ViewBody::Dir(dir_lines(&list)),
             Err(e) => ViewBody::Other(e.to_string()),
         };
     }
@@ -266,17 +306,27 @@ fn load_view(path: &Path) -> ViewBody {
     if let Err(e) = read {
         return ViewBody::Other(e.to_string());
     }
+    view_bytes(buf, meta.len() as usize)
+}
+
+/// A folder's entries for the viewer, one per line.
+fn dir_lines(list: &[Entry]) -> String {
+    list.iter().map(|c| if c.is_dir() { format!("{}/", c.name) } else { format!("{:<40} {:>10}", c.name, human_size(c.size)) }).collect::<Vec<_>>().join("\n")
+}
+
+/// Text or hex dump of the first bytes of a file of `len` bytes.
+fn view_bytes(mut buf: Vec<u8>, len: usize) -> ViewBody {
     // NUL bytes in the first few KB: treat as binary.
     if buf.iter().take(8192).any(|&b| b == 0) {
         buf.truncate(HEX_MAX);
-        return ViewBody::Hex { text: hex_dump(&buf), truncated: meta.len() as usize > HEX_MAX };
+        return ViewBody::Hex { text: hex_dump(&buf), truncated: len > HEX_MAX };
     }
     let text = match String::from_utf8(buf) {
         Ok(s) => s,
         // Cut-off multi-byte character at the end of the buffer.
         Err(e) => String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to().max(e.as_bytes().len().saturating_sub(4))]).into_owned(),
     };
-    ViewBody::Text { text: text.replace('\t', "    "), truncated: meta.len() as usize > VIEW_MAX }
+    ViewBody::Text { text: text.replace('\t', "    "), truncated: len > VIEW_MAX }
 }
 
 /// Offset, 16 bytes in hex (split in two groups), then printable ASCII.
@@ -366,7 +416,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("↑ ↓", "move cursor"),
         ("PgUp PgDn", "page up / down"),
         ("Home End", "first / last item"),
-        ("Enter", "open / jump there"),
+        ("Enter", "open folder, archive, file"),
         ("Backspace", "shorten search, else folder up"),
         ("Alt+← Alt+→", "history back / forward"),
         ("Tab", "switch pane"),
@@ -380,6 +430,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Files", &[
         ("Insert", "mark and advance"),
         ("Space", "mark (when search is empty)"),
+        ("+ / -", "mark / unmark by pattern"),
+        ("*", "invert marks"),
         ("F2", "rename"),
         ("F3", "view"),
         ("F4", "edit"),
@@ -391,6 +443,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Shift+F8/Del", "delete permanently"),
         ("Ctrl+C / X", "copy / cut files to clipboard"),
         ("Ctrl+V", "paste files here"),
+        ("Ctrl+J", "running jobs"),
     ]),
     ("View", &[
         ("F1", "this help"),
@@ -440,7 +493,7 @@ impl Sort {
 
 /// Size of an entry for display and sorting; folders come from the size computation.
 fn entry_size(e: &Entry, sizes: &DirSizes) -> Option<u64> {
-    if !e.is_dir() {
+    if !e.is_dir() || e.in_archive {
         return Some(e.size);
     }
     match sizes.get(&e.path) {
@@ -469,6 +522,8 @@ struct Pane {
     id: Id,
     /// Located on a network drive.
     network: bool,
+    /// Showing the inside of an archive (read-only).
+    archive: bool,
 }
 
 /// What happens after a folder has been read.
@@ -491,6 +546,23 @@ struct Loading {
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<Entry>>>,
     since: std::time::Instant,
     after: After,
+}
+
+/// File operations run one after another in the background.
+#[derive(Default)]
+struct Jobs {
+    running: Option<(OpKind, Job, String)>,
+    queue: std::collections::VecDeque<(OpKind, Vec<PathBuf>, Option<PathBuf>, String)>,
+    /// Notes collected from finished jobs, shown once the queue is empty.
+    problems: Vec<String>,
+    /// Jobs started since the queue was last empty, for "2 of 3".
+    started: usize,
+}
+
+impl Jobs {
+    fn busy(&self) -> bool {
+        self.running.is_some() || !self.queue.is_empty()
+    }
 }
 
 /// How long to wait synchronously for a read; local folders are almost always
@@ -516,6 +588,7 @@ impl Pane {
             scroll_target: None,
             id: Id::new(id),
             network: false,
+            archive: false,
         };
         p.network = guppy_core::platform::is_network(&path);
         p.path = path;
@@ -525,6 +598,7 @@ impl Pane {
     /// Shows a freshly read folder.
     fn enter(&mut self, path: PathBuf, entries: Vec<Entry>) {
         self.network = guppy_core::platform::is_network(&path);
+        self.archive = !path.is_dir();
         self.entries = entries;
         self.path = path;
         self.cursor = 0;
@@ -577,6 +651,11 @@ struct Guppy {
     /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
     config: Config,
+    jobs: Jobs,
+    /// Last pattern used with `+` / `-`.
+    last_pattern: String,
+    /// Window close was requested while jobs run; the next request quits.
+    close_armed: bool,
 }
 
 fn sort_from(s: SortBy) -> Sort {
@@ -615,6 +694,9 @@ impl Guppy {
             last_move: None,
             loads: [None, None],
             config,
+            jobs: Jobs::default(),
+            last_pattern: "*".into(),
+            close_armed: false,
         };
         let sort = sort_from(g.config.view.sort);
         g.panes.iter_mut().for_each(|p| p.sort = sort);
@@ -701,7 +783,7 @@ impl Guppy {
             keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
         }
         // Only while sizes are computed; no idle ticking otherwise.
-        let running = matches!(self.dialog, Some(Dialog::Running { .. }));
+        let running = self.jobs.busy() || !self.jobs.problems.is_empty();
         let loading = self.loads.iter().any(Option::is_some);
         if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
@@ -725,6 +807,9 @@ impl Guppy {
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
+        if matches!(msg, Message::Tick) {
+            self.poll_jobs();
+        }
         match msg {
             // On the file list (empty search): files to / from the clipboard.
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
@@ -735,6 +820,9 @@ impl Guppy {
             {
                 if clip_key(&key, modifiers) == Some('v') {
                     return Task::perform(smol::unblock(clip::get), Message::FilesPasted);
+                }
+                if self.read_only() {
+                    return Task::none();
                 }
                 let paths = self.selection();
                 if !paths.is_empty()
@@ -747,7 +835,8 @@ impl Guppy {
             Message::FilesPasted(None) => {}
             Message::FilesPasted(Some((sources, cut))) => {
                 let target = self.panes[self.active].path.clone();
-                if sources.iter().all(|s| s.parent() == Some(target.as_path())) {
+                if self.read_only() {
+                } else if sources.iter().all(|s| s.parent() == Some(target.as_path())) {
                     self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["The files are already in this folder.".into()] });
                 } else {
                     self.ask_with(if cut { OpKind::Move } else { OpKind::Copy }, sources, Some(target));
@@ -823,10 +912,6 @@ impl Guppy {
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                 return self.on_key(key, modifiers, text.as_deref());
             }
-            Message::Tick if matches!(self.dialog, Some(Dialog::Running { .. })) => {
-                self.poll_job();
-                return Task::none();
-            }
             Message::Tick if self.jump_pending => {
                 // Subfolder index is growing: refresh hits, keep selection.
                 // One last time after indexing ends.
@@ -863,7 +948,7 @@ impl Guppy {
                 self.rename = None;
                 self.active = side;
                 self.panes[side].cursor = i;
-                self.open_current();
+                return self.open_current();
             }
             Message::JumpTo(i) => {
                 self.jump_cur = i;
@@ -871,6 +956,12 @@ impl Guppy {
             }
             Message::Frame(now) => return self.animate_scroll(now),
             Message::CloseRequested(id) => {
+                // Running jobs: the first request shows them, the second quits.
+                if self.jobs.busy() && !self.close_armed {
+                    self.close_armed = true;
+                    self.dialog = Some(Dialog::Jobs);
+                    return Task::none();
+                }
                 let _ = self.sizes.save();
                 return iced::window::close(id);
             }
@@ -899,7 +990,7 @@ impl Guppy {
             Message::ToggleMark => self.toggle_mark(),
             Message::SwitchSide => self.active = 1 - self.active,
             Message::Op(kind) => self.ask(kind),
-            Message::NewDir => self.dialog = Some(Dialog::NewDir { name: String::new(), error: None }),
+            Message::NewDir => self.new_dir(),
             Message::DialogConfirm => self.confirm_dialog(),
             Message::DialogCancel => self.cancel_dialog(),
             Message::OpenSettings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
@@ -955,6 +1046,32 @@ impl Guppy {
                     }
                 }
             }
+            Message::Resolve(r) => {
+                if let Some(Dialog::Conflict { all, .. }) = self.dialog.take()
+                    && let Some((_, job, _)) = &self.jobs.running
+                {
+                    job.answer(r, all);
+                }
+            }
+            Message::ToggleAll => {
+                if let Some(Dialog::Conflict { all, .. }) = &mut self.dialog {
+                    *all = !*all;
+                }
+            }
+            Message::OpenJobs => self.dialog = Some(Dialog::Jobs),
+            Message::CancelJobs(everything) => {
+                if everything {
+                    self.jobs.queue.clear();
+                }
+                if let Some((_, job, _)) = &self.jobs.running {
+                    job.cancel();
+                }
+                if matches!(self.dialog, Some(Dialog::Conflict { .. })) {
+                    self.dialog = None;
+                }
+            }
+            Message::Opened(Ok(())) => {}
+            Message::Opened(Err(e)) => self.dialog = Some(Dialog::Report { title: "Not opened", problems: vec![e] }),
             Message::ToggleStartHelp => {
                 let mut new = self.config.clone();
                 new.start.help = !new.start.help;
@@ -1001,14 +1118,18 @@ impl Guppy {
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
             Key::Named(Named::F1) => self.dialog = Some(Dialog::Help { startup: false }),
-            Key::Named(Named::F2) => self.start_rename(),
+            Key::Named(Named::F2) => {
+                if !self.read_only() {
+                    self.start_rename();
+                }
+            }
             Key::Named(Named::F3) => return self.open_view(),
             Key::Named(Named::F4) if m.shift() => self.edit_external(),
             Key::Named(Named::F4) => return self.edit_current(),
             Key::Named(Named::F12) => return self.update(Message::OpenSettings),
             Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
-            Key::Named(Named::Enter) => self.open_current(),
+            Key::Named(Named::Enter) => return self.open_current(),
             Key::Named(Named::Backspace) if !query_empty => {
                 let mut q = self.panes[self.active].query.clone();
                 q.pop();
@@ -1025,7 +1146,7 @@ impl Guppy {
             Key::Named(Named::ArrowRight) if m.alt() => self.history(false),
             Key::Named(Named::F5) => self.ask(OpKind::Copy),
             Key::Named(Named::F6) => self.ask(OpKind::Move),
-            Key::Named(Named::F7) => self.dialog = Some(Dialog::NewDir { name: String::new(), error: None }),
+            Key::Named(Named::F7) => self.new_dir(),
             Key::Named(Named::F8 | Named::Delete) if m.shift() => self.ask(OpKind::Delete),
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
             Key::Character("g") if m.control() => self.set_query("~".into()),
@@ -1035,6 +1156,12 @@ impl Guppy {
                 p.sort = p.sort.next();
             }
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
+            Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
+            // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
+            _ if query_empty && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
+                self.dialog = Some(Dialog::Mark { add: typed == Some("+"), pattern: self.last_pattern.clone() });
+            }
+            _ if query_empty && !m.control() && !m.alt() && typed == Some("*") => self.invert_marks(),
             Key::Character("r") if m.control() => {
                 let path = self.panes[self.active].path.clone();
                 self.sizes.invalidate(&path);
@@ -1165,6 +1292,15 @@ impl Guppy {
         if sources.is_empty() {
             return;
         }
+        // Archives are read-only: copying out of one extracts, nothing goes in.
+        if self.panes[self.active].archive && kind != OpKind::Copy {
+            self.read_only();
+            return;
+        }
+        if self.panes[1 - self.active].archive && matches!(kind, OpKind::Copy | OpKind::Move) {
+            self.dialog = Some(Dialog::Report { title: "Archive is read-only", problems: vec!["Files can't be copied or moved into an archive.".into()] });
+            return;
+        }
         let target = matches!(kind, OpKind::Copy | OpKind::Move).then(|| self.panes[1 - self.active].path.clone());
         if target.as_deref() == Some(self.panes[self.active].path.as_path()) {
             self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Source and target are the same folder.".into()] });
@@ -1190,8 +1326,16 @@ impl Guppy {
 
     fn confirm_dialog(&mut self) {
         match self.dialog.take() {
-            Some(Dialog::Confirm { kind, sources, target }) => {
-                self.dialog = Some(Dialog::Running { kind, job: ops::start(kind, sources, target) });
+            Some(Dialog::Confirm { kind, sources, target }) => self.enqueue(kind, sources, target),
+            Some(Dialog::Mark { add, pattern }) => {
+                self.mark_pattern(add, &pattern);
+                self.last_pattern = pattern;
+            }
+            // Enter on a conflict: the safe answer.
+            Some(Dialog::Conflict { all, .. }) => {
+                if let Some((_, job, _)) = &self.jobs.running {
+                    job.answer(Resolve::Skip, all);
+                }
             }
             Some(Dialog::NewDir { name, .. }) => match ops::make_dir(&self.panes[self.active].path, name.trim()) {
                 Ok(created) => {
@@ -1203,17 +1347,18 @@ impl Guppy {
                 }
                 Err(e) => self.dialog = Some(Dialog::NewDir { name, error: Some(e.to_string()) }),
             },
-            Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
-            Some(Dialog::Report { .. } | Dialog::Help { .. }) | None => {}
+            Some(Dialog::Report { .. } | Dialog::Help { .. } | Dialog::Jobs) | None => {}
         }
     }
 
     fn cancel_dialog(&mut self) {
         match &self.dialog {
-            // Cancel the running operation; the dialog closes once it stops.
-            Some(Dialog::Running { job, .. }) => job.cancel(),
+            // Esc on a conflict stops the whole job.
+            Some(Dialog::Conflict { .. }) => {
+                let _ = self.update(Message::CancelJobs(false));
+            }
             _ => self.dialog = None,
         }
     }
@@ -1227,19 +1372,38 @@ impl Guppy {
             Key::Named(Named::Enter) => self.confirm_dialog(),
             Key::Named(Named::Escape) => self.cancel_dialog(),
             Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help { .. })) => self.dialog = None,
+            Key::Named(Named::Delete) if matches!(self.dialog, Some(Dialog::Jobs)) => {
+                let _ = self.update(Message::CancelJobs(false));
+            }
+            Key::Character("j") if matches!(self.dialog, Some(Dialog::Jobs)) => self.dialog = None,
+            Key::Character(c) if matches!(self.dialog, Some(Dialog::Conflict { .. })) => {
+                let msg = match c {
+                    "o" => Message::Resolve(Resolve::Overwrite),
+                    "s" => Message::Resolve(Resolve::Skip),
+                    "k" => Message::Resolve(Resolve::KeepBoth),
+                    "a" => Message::ToggleAll,
+                    _ => return,
+                };
+                let _ = self.update(msg);
+            }
             Key::Named(Named::Space) if matches!(self.dialog, Some(Dialog::Help { startup: true })) => {
                 let _ = self.update(Message::ToggleStartHelp);
             }
             _ => {
-                if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
-                    match (key.as_ref(), typed) {
-                        (Key::Named(Named::Backspace), _) => {
-                            name.pop();
-                        }
-                        (_, Some(t)) if t.chars().all(|c| !c.is_control()) => name.push_str(t),
-                        _ => return,
+                let (name, error) = match &mut self.dialog {
+                    Some(Dialog::NewDir { name, error }) => (name, Some(error)),
+                    Some(Dialog::Mark { pattern, .. }) => (pattern, None),
+                    _ => return,
+                };
+                match (key.as_ref(), typed) {
+                    (Key::Named(Named::Backspace), _) => {
+                        name.pop();
                     }
-                    *error = None;
+                    (_, Some(t)) if t.chars().all(|c| !c.is_control()) => name.push_str(t),
+                    _ => return,
+                }
+                if let Some(e) = error {
+                    *e = None;
                 }
             }
         }
@@ -1262,7 +1426,7 @@ impl Guppy {
         }
         match &mut self.dialog {
             None => Some(&mut self.panes[self.active].query),
-            Some(Dialog::NewDir { name, .. }) => Some(name),
+            Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. }) => Some(name),
             Some(Dialog::Settings { edit: Some(text), .. }) => Some(text),
             _ => None,
         }
@@ -1332,6 +1496,9 @@ impl Guppy {
 
     /// Opens the built-in editor for the file under the cursor.
     fn edit_current(&mut self) -> Task<Message> {
+        if self.read_only() {
+            return Task::none();
+        }
         let Some(e) = self.current() else { return Task::none() };
         if e.is_dir() {
             return Task::none();
@@ -1349,6 +1516,9 @@ impl Guppy {
 
     /// Shift+F4: the configured external editor.
     fn edit_external(&mut self) {
+        if self.read_only() {
+            return;
+        }
         let Some(e) = self.current() else { return };
         if e.is_dir() {
             return;
@@ -1400,17 +1570,118 @@ impl Guppy {
         Task::none()
     }
 
-    fn poll_job(&mut self) {
-        let Some(Dialog::Running { job, .. }) = &self.dialog else { return };
-        let progress = job.progress();
-        if !progress.finished {
+    /// Queues an operation; it starts right away if nothing else runs.
+    fn enqueue(&mut self, kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) {
+        let what = if sources.len() == 1 {
+            sources[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            format!("{} items", sources.len())
+        };
+        let label = match &target {
+            Some(t) => format!("{} {what} to {}", capitalize(op_verb(kind)), self.jumper.display(t)),
+            None => format!("{} {what}", capitalize(op_verb(kind))),
+        };
+        self.jobs.queue.push_back((kind, sources, target, label));
+        self.start_next_job();
+    }
+
+    fn start_next_job(&mut self) {
+        if self.jobs.running.is_some() {
             return;
         }
-        self.dialog = (!progress.problems.is_empty()).then_some(Dialog::Report { title: "Done, with notes", problems: progress.problems });
-        for side in 0..2 {
-            let path = self.panes[side].path.clone();
-            self.sizes.invalidate(&path);
-            self.reload(side);
+        if let Some((kind, sources, target, label)) = self.jobs.queue.pop_front() {
+            self.jobs.started += 1;
+            self.jobs.running = Some((kind, ops::start(kind, sources, target), label));
+        }
+    }
+
+    /// On every tick: shows conflicts, collects finished jobs, starts the next one.
+    fn poll_jobs(&mut self) {
+        if let Some((_, job, _)) = &self.jobs.running {
+            let progress = job.progress();
+            match job.conflict() {
+                Some(c) if self.dialog.is_none() || matches!(self.dialog, Some(Dialog::Jobs)) => {
+                    self.dialog = Some(Dialog::Conflict { conflict: c, all: false });
+                }
+                None if matches!(self.dialog, Some(Dialog::Conflict { .. })) => self.dialog = None,
+                _ => {}
+            }
+            if progress.finished {
+                self.jobs.running = None;
+                self.jobs.problems.extend(progress.problems);
+                for side in 0..2 {
+                    let path = self.panes[side].path.clone();
+                    self.sizes.invalidate(&path);
+                    self.reload(side);
+                }
+                self.start_next_job();
+            }
+        }
+        if !self.jobs.busy() {
+            self.jobs.started = 0;
+            self.close_armed = false;
+            if matches!(self.dialog, Some(Dialog::Jobs)) {
+                self.dialog = None;
+            }
+            if !self.jobs.problems.is_empty() && self.dialog.is_none() {
+                self.dialog = Some(Dialog::Report { title: "Done, with notes", problems: std::mem::take(&mut self.jobs.problems) });
+            }
+        }
+    }
+
+    /// Inside an archive nothing can change; says so and returns true.
+    fn read_only(&mut self) -> bool {
+        if !self.panes[self.active].archive {
+            return false;
+        }
+        self.dialog = Some(Dialog::Report {
+            title: "Archive is read-only",
+            problems: vec!["Copy (F5) extracts files to the other pane; Enter opens a file.".into()],
+        });
+        true
+    }
+
+    fn new_dir(&mut self) {
+        if !self.read_only() {
+            self.dialog = Some(Dialog::NewDir { name: String::new(), error: None });
+        }
+    }
+
+    /// `+` / `-`: marks or unmarks visible files matching any of the patterns
+    /// (separated by spaces, commas or semicolons); a pattern ending in `/` matches folders.
+    fn mark_pattern(&mut self, add: bool, pattern: &str) {
+        let pats: Vec<&str> = pattern.split([' ', ',', ';']).filter(|s| !s.is_empty()).collect();
+        let p = &self.panes[self.active];
+        let hits: Vec<PathBuf> = p
+            .visible(self.show_hidden, &self.sizes)
+            .iter()
+            .filter(|e| {
+                pats.iter().any(|pat| match pat.strip_suffix('/') {
+                    Some(dir) => e.is_dir() && glob_match(dir, &e.name),
+                    None => !e.is_dir() && glob_match(pat, &e.name),
+                })
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        let p = &mut self.panes[self.active];
+        for h in hits {
+            if add {
+                p.marked.insert(h);
+            } else {
+                p.marked.remove(&h);
+            }
+        }
+    }
+
+    /// `*`: inverts the marks of the visible files.
+    fn invert_marks(&mut self) {
+        let p = &self.panes[self.active];
+        let files: Vec<PathBuf> = p.visible(self.show_hidden, &self.sizes).iter().filter(|e| !e.is_dir()).map(|e| e.path.clone()).collect();
+        let p = &mut self.panes[self.active];
+        for f in files {
+            if !p.marked.remove(&f) {
+                p.marked.insert(f);
+            }
         }
     }
 
@@ -1454,7 +1725,7 @@ impl Guppy {
         let (tx, rx) = std::sync::mpsc::channel();
         let p = path.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(guppy_core::read_dir(&p));
+            let _ = tx.send(guppy_core::archive::read_path(&p));
         });
         match rx.recv_timeout(LOAD_WAIT) {
             Ok(res) => {
@@ -1500,7 +1771,7 @@ impl Guppy {
             let len = visible.len();
             p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
             // Let running computations continue, request only what's missing.
-            if !self.config.view.dir_sizes {
+            if !self.config.view.dir_sizes || self.panes[side].archive {
                 return;
             }
             let p = &self.panes[side];
@@ -1525,7 +1796,7 @@ impl Guppy {
             let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == *came_from);
             self.panes[side].cursor = pos.unwrap_or(0);
         }
-        if matches!(after, After::Nav | After::Parent(_)) {
+        if matches!(after, After::Nav | After::Parent(_)) && !self.panes[side].archive {
             self.jumper.visit(&path);
         }
         self.request_sizes(side);
@@ -1574,7 +1845,7 @@ impl Guppy {
         let p = &mut self.panes[side];
         p.sizing.cancel();
         p.sizing = Cancel::default();
-        if !self.config.view.dir_sizes {
+        if !self.config.view.dir_sizes || p.archive {
             return;
         }
         let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
@@ -1602,14 +1873,19 @@ impl Guppy {
         self.load(self.active, parent, After::Parent(came_from));
     }
 
-    fn open_current(&mut self) {
-        let Some(e) = self.current() else { return };
-        if e.is_dir() {
-            let path = e.path.clone();
+    /// Enter: folders and archives are entered, files open in their application;
+    /// a file inside an archive is extracted to a temporary folder first.
+    fn open_current(&mut self) -> Task<Message> {
+        let Some(e) = self.current() else { return Task::none() };
+        let path = e.path.clone();
+        if e.is_dir() || (!e.in_archive && guppy_core::archive::is_archive_name(&e.name)) {
             self.navigate(path);
+        } else if e.in_archive {
+            return Task::perform(smol::unblock(move || open_from_archive(&path)), Message::Opened);
         } else {
-            let _ = guppy_core::platform::open(&e.path);
+            let _ = guppy_core::platform::open(&path);
         }
+        Task::none()
     }
 
     fn toggle_mark(&mut self) {
@@ -1725,6 +2001,13 @@ impl Guppy {
         let buttons = |ok: &'static str| {
             row![iced::widget::Space::new().width(Length::Fill), btn("Cancel", Message::DialogCancel, false), btn(ok, Message::DialogConfirm, true)]
                 .spacing(8)
+        };
+        let progress_bar = |frac: f32| {
+            iced::widget::progress_bar(0.0..=1.0, frac).girth(6).style(move |_| iced::widget::progress_bar::Style {
+                background: Color { a: 0.25, ..Color::BLACK }.into(),
+                bar: rgb(t.accent).into(),
+                border: Border::default().rounded(3),
+            })
         };
         let names = |paths: &[PathBuf]| {
             let mut lines: Vec<String> = paths.iter().take(6).map(|p| {
@@ -1872,28 +2155,92 @@ impl Guppy {
                 }
                 c.push(buttons("Create")).into()
             }
-            Dialog::Running { kind, job } => {
-                let p = job.progress();
-                let frac = if p.total == 0 { 0.0 } else { p.done as f32 / p.total as f32 };
-                let amount = if matches!(kind, OpKind::Copy | OpKind::Move) {
-                    format!("{} of {}", human_size(p.done), human_size(p.total))
-                } else {
-                    format!("{} of {}", p.done, p.total)
+            Dialog::Jobs => {
+                let mut c = column![title("Jobs".into())].spacing(14);
+                match &self.jobs.running {
+                    Some((kind, job, label)) => {
+                        let p = job.progress();
+                        let frac = if p.total == 0 { 0.0 } else { p.done as f32 / p.total as f32 };
+                        let amount = if matches!(kind, OpKind::Copy | OpKind::Move) {
+                            format!("{} of {}", human_size(p.done), human_size(p.total))
+                        } else {
+                            format!("{} of {}", p.done, p.total)
+                        };
+                        c = c.push(text(label.clone()).size(13).color(rgb(t.bright)));
+                        c = c.push(progress_bar(frac));
+                        c = c.push(row![small(p.current), iced::widget::Space::new().width(Length::Fill), small(amount)]);
+                    }
+                    None => c = c.push(small("Nothing running.".into())),
+                }
+                if !self.jobs.queue.is_empty() {
+                    let waiting: Vec<String> = self.jobs.queue.iter().map(|(.., label)| format!("· {label}")).collect();
+                    c = c.push(column![text("WAITING").size(11).font(BOLD).color(rgb(t.accent)), small(waiting.join("\n"))].spacing(6));
+                }
+                if self.close_armed {
+                    c = c.push(text("Jobs are still running. Close the window again to quit and cancel them.").size(12).color(rgb(t.red)));
+                }
+                let mut buttons = row![small("Del cancels · Esc closes".into()), iced::widget::Space::new().width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
+                if !self.jobs.queue.is_empty() {
+                    buttons = buttons.push(btn("Cancel all", Message::CancelJobs(true), false));
+                }
+                if self.jobs.running.is_some() {
+                    buttons = buttons.push(btn("Cancel job", Message::CancelJobs(false), false));
+                }
+                c.push(buttons.push(btn("Close", Message::DialogCancel, true))).into()
+            }
+            Dialog::Conflict { conflict, all } => {
+                let describe = |p: &Path| match std::fs::symlink_metadata(p) {
+                    Ok(m) if m.is_dir() => "folder".to_string(),
+                    Ok(m) => format!("{} · {}", human_size(m.len()), m.modified().ok().map(human_date).unwrap_or_default()),
+                    Err(_) => String::new(),
                 };
+                let name = conflict.dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let dir = conflict.dst.parent().map(|d| self.jumper.display(d)).unwrap_or_default();
+                let line = |label: &'static str, what: String| row![text(label).size(12).color(fg).width(80), text(what).size(12).color(rgb(t.bright))];
+                let on = *all;
+                let tick = container(text(if on { "✓" } else { "" }).size(11).color(rgb(t.background)))
+                    .center_x(15)
+                    .center_y(15)
+                    .style(move |_| container::Style {
+                        background: on.then(|| rgb(t.accent).into()),
+                        border: Border { color: rgb(t.accent), width: 1.0, radius: 3.0.into() },
+                        ..Default::default()
+                    });
+                let toggle = mouse_area(row![tick, small("Same answer for the rest · A".into())].spacing(8).align_y(iced::Alignment::Center))
+                    .on_press(Message::ToggleAll)
+                    .interaction(iced::mouse::Interaction::Pointer);
                 column![
-                    title(format!("{} …", match kind {
-                        OpKind::Copy => "Copying",
-                        OpKind::Move => "Moving",
-                        OpKind::Trash => "Moving to trash",
-                        OpKind::Delete => "Deleting",
-                    })),
-                    iced::widget::progress_bar(0.0..=1.0, frac).girth(6).style(move |_| iced::widget::progress_bar::Style {
-                        background: Color { a: 0.25, ..Color::BLACK }.into(),
-                        bar: rgb(t.accent).into(),
-                        border: Border::default().rounded(3),
-                    }),
-                    row![small(p.current), iced::widget::Space::new().width(Length::Fill), small(amount)],
-                    row![iced::widget::Space::new().width(Length::Fill), btn("Cancel", Message::DialogCancel, false)],
+                    title(format!("“{name}” already exists")),
+                    small(format!("in {dir}")),
+                    column![line("New", describe(&conflict.src)), line("Existing", describe(&conflict.dst))].spacing(4),
+                    toggle,
+                    row![
+                        small("Esc cancels the job".into()),
+                        iced::widget::Space::new().width(Length::Fill),
+                        btn("Overwrite · O", Message::Resolve(Resolve::Overwrite), false),
+                        btn("Keep both · K", Message::Resolve(Resolve::KeepBoth), false),
+                        btn("Skip · S", Message::Resolve(Resolve::Skip), true),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .spacing(14)
+                .into()
+            }
+            Dialog::Mark { add, pattern } => {
+                let field = container(text(format!("{pattern}▏")).size(13).color(rgb(t.bright)))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                column![
+                    title(if *add { "Mark files" } else { "Unmark files" }.into()),
+                    small("Wildcards * and ?, several patterns separated by spaces. End a pattern with / for folders.".into()),
+                    field,
+                    buttons(if *add { "Mark" } else { "Unmark" }),
                 ]
                 .spacing(14)
                 .into()
@@ -2023,7 +2370,7 @@ impl Guppy {
             .width(match dialog {
                 Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
                 Dialog::Help { .. } => Length::Fixed(760.0),
-                Dialog::Settings { .. } => Length::Fixed(560.0),
+                Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
             })
             .height(if viewer { Length::Fill } else { Length::Shrink })
@@ -2153,7 +2500,7 @@ impl Guppy {
             let dot = if marked { "●" } else { " " };
             let dot_color = if on_cursor { fg } else if marked { rgb(t.marked) } else { self.class_color(e.class()) };
             let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
-            let (size, pending) = match (e.is_dir(), self.sizes.get(&e.path)) {
+            let (size, pending) = match (e.is_dir() && !e.in_archive, self.sizes.get(&e.path)) {
                 (false, _) => (human_size(e.size), false),
                 (true, Some(DirSize::Done(n))) => (human_size(n), false),
                 // From the last run's cache, currently being verified.
@@ -2289,7 +2636,7 @@ impl Guppy {
                 )
                 .width(Length::Fill)
                 .clip(true),
-                text(if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
+                text(if p.archive { "ARCHIVE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]
             .spacing(10),
@@ -2400,7 +2747,7 @@ impl Guppy {
         let count = visible.len();
         let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
         // Total of visible entries, once all folder sizes are known.
-        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir(), self.sizes.get(&e.path)) {
+        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir() && !e.in_archive, self.sizes.get(&e.path)) {
             (false, _) => Some(acc + e.size),
             (true, Some(DirSize::Done(n))) => Some(acc + n),
             _ => None,
@@ -2436,8 +2783,30 @@ impl Guppy {
                 ..Default::default()
             });
 
+        // Running jobs: a small clickable progress readout.
+        let jobs: Element<'_, Message> = match &self.jobs.running {
+            Some((kind, job, _)) => {
+                let p = job.progress();
+                let pct = (p.done * 100).checked_div(p.total).unwrap_or(0).min(100);
+                let verb = match kind {
+                    OpKind::Copy => "Copying",
+                    OpKind::Move => "Moving",
+                    OpKind::Trash => "Trashing",
+                    OpKind::Delete => "Deleting",
+                };
+                let count = self.jobs.started + self.jobs.queue.len();
+                let of = if count > 1 { format!(" · {} of {count}", self.jobs.started) } else { String::new() };
+                let waiting = if job.conflict().is_some() { " · waiting for you" } else { "" };
+                mouse_area(text(format!("{verb} {pct}%{of}{waiting}")).size(12).color(rgb(t.accent)).wrapping(iced::widget::text::Wrapping::None))
+                    .on_press(Message::OpenJobs)
+                    .interaction(iced::mouse::Interaction::Pointer)
+                    .into()
+            }
+            None => iced::widget::Space::new().width(0).into(),
+        };
         let bar = row![
             search,
+            jobs,
             iced::widget::Space::new().width(Length::Fill),
             text(cur).size(12).color(rgb(t.foreground)).wrapping(iced::widget::text::Wrapping::None),
             bar_sep(),
