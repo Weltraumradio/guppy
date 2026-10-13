@@ -2052,6 +2052,7 @@ impl Guppy {
 
     /// On every tick: shows conflicts, collects finished jobs, starts the next one.
     fn poll_jobs(&mut self) {
+        let was_busy = self.jobs.busy();
         if let Some((_, job, _)) = &self.jobs.running {
             let progress = job.progress();
             match job.conflict() {
@@ -2081,7 +2082,8 @@ impl Guppy {
         if !self.jobs.busy() {
             self.jobs.started = 0;
             self.close_armed = false;
-            if matches!(self.dialog, Some(Dialog::Jobs)) {
+            // Closes once the last job is done; opened while idle it stays.
+            if was_busy && matches!(self.dialog, Some(Dialog::Jobs)) {
                 self.dialog = None;
             }
             if !self.jobs.problems.is_empty() && self.dialog.is_none() {
@@ -2971,7 +2973,8 @@ impl Guppy {
                 if self.close_armed {
                     c = c.push(text("Jobs are still running. Close the window again to quit and cancel them.").size(12).color(rgb(t.red)));
                 }
-                let mut buttons = row![small("P pauses · Del cancels · Esc closes".into()), iced::widget::Space::new().width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
+                c = c.push(text("P pauses · Del cancels · Esc closes").size(11).color(rgb(t.muted)));
+                let mut buttons = row![iced::widget::Space::new().width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
                 if !self.jobs.queue.is_empty() {
                     buttons = buttons.push(btn("Cancel all", Message::CancelJobs(true), false));
                 }
