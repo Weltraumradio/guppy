@@ -124,6 +124,8 @@ impl Rename {
 enum ViewBody {
     Loading,
     Text { text: String, truncated: bool },
+    /// Binary file as a hex dump.
+    Hex { text: String, truncated: bool },
     Image,
     Svg,
     /// Folder: its entries, one per line.
@@ -134,6 +136,8 @@ enum ViewBody {
 
 /// The viewer shows at most this much of a text file.
 const VIEW_MAX: usize = 512 * 1024;
+/// Binary files: dumped up to this size (16 bytes per line).
+const HEX_MAX: usize = 64 * 1024;
 
 fn view_id() -> Id {
     Id::new("viewer")
@@ -167,7 +171,8 @@ fn load_view(path: &Path) -> ViewBody {
     }
     // NUL bytes in the first few KB: treat as binary.
     if buf.iter().take(8192).any(|&b| b == 0) {
-        return ViewBody::Other(format!("Binary file · {}", human_size(meta.len())));
+        buf.truncate(HEX_MAX);
+        return ViewBody::Hex { text: hex_dump(&buf), truncated: meta.len() as usize > HEX_MAX };
     }
     let text = match String::from_utf8(buf) {
         Ok(s) => s,
@@ -175,6 +180,28 @@ fn load_view(path: &Path) -> ViewBody {
         Err(e) => String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to().max(e.as_bytes().len().saturating_sub(4))]).into_owned(),
     };
     ViewBody::Text { text: text.replace('\t', "    "), truncated: meta.len() as usize > VIEW_MAX }
+}
+
+/// Offset, 16 bytes in hex (split in two groups), then printable ASCII.
+fn hex_dump(buf: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(buf.len() / 16 * 80 + 80);
+    for (n, chunk) in buf.chunks(16).enumerate() {
+        let _ = write!(out, "{:08x}  ", n * 16);
+        for i in 0..16 {
+            match chunk.get(i) {
+                Some(b) => { let _ = write!(out, "{b:02x} "); }
+                None => out.push_str("   "),
+            }
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+        out.push(' ');
+        out.extend(chunk.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '·' }));
+        out.push('\n');
+    }
+    out
 }
 
 /// Rows of the settings overlay, in display order: (section, label).
@@ -1448,6 +1475,13 @@ impl Guppy {
                         let mut c = column![mono(s.clone())];
                         if *truncated {
                             c = c.push(small(format!("… only the first {} are shown", human_size(VIEW_MAX as u64))));
+                        }
+                        c.into()
+                    }
+                    ViewBody::Hex { text: s, truncated } => {
+                        let mut c = column![mono(s.clone())];
+                        if *truncated {
+                            c = c.push(small(format!("… only the first {} are shown", human_size(HEX_MAX as u64))));
                         }
                         c.into()
                     }
