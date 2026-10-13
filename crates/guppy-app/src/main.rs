@@ -100,6 +100,8 @@ enum Message {
     Resized(iced::Size),
     /// Files in an open folder or the theme changed.
     FsChanged(Vec<PathBuf>),
+    /// Git status read for a pane's folder.
+    Git(usize, PathBuf, Option<std::sync::Arc<guppy_core::git::Status>>),
     CloseRequested(iced::window::Id),
     Back,
     Forward,
@@ -737,6 +739,9 @@ struct Guppy {
     last_move: Option<std::time::Instant>,
     /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
+    /// Git status per pane, and whether it must be read again.
+    git: [Option<std::sync::Arc<guppy_core::git::Status>>; 2],
+    git_stale: [bool; 2],
     config: Config,
     jobs: Jobs,
     /// Quick view on: the other pane shows the entry under the cursor.
@@ -788,6 +793,8 @@ impl Guppy {
             width: 1200.0,
             last_move: None,
             loads: [None, None],
+            git: [None, None],
+            git_stale: [true, true],
             config,
             jobs: Jobs::default(),
             quick: false,
@@ -921,7 +928,7 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         let task = self.handle(msg);
-        Task::batch([task, self.sync_quick()])
+        Task::batch([task, self.sync_quick(), self.sync_git()])
     }
 
     /// Follows the cursor: after a short rest, loads the entry for the quick view.
@@ -937,6 +944,27 @@ impl Guppy {
         self.quick_gen += 1;
         let generation = self.quick_gen;
         Task::perform(smol::Timer::after(Duration::from_millis(90)), move |_| Message::QuickDue(generation))
+    }
+
+    /// Reads the git status of folders that changed, off the UI thread.
+    fn sync_git(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for side in 0..2 {
+            if !std::mem::take(&mut self.git_stale[side]) {
+                continue;
+            }
+            let p = &self.panes[side];
+            if p.archive || p.network {
+                self.git[side] = None;
+                continue;
+            }
+            let path = p.path.clone();
+            let dir = path.clone();
+            tasks.push(Task::perform(smol::unblock(move || guppy_core::git::status(&dir).map(std::sync::Arc::new)), move |st| {
+                Message::Git(side, path.clone(), st)
+            }));
+        }
+        Task::batch(tasks)
     }
 
     fn handle(&mut self, msg: Message) -> Task<Message> {
@@ -1106,6 +1134,11 @@ impl Guppy {
                 }
                 let _ = self.sizes.save();
                 return iced::window::close(id);
+            }
+            Message::Git(side, path, st) => {
+                if self.panes[side].path == path {
+                    self.git[side] = st;
+                }
             }
             Message::FsChanged(paths) => {
                 self.on_fs_changed(&paths);
@@ -2276,7 +2309,10 @@ impl Guppy {
 
     fn finish_load(&mut self, side: usize, path: PathBuf, res: std::io::Result<Vec<Entry>>, after: After) {
         let entries = match res {
-            Ok(entries) => entries,
+            Ok(entries) => {
+                self.git_stale[side] = true;
+                entries
+            }
             Err(e) => {
                 // Unreadable (permissions, NAS gone): view stays as it was.
                 if !matches!(after, After::Reload | After::Start) {
@@ -2309,6 +2345,9 @@ impl Guppy {
         }
         let p = &mut self.panes[side];
         let old = std::mem::take(&mut p.path);
+        if old != path {
+            self.git[side] = None;
+        }
         p.enter(path.clone(), entries);
         let changed = old != path && !old.as_os_str().is_empty();
         match &after {
@@ -3347,17 +3386,34 @@ impl Guppy {
                 Some(err) => (err, rgb(t.red)),
                 None => (size, if on_cursor { fg } else if pending { rgb(t.light_foreground) } else { rgb(t.foreground) }),
             };
+            let git = self.git[side].as_ref().and_then(|g| g.mark(&e.name)).map(|m| {
+                use guppy_core::git::Mark;
+                let color = match m {
+                    _ if on_cursor => fg,
+                    Mark::Conflict => rgb(t.red),
+                    Mark::Modified => rgb(t.code),
+                    Mark::Added | Mark::Untracked => rgb(t.marked),
+                    Mark::Inside => rgb(t.accent),
+                    Mark::Ignored => rgb(t.light_foreground),
+                };
+                text(m.symbol()).color(color).size(11).font(BOLD).width(12).align_x(iced::alignment::Horizontal::Center)
+            });
             let mut line = row![
                 text(dot).color(dot_color).size(12).width(14),
                 container(name)
                 .width(Length::Fill)
                 .clip(true),
+            ];
+            if let Some(g) = git {
+                line = line.push(g);
+            }
+            let mut line = line.push(
                 text(size)
                     .color(size_color)
                     .size(12)
                     .width(if editing.is_some_and(|r| r.error.is_some()) { Length::Shrink } else { Length::Fixed(84.0) })
                     .align_x(iced::alignment::Horizontal::Right),
-            ]
+            )
             .spacing(8)
             .align_y(iced::Alignment::Center);
             if let Some(bar) = share {
@@ -3414,6 +3470,19 @@ impl Guppy {
                 )
                 .width(Length::Fill)
                 .clip(true),
+                text(self.git[side].as_ref().map(|g| {
+                    let mut s = format!("⎇ {}", g.branch);
+                    if g.dirty {
+                        s.push('*');
+                    }
+                    if g.ahead > 0 {
+                        s += &format!(" ↑{}", g.ahead);
+                    }
+                    if g.behind > 0 {
+                        s += &format!(" ↓{}", g.behind);
+                    }
+                    s
+                }).unwrap_or_default()).size(11).font(BOLD).color(rgb(t.accent)),
                 text(if p.archive { "ARCHIVE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]

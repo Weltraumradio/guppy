@@ -7,6 +7,7 @@ pub mod config;
 pub mod drives;
 pub mod du;
 pub mod fs;
+pub mod git;
 pub mod jump;
 pub mod ops;
 pub mod platform;

@@ -21,6 +21,5 @@ Future ideas (not built yet):
 - Command line at the bottom (runs in the current folder, Ctrl+Enter inserts the name)
 - Tabs per pane (Ctrl+T), restored at startup
 - Multi-rename with patterns like [N]_[C].[E] and live preview
-- Git status in the file list
 - Drag & drop to and from other apps (Wayland)
 - Nested archives, writing into archives, image preview inside archives
