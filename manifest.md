@@ -1,16 +1,16 @@
 
 
 App:
-Guppy ein moderner leichtgewichtiger File Manager für Linux
+Guppy, a modern lightweight file manager for Linux
 
 
-Software Stack:
-Minimalistisch, hocheffizient, schnell, performance im fokus
+Software stack:
+Minimalist, highly efficient, fast, focused on performance
 
-features:
-Norton commander ähnlich
+Features:
+Similar to Norton Commander
 
-Optik:
-modern und elegant.
+Look:
+Modern and elegant.
 
 
