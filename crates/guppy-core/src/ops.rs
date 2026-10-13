@@ -51,6 +51,17 @@ struct State {
     /// Answer given "for all".
     policy: Mutex<Option<Resolve>>,
     wake: Condvar,
+    /// What was done, for [`undo`].
+    steps: Mutex<Vec<Step>>,
+}
+
+/// One completed change that [`undo`] can reverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Moved or renamed.
+    Moved { from: PathBuf, to: PathBuf },
+    /// Moved to the trash from this path.
+    Trashed(PathBuf),
 }
 
 /// Running operation; `clone()` is cheap.
@@ -77,6 +88,15 @@ impl Job {
             finished: s.finished.load(Ordering::Relaxed),
             problems: s.problems.lock().unwrap().clone(),
         }
+    }
+
+    /// The changes made so far (moves and trashing; copies are not undone).
+    pub fn steps(&self) -> Vec<Step> {
+        self.0.steps.lock().unwrap().clone()
+    }
+
+    fn step(&self, s: Step) {
+        self.0.steps.lock().unwrap().push(s);
     }
 
     pub fn cancel(&self) {
@@ -183,8 +203,10 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
                     } else {
                         remove(src).map_err(|e| e.to_string())
                     };
-                    if let Err(e) = res {
-                        j.problem(src, e);
+                    match res {
+                        Ok(()) if kind == OpKind::Trash => j.step(Step::Trashed(src.clone())),
+                        Ok(()) => {}
+                        Err(e) => j.problem(src, e),
                     }
                     j.add_done(1);
                 }
@@ -193,6 +215,66 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
         j.0.finished.store(true, Ordering::Relaxed);
     });
     job
+}
+
+/// Reverses `steps`, last first: moves entries back and restores trashed ones.
+/// A move back asks like any other move if the old place is taken again.
+pub fn undo(steps: Vec<Step>) -> Job {
+    let job = Job::default();
+    let j = job.clone();
+    std::thread::spawn(move || {
+        j.0.total.store(steps.iter().map(|s| if let Step::Moved { to, .. } = s { tree_size(to) } else { 0 }).sum(), Ordering::Relaxed);
+        let mut trashed = Vec::new();
+        for s in steps.into_iter().rev() {
+            if j.cancelled() {
+                break;
+            }
+            match s {
+                Step::Moved { from, to } => {
+                    // A merged folder was removed after its contents moved out.
+                    if let Some(parent) = from.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = move_entry(&j, &to, &from) {
+                        j.problem(&to, e);
+                    }
+                }
+                Step::Trashed(p) => trashed.push(p),
+            }
+        }
+        if !trashed.is_empty() && !j.cancelled() {
+            restore(&j, &trashed);
+        }
+        j.0.finished.store(true, Ordering::Relaxed);
+    });
+    job
+}
+
+/// Takes the most recently trashed item for each path back out of the trash.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn restore(job: &Job, paths: &[PathBuf]) {
+    let items = match trash::os_limited::list() {
+        Ok(items) => items,
+        Err(e) => return job.problem(Path::new("trash"), e),
+    };
+    let mut pick = Vec::new();
+    for p in paths {
+        match items.iter().filter(|i| i.original_path() == *p).max_by_key(|i| i.time_deleted) {
+            Some(_) if p.symlink_metadata().is_ok() => job.problem(p, "something with that name exists again, left in the trash"),
+            Some(i) => pick.push(i.clone()),
+            None => job.problem(p, "no longer in the trash"),
+        }
+    }
+    if let Err(e) = trash::os_limited::restore_all(pick) {
+        job.problem(Path::new("trash"), e);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn restore(job: &Job, paths: &[PathBuf]) {
+    for p in paths {
+        job.problem(p, "restoring from the trash is not supported here");
+    }
 }
 
 /// Extracts archive members into a hidden folder inside `target` (same filesystem),
@@ -336,10 +418,7 @@ fn move_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
     };
     // Same filesystem: instant. Otherwise copy and remove the source.
     match std::fs::rename(src, &dst) {
-        Ok(()) => {
-            job.add_done(tree_size(&dst));
-            Ok(())
-        }
+        Ok(()) => job.add_done(tree_size(&dst)),
         Err(_) => {
             let before = job.problem_count();
             copy_entry(job, src, &dst)?;
@@ -347,9 +426,11 @@ fn move_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
             if job.cancelled() || job.problem_count() > before {
                 return Ok(());
             }
-            remove(src)
+            remove(src)?;
         }
     }
+    job.step(Step::Moved { from: src.to_path_buf(), to: dst });
+    Ok(())
 }
 
 fn copy_entry(job: &Job, src: &Path, dst: &Path) -> io::Result<()> {
@@ -482,6 +563,30 @@ mod tests {
 
         wait(&start(OpKind::Delete, vec![b.join("sub"), a.join("new")], None));
         assert!(!b.join("sub").exists() && !a.join("new").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_moves() {
+        let root = std::env::temp_dir().join(format!("guppy-ops-u-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(a.join("d")).unwrap();
+        std::fs::create_dir_all(b.join("d")).unwrap();
+        std::fs::write(a.join("d/f"), "f").unwrap();
+        std::fs::write(a.join("x"), "x").unwrap();
+
+        // `d` merges into the existing folder, `x` moves plainly.
+        let job = start(OpKind::Move, vec![a.join("d"), a.join("x")], Some(b.clone()));
+        answer(&job, Resolve::Overwrite, true);
+        wait(&job);
+        assert!(!a.join("d").exists() && b.join("d/f").exists());
+        let steps = job.steps();
+        assert_eq!(steps.len(), 2, "{steps:?}");
+
+        let p = wait(&undo(steps));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        assert_eq!(std::fs::read_to_string(a.join("d/f")).unwrap(), "f");
+        assert!(a.join("x").exists() && !b.join("x").exists() && !b.join("d/f").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

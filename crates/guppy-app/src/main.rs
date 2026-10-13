@@ -360,6 +360,7 @@ enum Cmd {
     Delete,
     NewDir,
     Rename,
+    Undo,
     View,
     Edit,
     EditExternal,
@@ -393,6 +394,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Delete permanently", "Shift+F8", Cmd::Delete),
     ("New folder", "F7", Cmd::NewDir),
     ("Rename", "F2", Cmd::Rename),
+    ("Undo last move, rename or trash", "Ctrl+Z", Cmd::Undo),
     ("View file", "F3", Cmd::View),
     ("Edit file", "F4", Cmd::Edit),
     ("Edit in external editor", "Shift+F4", Cmd::EditExternal),
@@ -484,6 +486,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("F6", "move to other pane"),
         ("F7", "new folder"),
         ("F8 Del", "move to trash"),
+        ("Ctrl+Z", "undo move, rename, trash"),
         ("Shift+F8/Del", "delete permanently"),
         ("Ctrl+C / X", "copy / cut files to clipboard"),
         ("Ctrl+V", "paste files here"),
@@ -605,6 +608,10 @@ struct Jobs {
     problems: Vec<String>,
     /// Jobs started since the queue was last empty, for "2 of 3".
     started: usize,
+    /// The running job is an undo.
+    undoing: bool,
+    /// The last move, rename or trashing: label and what to reverse.
+    last: Option<(String, Vec<ops::Step>)>,
 }
 
 impl Jobs {
@@ -1298,6 +1305,7 @@ impl Guppy {
             }
             _ if query_empty && !m.control() && !m.alt() && typed == Some("*") => self.invert_marks(),
             Key::Character("r") if m.control() => self.recompute_sizes(),
+            Key::Character("z") if m.control() => self.undo(),
             // Anything printable without Ctrl/Alt goes into the input.
             _ => match typed {
                 Some(t) if !m.control() && !m.alt() && !m.logo() && t.chars().all(|c| !c.is_control()) => {
@@ -1617,6 +1625,10 @@ impl Guppy {
         let Some(r) = &mut self.rename else { return };
         match ops::rename(&r.from, r.name.trim()) {
             Ok(to) => {
+                if to != r.from {
+                    let label = format!("Rename {} to {}", r.from.file_name().unwrap_or_default().to_string_lossy(), r.name.trim());
+                    self.jobs.last = Some((label, vec![ops::Step::Moved { from: r.from.clone(), to: to.clone() }]));
+                }
                 let side = r.side;
                 self.rename = None;
                 self.reload(side);
@@ -1726,6 +1738,7 @@ impl Guppy {
         }
         if let Some((kind, sources, target, label)) = self.jobs.queue.pop_front() {
             self.jobs.started += 1;
+            self.jobs.undoing = false;
             self.jobs.running = Some((kind, ops::start(kind, sources, target), label));
         }
     }
@@ -1742,7 +1755,13 @@ impl Guppy {
                 _ => {}
             }
             if progress.finished {
-                self.jobs.running = None;
+                let steps = job.steps();
+                if let Some((_, _, label)) = self.jobs.running.take()
+                    && !self.jobs.undoing
+                    && !steps.is_empty()
+                {
+                    self.jobs.last = Some((label, steps));
+                }
                 self.jobs.problems.extend(progress.problems);
                 for side in 0..2 {
                     let path = self.panes[side].path.clone();
@@ -1762,6 +1781,21 @@ impl Guppy {
                 self.dialog = Some(Dialog::Report { title: "Done, with notes", problems: std::mem::take(&mut self.jobs.problems) });
             }
         }
+    }
+
+    /// Reverses the last move, rename or trashing (Ctrl+Z).
+    fn undo(&mut self) {
+        if self.jobs.busy() {
+            self.dialog = Some(Dialog::Report { title: "Not yet", problems: vec!["Wait until the running jobs are done.".into()] });
+            return;
+        }
+        let Some((label, steps)) = self.jobs.last.take() else {
+            self.dialog = Some(Dialog::Report { title: "Nothing to undo", problems: vec!["Moves, renames and trashing can be undone; copies and permanent deletes can't.".into()] });
+            return;
+        };
+        self.jobs.started = 1;
+        self.jobs.undoing = true;
+        self.jobs.running = Some((OpKind::Move, ops::undo(steps), format!("Undo: {label}")));
     }
 
     fn cycle_sort(&mut self) {
@@ -1817,6 +1851,7 @@ impl Guppy {
                     self.start_rename();
                 }
             }
+            Cmd::Undo => self.undo(),
             Cmd::View => return self.open_view(),
             Cmd::Edit => return self.edit_current(),
             Cmd::EditExternal => self.edit_external(),
@@ -3332,6 +3367,7 @@ impl Guppy {
                 let p = job.progress();
                 let pct = (p.done * 100).checked_div(p.total).unwrap_or(0).min(100);
                 let verb = match kind {
+                    _ if self.jobs.undoing => "Undoing",
                     OpKind::Copy => "Copying",
                     OpKind::Move => "Moving",
                     OpKind::Trash => "Trashing",
