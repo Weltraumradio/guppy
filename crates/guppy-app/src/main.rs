@@ -1268,7 +1268,7 @@ impl Guppy {
             } else {
                 self.class_color(e.class())
             };
-            let dot = if marked { "●" } else if e.is_dir() { " " } else { "▪" };
+            let dot = if marked { "●" } else { " " };
             let dot_color = if on_cursor { fg } else if marked { rgb(t.marked) } else { self.class_color(e.class()) };
             let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
             let (size, pending) = match (e.is_dir(), self.sizes.get(&e.path)) {
