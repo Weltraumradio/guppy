@@ -2507,9 +2507,9 @@ impl Guppy {
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let side_view = |side: usize| if self.quick && side != self.active { self.quick_pane(side) } else { self.pane_view(side) };
-        let body = row![side_view(0), side_view(1)].spacing(22);
+        let body = row![side_view(0), side_view(1)].spacing(16);
         let desk = container(body)
-            .padding([16, 18])
+            .padding([12, 13])
             .height(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(rgb(t.dark_background).into()),
