@@ -74,7 +74,6 @@ enum Message {
     DialogConfirm,
     DialogCancel,
     ToggleHidden,
-    TogglePreview,
     /// Entwickler-Hilfe: `GUPPY_SCREENSHOT=datei.ppm` speichert ein Bild, sobald die
     /// Größen berechnet sind, und beendet.
     Shot(iced::window::Screenshot),
@@ -91,7 +90,43 @@ enum Dialog {
     NewDir { name: String, error: Option<String> },
     Running { kind: OpKind, job: Job },
     Report { problems: Vec<String> },
+    /// Kurzhilfe mit allen Tasten (F1).
+    Help,
 }
+
+/// Abschnitte der Kurzhilfe: Überschrift und (Taste, Funktion).
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    ("Navigation", &[
+        ("↑ ↓", "Cursor bewegen"),
+        ("Bild↑ Bild↓", "seitenweise"),
+        ("Pos1 Ende", "erster / letzter Eintrag"),
+        ("Enter", "öffnen / hinspringen"),
+        ("Backspace", "Suche kürzen, sonst Ordner hoch"),
+        ("Alt+← Alt+→", "Verlauf zurück / vor"),
+        ("Tab", "Pane wechseln"),
+    ]),
+    ("Suche", &[
+        ("a–z …", "aktives Pane filtern"),
+        ("~ oder /", "Ordner springen (unscharf)"),
+        ("Strg+G", "Sprungmodus öffnen"),
+        ("Esc", "Suche leeren"),
+    ]),
+    ("Dateien", &[
+        ("Einfg", "markieren und weiter"),
+        ("Leertaste", "markieren (bei leerer Suche)"),
+        ("F5", "kopieren ins andere Pane"),
+        ("F6", "verschieben ins andere Pane"),
+        ("F7", "neuer Ordner"),
+        ("F8 Entf", "in den Papierkorb"),
+        ("Shift+F8/Entf", "endgültig löschen"),
+    ]),
+    ("Ansicht", &[
+        ("F1", "diese Hilfe"),
+        ("Strg+H", "versteckte Dateien"),
+        ("Strg+S", "Sortierung: Name, Größe, Datum"),
+        ("Strg+R", "Ordnergrößen neu berechnen"),
+    ]),
+];
 
 fn op_verb(kind: OpKind) -> &'static str {
     match kind {
@@ -219,9 +254,7 @@ struct Guppy {
     panes: [Pane; 2],
     active: usize,
     show_hidden: bool,
-    show_preview: bool,
-    preview: Option<(PathBuf, String)>,
-    papers: [Paper; 3],
+    papers: [Paper; 2],
     sizes: DirSizes,
     jumper: Jumper,
     /// Treffer im Sprungmodus und die gewählte Zeile.
@@ -235,7 +268,6 @@ struct Guppy {
     /// Fensterbreite, für das anpassungsfähige Layout.
     width: f32,
     /// Zeitpunkt, ab dem die Vorschau geladen wird.
-    preview_due: Option<std::time::Instant>,
     /// Letzte Cursorbewegung, um Tastenwiederholung zu erkennen.
     last_move: Option<std::time::Instant>,
 }
@@ -249,9 +281,7 @@ impl Guppy {
             panes: [Pane::new(cwd, "pane-left"), Pane::new(home, "pane-right")],
             active: 0,
             show_hidden: false,
-            show_preview: true,
-            preview: None,
-            papers: [Paper::new(1), Paper::new(2), Paper::new(3)],
+            papers: [Paper::new(1), Paper::new(2)],
             sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
             jumper: Jumper::load(),
             jump: Vec::new(),
@@ -261,12 +291,10 @@ impl Guppy {
             dialog: None,
             last_frame: None,
             width: 1200.0,
-            preview_due: None,
             last_move: None,
         };
         g.request_sizes(0);
         g.request_sizes(1);
-        g.refresh_preview();
         // Entwickler-Hilfe: vorgegebene Eingabe, z. B. `GUPPY_QUERY=~gu`.
         if let Ok(q) = std::env::var("GUPPY_QUERY") {
             g.set_query(q);
@@ -276,6 +304,10 @@ impl Guppy {
         }
         // `GUPPY_DIALOG=copy` öffnet den Kopierdialog, `=run` bestätigt ihn auch.
         if let Ok(d) = std::env::var("GUPPY_DIALOG") {
+            if d == "help" {
+                g.dialog = Some(Dialog::Help);
+                return (g, Task::none());
+            }
             g.ask(OpKind::Copy);
             if d == "run" {
                 g.confirm_dialog();
@@ -321,7 +353,7 @@ impl Guppy {
         }
         // Nur solange Größen berechnet werden, sonst kein Leerlauf-Takt.
         let running = matches!(self.dialog, Some(Dialog::Running { .. }));
-        if self.sizes.busy() || self.jump_pending || running || self.preview_due.is_some() || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+        if self.sizes.busy() || self.jump_pending || running || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
             keys
@@ -333,13 +365,9 @@ impl Guppy {
         p.visible(self.show_hidden, &self.sizes).get(p.cursor).copied()
     }
 
-    /// Bei schmalem Fenster weicht zuerst die Vorschau, dann die Datumsspalte.
-    fn preview_visible(&self) -> bool {
-        self.show_preview && self.width >= 1100.0
-    }
-
+    /// Bei schmalem Fenster weicht die Datumsspalte.
     fn show_dates(&self) -> bool {
-        self.width >= if self.preview_visible() { 1300.0 } else { 760.0 }
+        self.width >= 760.0
     }
 
     fn jumping(&self) -> bool {
@@ -359,11 +387,6 @@ impl Guppy {
                 self.poll_job();
                 return Task::none();
             }
-            Message::Tick if self.preview_due.is_some_and(|t| std::time::Instant::now() >= t) => {
-                self.preview_due = None;
-                self.refresh_preview();
-                return Task::none();
-            }
             Message::Tick if self.jump_pending => {
                 // Unterordner-Index wächst: Treffer auffrischen, Auswahl behalten.
                 // Nach dem Ende des Einlesens ein letztes Mal.
@@ -375,7 +398,7 @@ impl Guppy {
                 }
                 return Task::none();
             }
-            Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending && self.preview_due.is_none() => {
+            Message::Tick if std::env::var_os("GUPPY_SCREENSHOT").is_some() && !self.sizes.busy() && !self.jump_pending => {
                 // Ein paar Takte warten, damit der letzte Stand gezeichnet ist.
                 self.shot_wait += 1;
                 if self.shot_wait < 4 {
@@ -434,7 +457,6 @@ impl Guppy {
                 self.show_hidden = !self.show_hidden;
                 self.panes.iter_mut().for_each(|p| p.cursor = 0);
             }
-            Message::TogglePreview => self.show_preview = !self.show_preview,
             Message::Shot(shot) => {
                 if let Some(path) = std::env::var_os("GUPPY_SCREENSHOT") {
                     save_ppm(&path, &shot);
@@ -442,7 +464,6 @@ impl Guppy {
                 return iced::exit();
             }
         }
-        self.schedule_preview();
         self.scroll_into_view()
     }
 
@@ -465,6 +486,7 @@ impl Guppy {
             Key::Named(Named::PageUp) => move_to(cur.saturating_sub(page)),
             Key::Named(Named::Home) => move_to(0),
             Key::Named(Named::End) => move_to(usize::MAX),
+            Key::Named(Named::F1) => self.dialog = Some(Dialog::Help),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => self.open_current(),
             Key::Named(Named::Backspace) if !query_empty => {
@@ -508,7 +530,6 @@ impl Guppy {
                 _ => return Task::none(),
             },
         }
-        self.schedule_preview();
         self.scroll_into_view()
     }
 
@@ -552,7 +573,7 @@ impl Guppy {
                 Err(e) => self.dialog = Some(Dialog::NewDir { name, error: Some(e.to_string()) }),
             },
             Some(Dialog::Running { kind, job }) => self.dialog = Some(Dialog::Running { kind, job }),
-            Some(Dialog::Report { .. }) | None => {}
+            Some(Dialog::Report { .. } | Dialog::Help) | None => {}
         }
     }
 
@@ -568,6 +589,7 @@ impl Guppy {
         match key.as_ref() {
             Key::Named(Named::Enter) => self.confirm_dialog(),
             Key::Named(Named::Escape) => self.cancel_dialog(),
+            Key::Named(Named::F1) if matches!(self.dialog, Some(Dialog::Help)) => self.dialog = None,
             _ => {
                 if let Some(Dialog::NewDir { name, error }) = &mut self.dialog {
                     match (key.as_ref(), typed) {
@@ -742,38 +764,6 @@ impl Guppy {
         p.cursor = p.cursor.min(len.saturating_sub(1));
     }
 
-    /// Vorschau erst laden, wenn der Cursor kurz ruht; beim Dauerscrollen kein Dateizugriff.
-    fn schedule_preview(&mut self) {
-        let same = match (self.current(), &self.preview) {
-            (Some(e), Some((p, _))) => e.path == *p,
-            _ => false,
-        };
-        if !same {
-            self.preview_due = Some(std::time::Instant::now() + Duration::from_millis(90));
-        }
-    }
-
-    fn refresh_preview(&mut self) {
-        let Some(e) = self.current() else {
-            self.preview = None;
-            return;
-        };
-        if self.preview.as_ref().is_some_and(|(p, _)| *p == e.path) {
-            return;
-        }
-        let body = if e.is_dir() {
-            match guppy_core::read_dir(&e.path) {
-                Ok(list) => list.iter().filter(|c| !c.hidden).take(40)
-                    .map(|c| if c.is_dir() { format!("{}/", c.name) } else { c.name.clone() })
-                    .collect::<Vec<_>>().join("\n"),
-                Err(_) => "Kein Zugriff".into(),
-            }
-        } else {
-            read_head(&e.path).unwrap_or_else(|| format!("{} · keine Textvorschau", human_size(e.size)))
-        };
-        self.preview = Some((e.path.clone(), body));
-    }
-
     /// Hält den Cursor sichtbar, mit zwei Zeilen Abstand zum Rand; gescrollt wird weich.
     fn scroll_into_view(&mut self) -> Task<Message> {
         if self.jumping() {
@@ -837,10 +827,7 @@ impl Guppy {
 
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
-        let mut body = row![self.pane_view(0), self.pane_view(1)].spacing(22);
-        if self.preview_visible() {
-            body = body.push(self.preview_view());
-        }
+        let body = row![self.pane_view(0), self.pane_view(1)].spacing(22);
         let desk = container(body)
             .padding([16, 18])
             .height(Length::Fill)
@@ -956,6 +943,31 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Help => {
+                let section = |(head, keys): &(&'static str, &'static [(&'static str, &'static str)])| {
+                    let mut c = column![text(*head).size(11).font(BOLD).color(rgb(t.accent))].spacing(5);
+                    for (k, what) in keys.iter() {
+                        c = c.push(row![
+                            text(*k).size(12).font(BOLD).color(rgb(t.bright)).width(118),
+                            text(*what).size(12).color(rgb(t.foreground)),
+                        ]);
+                    }
+                    c
+                };
+                column![
+                    title("Guppy · Tasten".into()),
+                    small("Alles geht per Tastatur. Tippen filtert das aktive Pane, ~ oder / springt zu einem Ordner. Ohne Markierung wirken Dateioperationen auf den Eintrag unter dem Cursor; Enter bestätigt, Esc bricht ab.".into()),
+                    row![
+                        column![section(&HELP[0]), section(&HELP[1])].spacing(18).width(Length::Fill),
+                        column![section(&HELP[2]), section(&HELP[3])].spacing(18).width(Length::Fill),
+                    ]
+                    .spacing(24),
+                    row![small("F1 oder Esc schließt".into()), iced::widget::Space::new().width(Length::Fill), btn("OK", Message::DialogCancel, true)]
+                        .align_y(iced::Alignment::Center),
+                ]
+                .spacing(18)
+                .into()
+            }
             Dialog::Report { problems } => {
                 let mut lines: Vec<String> = problems.iter().take(8).cloned().collect();
                 if problems.len() > 8 {
@@ -973,7 +985,7 @@ impl Guppy {
 
         let card = container(content)
             .padding(22)
-            .width(480)
+            .width(if matches!(dialog, Dialog::Help) { 760 } else { 480 })
         .style(move |_| container::Style {
             background: Some(rgb(0x57534a).into()),
             border: Border { color: rgb(t.accent), width: 1.5, radius: SHEET_RADIUS.into() },
@@ -1050,7 +1062,6 @@ impl Guppy {
             self.icon_button(icons::SWAP, "Seite wechseln (Tab)", Some(Message::SwitchSide)),
             iced::widget::Space::new().width(Length::Fill),
             self.icon_button(icons::HIDDEN, "Versteckte Dateien (Strg H)", Some(Message::ToggleHidden)),
-            self.icon_button(icons::PREVIEW, "Vorschau ein/aus", Some(Message::TogglePreview)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
@@ -1291,56 +1302,6 @@ impl Guppy {
         })
     }
 
-    fn preview_view(&self) -> Element<'_, Message> {
-        let t = &self.theme;
-        let content: Element<'_, Message> = match (self.current(), &self.preview) {
-            (Some(e), Some((path, body))) => {
-                let body = if *path == e.path { body.as_str() } else { "" };
-                let kind = match e.class() {
-                    FileClass::Dir => "ORDNER",
-                    FileClass::Code => "CODE",
-                    FileClass::Doc => "TEXT",
-                    FileClass::Image => "BILD",
-                    FileClass::Archive => "ARCHIV",
-                    FileClass::Other => "DATEI",
-                };
-                let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-                // Bild erst zeigen, wenn der Cursor ruht (gleiche Entprellung wie beim Text).
-                let settled = self.preview.as_ref().is_some_and(|(p, _)| *p == e.path);
-                let picture: Option<Element<'_, Message>> = match ext.as_str() {
-                    "png" | "jpg" | "jpeg" | "gif" | "webp" if settled => Some(
-                        iced::widget::image(iced::widget::image::Handle::from_path(&e.path))
-                            .content_fit(iced::ContentFit::Contain)
-                            .width(Length::Fill)
-                            .into(),
-                    ),
-                    "svg" if settled => Some(
-                        svg(svg::Handle::from_path(&e.path)).content_fit(iced::ContentFit::Contain).width(Length::Fill).into(),
-                    ),
-                    _ => None,
-                };
-                let mut c = column![
-                    text(format!("VORSCHAU · {kind}")).size(11).color(rgb(t.foreground)),
-                    text(&e.name).size(17).font(BOLD).color(rgb(t.bright)),
-                ]
-                .spacing(12);
-                match picture {
-                    Some(pic) => {
-                        c = c.push(container(pic).max_height(420)).push(small_meta(e, t));
-                    }
-                    None => {
-                        c = c.push(scrollable(text(body).size(12).color(rgb(t.foreground)).line_height(1.6)).height(Length::Fill));
-                    }
-                }
-                c.into()
-            }
-            _ => text("Leer").color(rgb(t.foreground)).into(),
-        };
-        self.sheet(container(content).padding(16).into(), &self.papers[2], 0x535047, None)
-            .width(Length::FillPortion(2))
-            .into()
-    }
-
     fn statusbar(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let p = &self.panes[self.active];
@@ -1426,30 +1387,8 @@ fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Erste 16 KB einer Datei, falls es Text ist.
-fn read_head(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut buf = vec![0; 16 * 1024];
-    let n = std::fs::File::open(path).ok()?.read(&mut buf).ok()?;
-    buf.truncate(n);
-    if buf.contains(&0) {
-        return None;
-    }
-    let s = match String::from_utf8(buf) {
-        Ok(s) => s,
-        // Am Pufferende abgeschnittenes UTF-8-Zeichen verwerfen.
-        Err(e) => String::from_utf8_lossy(&e.as_bytes()[..e.utf8_error().valid_up_to()]).into_owned(),
-    };
-    Some(s.lines().take(200).collect::<Vec<_>>().join("\n"))
-}
-
 fn save_ppm(path: &std::ffi::OsStr, shot: &iced::window::Screenshot) {
     let mut out = format!("P6 {} {} 255\n", shot.size.width, shot.size.height).into_bytes();
     out.extend(shot.rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
     let _ = std::fs::write(path, out);
-}
-
-fn small_meta<'a>(e: &Entry, t: &guppy_core::Theme) -> Element<'a, Message> {
-    let date = e.modified.map(human_date).unwrap_or_default();
-    text(format!("{} · {date}", human_size(e.size))).size(12).color(rgb(t.foreground)).into()
 }

@@ -21,5 +21,4 @@ icon!(DELETE, r#"<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>"#);
 icon!(MARK, r#"<path d="M5 12l4 4L19 6"/>"#);
 icon!(SWAP, r#"<path d="M7 7h13M16 3l4 4-4 4M17 17H4M8 13l-4 4 4 4"/>"#);
 icon!(HIDDEN, r#"<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>"#);
-icon!(PREVIEW, r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>"#);
 icon!(SEARCH, r#"<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>"#);
