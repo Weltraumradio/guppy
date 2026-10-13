@@ -14,6 +14,17 @@ pub struct Config {
     pub confirm: Confirm,
     pub network: Network,
     pub edit: Edit,
+    /// Folders the user keeps at hand, in their order (`[[bookmark]]`).
+    #[serde(rename = "bookmark")]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bookmark {
+    pub name: String,
+    /// As written: absolute or `~/…`; see [`Config::resolve`].
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
@@ -91,7 +102,7 @@ pub struct Network {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default(), edit: Edit::default() }
+        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default(), edit: Edit::default(), bookmarks: Vec::new() }
     }
 }
 
@@ -145,6 +156,11 @@ threads = 4        # parallel accesses per folder-size computation on network dr
 
 [edit]
 command = ""       # editor for F4, e.g. "code" or "kitty -e nvim"; "" = automatic
+
+# Bookmarks, shown under the drives (Alt+F1 / Alt+F2); Ctrl+D adds the current folder.
+# [[bookmark]]
+# name = "Projects"
+# path = "~/Work/projects"
 "#;
 
 impl SortBy {
@@ -209,6 +225,9 @@ impl Config {
                 }
             }
         }
+        for b in &self.bookmarks {
+            out.push_str(&format!("\n[[bookmark]]\nname = {}\npath = {}\n", q(&b.name), q(&b.path)));
+        }
         out
     }
 
@@ -267,6 +286,9 @@ mod tests {
         assert_eq!(c.view.sort, SortBy::Name);
         assert_eq!(c.network.threads, 4);
         assert!(toml::from_str::<Config>("[view]\nbogus = 1").is_err());
+        let mut b = Config::default();
+        b.bookmarks = vec![Bookmark { name: "Pro \"jekte\"".into(), path: "~/Work".into() }, Bookmark { name: "Root".into(), path: "/".into() }];
+        assert_eq!(toml::from_str::<Config>(&b.to_toml()).unwrap(), b);
         // Round trip through the commented layout.
         let mut c = Config::default();
         c.start.left = "~/a \"b\"".into();

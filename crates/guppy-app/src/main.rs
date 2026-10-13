@@ -15,7 +15,7 @@ use guppy_core::archive;
 use guppy_core::fs::{glob_match, human_date, human_size};
 use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
-use guppy_core::config::{Look, SortBy};
+use guppy_core::config::{Bookmark, Look, SortBy};
 use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
@@ -158,6 +158,8 @@ enum Dialog {
     Palette { query: String, cur: usize },
     /// Drive picker (Alt+F1 / Alt+F2) for the pane `side`.
     Drives { side: usize, list: Vec<guppy_core::drives::Drive>, cur: usize },
+    /// Name for a bookmark of `path`: new (Ctrl+D), or renaming bookmark `edit` (F2 in the picker).
+    Bookmark { path: PathBuf, name: String, edit: Option<usize> },
     /// Mark (`+`) or unmark (`-`) by wildcard pattern.
     Mark { add: bool, pattern: String },
     Report { title: &'static str, problems: Vec<String> },
@@ -376,6 +378,7 @@ enum Cmd {
     Switch,
     DrivesLeft,
     DrivesRight,
+    Bookmark,
     Jobs,
     Look,
     Settings,
@@ -406,35 +409,40 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Parent folder", "Backspace", Cmd::Parent),
     ("Home folder", "", Cmd::Home),
     ("Switch pane", "Tab", Cmd::Switch),
-    ("Drives: left pane", "Alt+F1", Cmd::DrivesLeft),
-    ("Drives: right pane", "Alt+F2", Cmd::DrivesRight),
+    ("Drives & bookmarks: left pane", "Alt+F1", Cmd::DrivesLeft),
+    ("Drives & bookmarks: right pane", "Alt+F2", Cmd::DrivesRight),
+    ("Bookmark this folder", "Ctrl+D", Cmd::Bookmark),
     ("Running jobs", "Ctrl+J", Cmd::Jobs),
     ("Switch look: paper / neon", "", Cmd::Look),
     ("Settings", "F12", Cmd::Settings),
     ("Key help", "F1", Cmd::Help),
 ];
 
-/// Fuzzy score: all query characters in order; consecutive and word-start hits
-/// count more. `None` if they don't all appear.
+/// Fuzzy score: every word of the query must appear in order somewhere in the
+/// label (words may match in any place); consecutive and word-start hits count
+/// more. `None` if a word doesn't match.
 fn fuzzy(query: &str, label: &str) -> Option<i32> {
     let label: Vec<char> = label.to_lowercase().chars().collect();
-    let mut score = 0;
-    let mut pos = 0;
-    let mut last: Option<usize> = None;
-    for q in query.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
-        let i = pos + label[pos..].iter().position(|&c| c == q)?;
-        score += 1;
-        if last.is_some_and(|l| l + 1 == i) {
-            score += 3;
+    let word_start = |i: usize| i == 0 || !label[i - 1].is_alphanumeric();
+    // One word matched as a subsequence starting at `from`.
+    let score_from = |word: &[char], from: usize| -> Option<i32> {
+        let (mut score, mut pos, mut last) = (0, from, None::<usize>);
+        for &q in word {
+            let i = pos + label[pos..].iter().position(|&c| c == q)?;
+            score += 1 + if last.is_some_and(|l| l + 1 == i) { 3 } else { 0 } + if word_start(i) { 5 } else { 0 };
+            last = Some(i);
+            pos = i + 1;
         }
-        if i == 0 || !label[i - 1].is_alphanumeric() {
-            score += 5;
-        }
-        last = Some(i);
-        pos = i + 1;
+        Some(score * 10 - from as i32)
+    };
+    let mut total = 0;
+    for word in query.to_lowercase().split_whitespace() {
+        let word: Vec<char> = word.chars().collect();
+        // Best start among the word starts that begin with the right letter, else anywhere.
+        let best = (0..label.len()).filter(|&i| word_start(i) && label[i] == word[0]).filter_map(|i| score_from(&word, i)).max();
+        total += best.or_else(|| score_from(&word, 0))?;
     }
-    // Earlier and shorter matches first.
-    Some(score * 10 - last.unwrap_or(0) as i32 - label.len() as i32 / 4)
+    Some(total - label.len() as i32 / 4)
 }
 
 /// Palette hits for `query`, best first (all commands when empty).
@@ -482,7 +490,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+J", "running jobs"),
         ("Ctrl+Q", "quick view in other pane"),
         ("Ctrl+P", "command palette"),
-        ("Alt+F1 / F2", "drives left / right"),
+        ("Alt+F1 / F2", "drives & bookmarks"),
+        ("Ctrl+D", "bookmark this folder"),
     ]),
     ("View", &[
         ("F1", "this help"),
@@ -984,7 +993,7 @@ impl Guppy {
                     _ => operation::focus(editor_id()),
                 };
             }
-            Message::Key(keyboard::Event::KeyPressed { key, text, .. }) if self.dialog.is_some() => {
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, text, .. }) if self.dialog.is_some() => {
                 if matches!(self.dialog, Some(Dialog::View { .. })) {
                     return self.on_view_key(key);
                 }
@@ -992,7 +1001,7 @@ impl Guppy {
                     return self.on_palette_key(key, text.as_deref());
                 }
                 if matches!(self.dialog, Some(Dialog::Drives { .. })) {
-                    return self.on_drives_key(key, text.as_deref());
+                    return self.on_drives_key(key, modifiers, text.as_deref());
                 }
                 self.on_dialog_key(key, text.as_deref());
                 return Task::none();
@@ -1157,7 +1166,7 @@ impl Guppy {
                 if let Some(Dialog::Drives { cur, .. }) = &mut self.dialog {
                     *cur = i;
                 }
-                self.pick_drive();
+                self.pick_drive(false);
             }
             Message::ToggleQuick => {
                 self.quick = !self.quick;
@@ -1281,6 +1290,7 @@ impl Guppy {
             Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
             Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
             Key::Character("q") if m.control() => return self.update(Message::ToggleQuick),
+            Key::Character("d") if m.control() => self.bookmark_here(),
             Key::Character("p") if m.control() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
             _ if query_empty && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
@@ -1450,6 +1460,7 @@ impl Guppy {
     fn confirm_dialog(&mut self) {
         match self.dialog.take() {
             Some(Dialog::Confirm { kind, sources, target }) => self.enqueue(kind, sources, target),
+            Some(Dialog::Bookmark { path, name, edit }) => self.save_bookmark(path, name, edit),
             Some(Dialog::Mark { add, pattern }) => {
                 self.mark_pattern(add, &pattern);
                 self.last_pattern = pattern;
@@ -1516,7 +1527,7 @@ impl Guppy {
             _ => {
                 let (name, error) = match &mut self.dialog {
                     Some(Dialog::NewDir { name, error }) => (name, Some(error)),
-                    Some(Dialog::Mark { pattern, .. }) => (pattern, None),
+                    Some(Dialog::Mark { pattern, .. } | Dialog::Bookmark { name: pattern, .. }) => (pattern, None),
                     _ => return,
                 };
                 match (key.as_ref(), typed) {
@@ -1550,7 +1561,7 @@ impl Guppy {
         }
         match &mut self.dialog {
             None => Some(&mut self.panes[self.active].query),
-            Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. } | Dialog::Palette { query: name, .. }) => Some(name),
+            Some(Dialog::NewDir { name, .. } | Dialog::Mark { pattern: name, .. } | Dialog::Palette { query: name, .. } | Dialog::Bookmark { name, .. }) => Some(name),
             Some(Dialog::Settings { edit: Some(text), .. }) => Some(text),
             _ => None,
         }
@@ -1823,6 +1834,7 @@ impl Guppy {
             Cmd::Switch => self.active = 1 - self.active,
             Cmd::DrivesLeft => self.open_drives(0),
             Cmd::DrivesRight => self.open_drives(1),
+            Cmd::Bookmark => self.bookmark_here(),
             Cmd::Jobs => self.dialog = Some(Dialog::Jobs),
             Cmd::Look => {
                 let mut new = self.config.clone();
@@ -1848,31 +1860,106 @@ impl Guppy {
         self.dialog = Some(Dialog::Drives { side, list, cur });
     }
 
-    fn on_drives_key(&mut self, key: Key, typed: Option<&str>) -> Task<Message> {
-        let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog else { return Task::none() };
+    fn on_drives_key(&mut self, key: Key, m: keyboard::Modifiers, typed: Option<&str>) -> Task<Message> {
+        let marks = self.config.bookmarks.len();
+        let Some(Dialog::Drives { side, list, cur }) = &mut self.dialog else { return Task::none() };
+        let drives = list.len();
+        let total = drives + marks;
+        // Selected bookmark, if the cursor is on one.
+        let mark = cur.checked_sub(drives).filter(|&b| b < marks);
         match key.as_ref() {
             Key::Named(Named::Escape) => self.dialog = None,
-            Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(list.len().saturating_sub(1)),
+            // Alt+↑/↓ move a bookmark within the list.
+            Key::Named(dir @ (Named::ArrowUp | Named::ArrowDown)) if m.alt() => {
+                if let Some(b) = mark {
+                    let to = if dir == Named::ArrowUp { b.checked_sub(1) } else { Some(b + 1).filter(|&t| t < marks) };
+                    if let Some(to) = to {
+                        *cur = drives + to;
+                        let mut new = self.config.clone();
+                        new.bookmarks.swap(b, to);
+                        self.set_config(new);
+                    }
+                }
+            }
+            Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(total.saturating_sub(1)),
             Key::Named(Named::ArrowUp) => *cur = cur.saturating_sub(1),
             Key::Named(Named::Home) => *cur = 0,
-            Key::Named(Named::End) => *cur = list.len().saturating_sub(1),
-            Key::Named(Named::Enter) => self.pick_drive(),
+            Key::Named(Named::End) => *cur = total.saturating_sub(1),
+            Key::Named(Named::Enter) => self.pick_drive(m.shift()),
+            Key::Named(Named::Delete) => {
+                if let Some(b) = mark {
+                    *cur = (*cur).min(total.saturating_sub(2));
+                    let mut new = self.config.clone();
+                    new.bookmarks.remove(b);
+                    self.set_config(new);
+                }
+            }
+            Key::Named(Named::F2) => {
+                if let Some(b) = mark {
+                    let side = *side;
+                    let bm = &self.config.bookmarks[b];
+                    let path = Config::resolve(&bm.path, &self.panes[side].path);
+                    self.dialog = Some(Dialog::Bookmark { path, name: bm.name.clone(), edit: Some(b) });
+                }
+            }
             // 1–9 pick directly.
             _ => {
-                if let Some(n) = typed.and_then(|t| t.parse::<usize>().ok()).filter(|n| (1..=list.len()).contains(n)) {
+                if let Some(n) = typed.and_then(|t| t.parse::<usize>().ok()).filter(|n| (1..=total).contains(n)) {
                     *cur = n - 1;
-                    self.pick_drive();
+                    self.pick_drive(false);
                 }
             }
         }
         self.scroll_into_view()
     }
 
-    fn pick_drive(&mut self) {
+    /// Opens the selected drive or bookmark in its pane, or with `other` in the other one.
+    fn pick_drive(&mut self, other: bool) {
         let Some(Dialog::Drives { side, list, cur }) = self.dialog.take() else { return };
-        if let Some(d) = list.get(cur) {
-            self.active = side;
-            self.navigate(d.path.clone());
+        let target = match list.get(cur) {
+            Some(d) => Some(d.path.clone()),
+            None => self.config.bookmarks.get(cur - list.len()).map(|b| Config::resolve(&b.path, &self.panes[side].path)),
+        };
+        if let Some(path) = target {
+            self.active = if other { 1 - side } else { side };
+            self.navigate(path);
+        }
+    }
+
+    /// Ctrl+D: names a new bookmark for the active folder; if it has one, shows it in the list.
+    fn bookmark_here(&mut self) {
+        let here = self.panes[self.active].path.clone();
+        let cwd = here.clone();
+        if let Some(b) = self.config.bookmarks.iter().position(|b| Config::resolve(&b.path, &cwd) == here) {
+            self.open_drives(self.active);
+            if let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog {
+                *cur = list.len() + b;
+            }
+            return;
+        }
+        let name = here.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
+        self.dialog = Some(Dialog::Bookmark { path: here, name, edit: None });
+    }
+
+    fn save_bookmark(&mut self, path: PathBuf, name: String, edit: Option<usize>) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.dialog = Some(Dialog::Bookmark { path, name, edit });
+            return;
+        }
+        let mut new = self.config.clone();
+        match edit {
+            Some(b) if b < new.bookmarks.len() => new.bookmarks[b].name = name,
+            _ => new.bookmarks.push(Bookmark { name, path: self.jumper.display(&path) }),
+        }
+        let index = edit.unwrap_or(new.bookmarks.len() - 1);
+        self.set_config(new);
+        // Back to the list, with this bookmark selected.
+        if self.dialog.is_none() {
+            self.open_drives(self.active);
+            if let Some(Dialog::Drives { list, cur, .. }) = &mut self.dialog {
+                *cur = list.len() + index;
+            }
         }
     }
 
@@ -2067,6 +2154,22 @@ impl Guppy {
         let q = &self.panes[self.active].query;
         let pattern = &q[1..];
         let mut hits = self.jumper.search(pattern, JUMP_LIMIT);
+        // Bookmarks whose name fits come first.
+        if !pattern.trim().is_empty() {
+            let cwd = self.panes[self.active].path.clone();
+            let mut marks: Vec<(i32, PathBuf)> = self
+                .config
+                .bookmarks
+                .iter()
+                .filter_map(|b| fuzzy(pattern, &b.name).map(|s| (s, Config::resolve(&b.path, &cwd))))
+                .collect();
+            marks.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+            for (_, p) in marks.into_iter().rev() {
+                hits.retain(|h| *h != p);
+                hits.insert(0, p);
+            }
+            hits.truncate(JUMP_LIMIT);
+        }
         // A typed path that exists goes to the top.
         let typed = match q.strip_prefix('~') {
             Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
@@ -2483,6 +2586,21 @@ impl Guppy {
                 column![field, list, small("↑↓ choose · Enter runs · Esc closes".into())].spacing(12).into()
             }
             Dialog::Drives { side, list, cur } => {
+                let radius = if self.neon() { 0 } else { 4 };
+                let row_style = move |on: bool| {
+                    move |_: &iced::Theme, status: button::Status| button::Style {
+                        background: Some(if on {
+                            rgb(t.accent)
+                        } else if matches!(status, button::Status::Hovered) {
+                            Color { a: 0.06, ..Color::WHITE }
+                        } else {
+                            Color::TRANSPARENT
+                        }
+                        .into()),
+                        border: Border::default().rounded(radius),
+                        ..Default::default()
+                    }
+                };
                 let mut rows = column![].spacing(4);
                 for (i, d) in list.iter().enumerate() {
                     let on = i == *cur;
@@ -2520,24 +2638,63 @@ impl Guppy {
                         .padding([6, 10])
                         .width(Length::Fill)
                         .on_press(Message::DrivePick(i))
-                        .style(move |_, status| button::Style {
-                            background: Some(if on {
-                                rgb(t.accent)
-                            } else if matches!(status, button::Status::Hovered) {
-                                Color { a: 0.06, ..Color::WHITE }
-                            } else {
-                                Color::TRANSPARENT
-                            }
-                            .into()),
-                            border: Border::default().rounded(if self.neon() { 0 } else { 4 }),
-                            ..Default::default()
-                        }),
+                        .style(row_style(on)),
                     );
                 }
+                rows = rows.push(container(text("BOOKMARKS").size(11).font(BOLD).color(rgb(t.accent))).padding(iced::Padding { top: 10.0, bottom: 2.0, left: 10.0, right: 0.0 }));
+                if self.config.bookmarks.is_empty() {
+                    rows = rows.push(container(small("None yet · Ctrl+D bookmarks the current folder".into())).padding([2, 10]));
+                }
+                for (b, bm) in self.config.bookmarks.iter().enumerate() {
+                    let i = list.len() + b;
+                    let on = i == *cur;
+                    let path = Config::resolve(&bm.path, &self.panes[*side].path);
+                    // Unreachable targets are dimmed; network paths aren't probed (could hang).
+                    let there = guppy_core::platform::is_network(&path) || path.exists() || guppy_core::archive::split(&path).is_some();
+                    let main = if on { rgb(t.background) } else if there { rgb(t.bright) } else { rgb(t.muted) };
+                    let dim = if on { rgb(t.background) } else if there { fg } else { rgb(t.muted) };
+                    let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
+                    rows = rows.push(
+                        button(
+                            column![
+                                text(format!("{number}{}", bm.name)).size(13).font(BOLD).color(main),
+                                text(if there { bm.path.clone() } else { format!("{} · not reachable", bm.path) }).size(11).color(dim).wrapping(iced::widget::text::Wrapping::None),
+                            ]
+                            .spacing(2),
+                        )
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .on_press(Message::DrivePick(i))
+                        .style(row_style(on)),
+                    );
+                }
+                let hint = if cur.checked_sub(list.len()).is_some_and(|b| b < self.config.bookmarks.len()) {
+                    "Enter opens · Shift+Enter in other pane · Del removes · F2 renames · Alt+↑↓ moves"
+                } else {
+                    "↑↓ choose · Enter or 1–9 opens · Shift+Enter in other pane · Esc closes"
+                };
                 column![
-                    title(format!("Drives · {} pane", if *side == 0 { "left" } else { "right" })),
+                    title(format!("Drives & bookmarks · {} pane", if *side == 0 { "left" } else { "right" })),
                     scrollable(rows).height(Length::Shrink),
-                    small("↑↓ choose · Enter or 1–9 opens · Esc closes".into()),
+                    small(hint.into()),
+                ]
+                .spacing(14)
+                .into()
+            }
+            Dialog::Bookmark { path, name, edit } => {
+                let field = container(text(format!("{name}▏")).size(13).color(rgb(t.bright)))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                column![
+                    title(if edit.is_some() { "Rename bookmark" } else { "Bookmark this folder" }.into()),
+                    small(self.jumper.display(path)),
+                    field,
+                    buttons("Save"),
                 ]
                 .spacing(14)
                 .into()
@@ -3245,7 +3402,8 @@ mod tests {
         assert_eq!(label("copy"), "Copy to other pane");
         assert_eq!(label("trash"), "Move to trash");
         assert_eq!(label("hid"), "Show / hide hidden files");
-        assert_eq!(label("drv r"), "Drives: right pane");
+        assert_eq!(label("drv r"), "Drives & bookmarks: right pane");
+        assert_eq!(label("bookm"), "Bookmark this folder");
         assert!(palette_hits("zzzq").is_empty());
         assert_eq!(palette_hits("").len(), COMMANDS.len());
     }
