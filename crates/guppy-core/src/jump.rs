@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -18,8 +18,8 @@ struct Visit {
 
 pub struct Jumper {
     visits: HashMap<PathBuf, Visit>,
-    /// Scores from zoxide, if available.
-    zoxide: HashMap<PathBuf, f64>,
+    /// Scores from zoxide, if available; filled in the background at startup.
+    zoxide: Arc<OnceLock<HashMap<PathBuf, f64>>>,
     /// Subdirectories of the current directory, scanned in the background.
     nearby: Arc<Mutex<(PathBuf, Vec<PathBuf>)>>,
     indexing: Arc<AtomicBool>,
@@ -53,7 +53,7 @@ impl Jumper {
             .unwrap_or_default();
         let me = Self {
             visits,
-            zoxide: load_zoxide(),
+            zoxide: Default::default(),
             nearby: Default::default(),
             indexing: Default::default(),
             alive: Default::default(),
@@ -65,12 +65,16 @@ impl Jumper {
     }
 
     /// Checks all stored targets in the background, local ones first.
+    /// Also loads the zoxide scores first, so starting zoxide doesn't delay startup.
     fn check_alive(&self) {
-        let mut paths: Vec<PathBuf> = self.visits.keys().chain(self.zoxide.keys()).cloned().collect();
-        paths.sort_by_key(|p| crate::platform::is_network(p));
-        paths.dedup();
+        let own: Vec<PathBuf> = self.visits.keys().cloned().collect();
         let alive = self.alive.clone();
+        let zoxide = self.zoxide.clone();
         std::thread::spawn(move || {
+            let z = zoxide.get_or_init(load_zoxide);
+            let mut paths: Vec<PathBuf> = own.into_iter().chain(z.keys().cloned()).collect();
+            paths.sort_by_key(|p| crate::platform::is_network(p));
+            paths.dedup();
             for p in paths {
                 let ok = p.is_dir();
                 alive.lock().unwrap().insert(p, ok);
@@ -139,6 +143,11 @@ impl Jumper {
         });
     }
 
+    fn zoxide(&self) -> &HashMap<PathBuf, f64> {
+        static EMPTY: LazyLock<HashMap<PathBuf, f64>> = LazyLock::new(HashMap::new);
+        self.zoxide.get().unwrap_or(&EMPTY)
+    }
+
     /// Are subdirectories currently being scanned?
     pub fn indexing(&self) -> bool {
         self.indexing.load(Ordering::Relaxed)
@@ -155,12 +164,12 @@ impl Jumper {
             };
             v.count * w
         });
-        own + self.zoxide.get(p).copied().unwrap_or(0.0)
+        own + self.zoxide().get(p).copied().unwrap_or(0.0)
     }
 
     /// Finds directories matching `query`. Empty query: sorted by frecency.
     pub fn search(&self, query: &str, limit: usize) -> Vec<PathBuf> {
-        let mut candidates: Vec<PathBuf> = self.visits.keys().chain(self.zoxide.keys()).cloned().collect();
+        let mut candidates: Vec<PathBuf> = self.visits.keys().chain(self.zoxide().keys()).cloned().collect();
         candidates.extend(self.nearby.lock().unwrap().1.iter().cloned());
         candidates.sort();
         candidates.dedup();

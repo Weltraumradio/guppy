@@ -23,14 +23,34 @@ pub enum DirSize {
     Cached(u64),
 }
 
+/// A folder by its path hash (see [`key`]); `parent` lets [`DirSizes::invalidate`]
+/// find everything below a folder without keeping 100 000s of paths in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Node {
+    size: u64,
+    parent: u64,
+}
+
+/// FNV-1a over the path bytes: stable across builds, so the cache file stays valid.
+fn key(p: &Path) -> u64 {
+    p.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+fn node(dir: &Path, size: u64) -> Node {
+    Node { size, parent: dir.parent().map_or(0, key) }
+}
+
+/// Header of the cache file; records follow as three little-endian u64: key, size, parent.
+const MAGIC: &[u8; 8] = b"guppysz1";
+
 #[derive(Default)]
 struct Inner {
-    done: Mutex<HashMap<PathBuf, u64>>,
+    done: Mutex<HashMap<u64, Node>>,
     /// Running computations: progress and the request's cancel signal.
     running: Mutex<HashMap<PathBuf, (Arc<AtomicU64>, Cancel)>>,
     pending: AtomicUsize,
     /// Persistent cache: loaded at startup, saved on exit.
-    cached: Mutex<HashMap<PathBuf, u64>>,
+    cached: Mutex<HashMap<u64, Node>>,
     cache_file: Option<PathBuf>,
 }
 
@@ -68,21 +88,22 @@ fn net_pool() -> &'static rayon::ThreadPool {
 }
 
 impl DirSizes {
-    /// Default cache location, e.g. `~/.cache/guppy/sizes.tsv`.
+    /// Default cache location, e.g. `~/.cache/guppy/sizes.bin`.
     pub fn default_cache_file() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("guppy/sizes.tsv"))
+        let dir = dirs::cache_dir()?.join("guppy");
+        // The old text format, replaced by the compact one.
+        let _ = std::fs::remove_file(dir.join("sizes.tsv"));
+        Some(dir.join("sizes.bin"))
     }
 
-    /// With a persistent cache in `file` (lines `size<TAB>path`).
+    /// With a persistent cache in `file` (binary, see [`MAGIC`]).
     pub fn with_cache(file: PathBuf) -> Self {
-        let cached = std::fs::read_to_string(&file)
-            .map(|s| {
-                s.lines()
-                    .filter_map(|l| {
-                        let (n, p) = l.split_once('\t')?;
-                        Some((PathBuf::from(p), n.parse().ok()?))
-                    })
-                    .collect()
+        let cached = std::fs::read(&file)
+            .ok()
+            .filter(|b| b.starts_with(MAGIC))
+            .map(|b| {
+                let u = |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap());
+                b[MAGIC.len()..].chunks_exact(24).map(|c| (u(&c[..8]), Node { size: u(&c[8..16]), parent: u(&c[16..]) })).collect()
             })
             .unwrap_or_default();
         Self {
@@ -94,13 +115,12 @@ impl DirSizes {
     pub fn save(&self) -> std::io::Result<()> {
         let Some(file) = &self.inner.cache_file else { return Ok(()) };
         let mut all = self.inner.cached.lock().unwrap().clone();
-        all.extend(self.inner.done.lock().unwrap().iter().map(|(p, n)| (p.clone(), *n)));
-        let mut out = String::new();
-        for (p, n) in &all {
-            let p = p.to_string_lossy();
-            // Paths containing newlines don't fit the line format.
-            if !p.contains('\n') {
-                out.push_str(&format!("{n}\t{p}\n"));
+        all.extend(self.inner.done.lock().unwrap().iter().map(|(k, n)| (*k, *n)));
+        let mut out = Vec::with_capacity(MAGIC.len() + 24 * all.len());
+        out.extend_from_slice(MAGIC);
+        for (k, n) in &all {
+            for v in [*k, n.size, n.parent] {
+                out.extend_from_slice(&v.to_le_bytes());
             }
         }
         if let Some(dir) = file.parent() {
@@ -112,10 +132,11 @@ impl DirSizes {
     }
 
     pub fn get(&self, dir: &Path) -> Option<DirSize> {
-        if let Some(&n) = self.inner.done.lock().unwrap().get(dir) {
-            return Some(DirSize::Done(n));
+        let k = key(dir);
+        if let Some(n) = self.inner.done.lock().unwrap().get(&k) {
+            return Some(DirSize::Done(n.size));
         }
-        let cached = self.inner.cached.lock().unwrap().get(dir).copied();
+        let cached = self.inner.cached.lock().unwrap().get(&k).map(|n| n.size);
         if let Some(n) = cached {
             // Keep the estimate until the new result is in; no counting up.
             return Some(DirSize::Cached(n));
@@ -138,7 +159,7 @@ impl DirSizes {
             let running = self.inner.running.lock().unwrap();
             // Cancelled runs that haven't finished yet don't count as running.
             let active = |d: &PathBuf| running.get(d).is_some_and(|(_, c)| !c.is_cancelled());
-            dirs.into_iter().filter(|d| !done.contains_key(d) && !active(d)).collect()
+            dirs.into_iter().filter(|d| !done.contains_key(&key(d)) && !active(d)).collect()
         };
         if todo.is_empty() {
             return;
@@ -175,15 +196,43 @@ impl DirSizes {
     /// Marks everything under `dir` and its parent directories as stale.
     /// Old values stay visible as estimates until recomputed.
     pub fn invalidate(&self, dir: &Path) {
-        let stale = |p: &PathBuf| p.starts_with(dir) || dir.starts_with(p);
+        let target = key(dir);
+        let ancestors: HashSet<u64> = dir.ancestors().map(key).collect();
         let mut done = self.inner.done.lock().unwrap();
         let mut cached = self.inner.cached.lock().unwrap();
-        done.retain(|p, n| {
-            if stale(p) {
-                cached.insert(p.clone(), *n);
+        // Below `dir`: following the parents leads to it. Each answer is remembered.
+        let mut below: HashMap<u64, bool> = HashMap::new();
+        let stale: Vec<u64> = done
+            .keys()
+            .copied()
+            .filter(|&k| {
+                if ancestors.contains(&k) {
+                    return true;
+                }
+                let mut chain = Vec::new();
+                let mut cur = k;
+                let hit = loop {
+                    if cur == target {
+                        break true;
+                    }
+                    if let Some(&b) = below.get(&cur) {
+                        break b;
+                    }
+                    chain.push(cur);
+                    match done.get(&cur).or_else(|| cached.get(&cur)) {
+                        Some(n) if n.parent != 0 => cur = n.parent,
+                        _ => break false,
+                    }
+                };
+                below.extend(chain.into_iter().map(|c| (c, hit)));
+                hit
+            })
+            .collect();
+        for k in stale {
+            if let Some(n) = done.remove(&k) {
+                cached.insert(k, n);
             }
-            !stale(p)
-        });
+        }
     }
 
     fn walk(
@@ -197,9 +246,10 @@ impl DirSizes {
         if cancel.is_cancelled() {
             return None;
         }
-        if let Some(&n) = self.inner.done.lock().unwrap().get(dir) {
-            acc.fetch_add(n, Ordering::Relaxed);
-            return Some(n);
+        let k = key(dir);
+        if let Some(n) = self.inner.done.lock().unwrap().get(&k) {
+            acc.fetch_add(n.size, Ordering::Relaxed);
+            return Some(n.size);
         }
         let Ok(rd) = std::fs::read_dir(dir) else { return Some(0) };
 
@@ -225,8 +275,8 @@ impl DirSizes {
             .map(|d| self.walk(d, dev, cancel, links, acc))
             .sum();
         let total = files + sub?;
-        self.inner.done.lock().unwrap().insert(dir.to_path_buf(), total);
-        self.inner.cached.lock().unwrap().remove(dir);
+        self.inner.done.lock().unwrap().insert(k, node(dir, total));
+        self.inner.cached.lock().unwrap().remove(&k);
         Some(total)
     }
 }
@@ -237,7 +287,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip() {
-        let file = std::env::temp_dir().join(format!("guppy-cache-{}.tsv", std::process::id()));
+        let file = std::env::temp_dir().join(format!("guppy-cache-{}.bin", std::process::id()));
         let root = std::env::temp_dir().join(format!("guppy-cdir-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("x"), [0u8; 42]).unwrap();
@@ -269,6 +319,18 @@ mod tests {
         }
         assert_eq!(sizes.get(&root.join("a")), Some(DirSize::Done(150)));
         assert_eq!(sizes.get(&root.join("a/b")), Some(DirSize::Done(50)));
+        // Below and above the changed folder become estimates; a sibling stays.
+        std::fs::create_dir_all(root.join("a/c")).unwrap();
+        sizes.request(vec![root.join("a/c")], Cancel::default());
+        while sizes.busy() {
+            std::thread::yield_now();
+        }
+        sizes.invalidate(&root.join("a/b"));
+        assert_eq!(sizes.get(&root.join("a")), Some(DirSize::Cached(150)));
+        assert_eq!(sizes.get(&root.join("a/b")), Some(DirSize::Cached(50)));
+        assert_eq!(sizes.get(&root.join("a/c")), Some(DirSize::Done(0)));
+        sizes.invalidate(&root);
+        assert_eq!(sizes.get(&root.join("a/c")), Some(DirSize::Cached(0)));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

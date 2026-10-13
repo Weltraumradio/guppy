@@ -17,24 +17,35 @@ Press F1 for all keys, Ctrl+P for the command palette. Settings live in
 Measured on 2026-10-13 with `GUPPY_BENCH=1 target/release/guppy-app`, which prints the time
 from process start to the first frame, then memory after three idle seconds, and exits.
 Release build, AMD Ryzen 9 6900HX (Radeon 680M), Arch Linux / Hyprland (Wayland),
-window 1200×760, both panes on real folders (`~/guppy` and `/mnt`). Median of six runs.
+window 1200×760, both panes on real folders (`~/guppy` and `/mnt`). Typical of six runs.
 
-| | Guppy (wgpu, default) | Guppy (`ICED_BACKEND=tiny-skia`) | Nautilus 50.3 |
-|---|---|---|---|
-| Binary size | 15 MB (one static file) | — | — |
-| First frame | 0.49 s | 0.46 s | — |
-| RSS | 182 MB | 184 MB | 131 MB |
-| PSS (shared pages split) | 114 MB | 176 MB | 70 MB |
-| Private dirty | 104 MB | 162 MB | 46 MB |
+| | Guppy | Nautilus 50.3 |
+|---|---|---|
+| Binary size | 15 MB (one file) | — |
+| First frame | 0.37 s | — |
+| RSS | 97 MB | 131 MB |
+| PSS (shared pages split) | 70 MB | 70 MB |
+| Private dirty | 55 MB | 46 MB |
+
+The size cache held ~70 000 folders (`cargo run --release --example du` with
+`GUPPY_SAVE=1` fills it for the whole home folder).
+
+History of this table: the first measurement (same day) was 0.49 s / 114 MB PSS. Since then:
+
+- wgpu uses only Vulkan when a Vulkan driver is installed; before, it started Vulkan *and*
+  OpenGL to choose an adapter, loading both drivers (`WGPU_BACKEND` still overrides this).
+- The folder-size cache keeps 64-bit path hashes instead of paths and is stored in a compact
+  binary file (1.7 MB instead of 11 MB of text), read in a few milliseconds.
+- zoxide is queried in the background instead of before the first frame.
 
 Notes:
 
-- Most of the memory is the renderer, not Guppy's data: with an empty home folder
-  (no jump index, no size cache) PSS is still ~100 MB. Vulkan/Mesa driver state and the
-  GPU font atlas dominate.
-- The software renderer (tiny-skia) saves no memory, because it keeps full-size frame buffers.
-- Nautilus shares more pages with the rest of the GNOME stack already in memory, which lowers
-  its PSS; its time to first window was not measured.
+- Most of the remaining time and memory is the renderer: Vulkan/Mesa driver state, the GPU
+  font atlas, and the compositor mapping the window. Guppy's own startup work is under 10 ms.
+- The software renderer (`ICED_BACKEND=tiny-skia`) saves no memory, because it keeps
+  full-size frame buffers.
+- Nautilus shares more pages with the GNOME stack already in memory; its time to first
+  window was not measured.
 
 Reproduce:
 

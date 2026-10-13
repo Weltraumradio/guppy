@@ -42,6 +42,7 @@ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new
 
 fn main() -> iced::Result {
     START.get_or_init(std::time::Instant::now);
+    prefer_vulkan();
     iced::application(Guppy::new, Guppy::update, Guppy::view)
         .title(Guppy::title)
         .theme(Guppy::theme)
@@ -53,6 +54,22 @@ fn main() -> iced::Result {
         // On close, save the size cache first.
         .exit_on_close_request(false)
         .run()
+}
+
+/// Without a choice, wgpu starts Vulkan *and* OpenGL to pick an adapter, which
+/// loads both drivers (~25 MB more, slower start). With a Vulkan driver installed,
+/// only Vulkan is used; `WGPU_BACKEND` still overrides this.
+fn prefer_vulkan() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        let has_icd = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]
+            .iter()
+            .any(|d| std::fs::read_dir(d).is_ok_and(|mut rd| rd.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json")))));
+        if has_icd {
+            // Safe: called first thing in main, before any other thread exists.
+            unsafe { std::env::set_var("WGPU_BACKEND", "vulkan") };
+        }
+    }
 }
 
 /// Colors for a look: neon is a fixed palette, paper follows the Omarchy theme.
