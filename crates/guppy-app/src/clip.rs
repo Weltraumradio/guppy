@@ -14,17 +14,20 @@ const URI_LIST: &str = "text/uri-list";
 pub fn put(paths: &[PathBuf], cut: bool) -> Result<(), String> {
     let uris: Vec<String> = paths.iter().map(|p| uri(p)).collect();
     let text = |s: String| Source::Bytes(s.into_bytes().into_boxed_slice());
+    // Plain paths first: `wl-paste` without a type (used by terminal apps such
+    // as Claude Code) takes the first text format offered.
     let sources = vec![
-        MimeSource {
-            source: text(format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"))),
-            mime_type: copy::MimeType::Specific(GNOME.into()),
-        },
-        MimeSource { source: text(uris.iter().map(|u| format!("{u}\r\n")).collect()), mime_type: copy::MimeType::Specific(URI_LIST.into()) },
         MimeSource {
             source: text(paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")),
             mime_type: copy::MimeType::Text,
         },
+        MimeSource { source: text(uris.iter().map(|u| format!("{u}\r\n")).collect()), mime_type: copy::MimeType::Specific(URI_LIST.into()) },
+        MimeSource {
+            source: text(format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"))),
+            mime_type: copy::MimeType::Specific(GNOME.into()),
+        },
     ];
+
     copy::Options::new().copy_multi(sources).map_err(|e| e.to_string())
 }
 
@@ -111,6 +114,10 @@ mod live {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let out = std::process::Command::new("wl-paste").args(["--list-types"]).output().unwrap();
         eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+        for args in [vec![], vec!["--no-newline"], vec!["--type", "text/plain"], vec!["--type", "text"]] {
+            let out = std::process::Command::new("wl-paste").args(&args).output().unwrap();
+            eprintln!("{args:?} -> {:?}", String::from_utf8_lossy(&out.stdout));
+        }
         assert_eq!(get(), Some((p, true)));
     }
 }
