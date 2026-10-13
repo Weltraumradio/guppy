@@ -217,6 +217,18 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
+/// Original paths of everything in the trash (all drives).
+pub fn trash_contents() -> Result<Vec<PathBuf>, String> {
+    let items = trash::os_limited::list().map_err(|e| e.to_string())?;
+    Ok(items.iter().map(trash::TrashItem::original_path).collect())
+}
+
+/// Permanently deletes everything in the trash.
+pub fn empty_trash() -> Result<(), String> {
+    let items = trash::os_limited::list().map_err(|e| e.to_string())?;
+    trash::os_limited::purge_all(items).map_err(|e| e.to_string())
+}
+
 /// Lies in a trash folder (`~/.local/share/Trash`, `.Trash-1000` on drives), or is one.
 pub fn in_trash(p: &Path) -> bool {
     let mut prev = None;

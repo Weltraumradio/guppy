@@ -148,6 +148,10 @@ enum Message {
     CancelJobs(bool),
     /// A file from an archive was extracted for opening (or failed).
     Opened(Result<(), String>),
+    /// Trash contents read for "Empty trash".
+    TrashListed(Result<Vec<PathBuf>, String>),
+    /// Trash emptied (or failed).
+    TrashEmptied(Result<(), String>),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
     /// computed, then exits.
     Shot(iced::window::Screenshot),
@@ -188,6 +192,8 @@ enum Dialog {
     /// Permissions and owner (Alt+Enter); `field`: 0 mode, 1 owner, 2 recursive.
     Attrs { paths: Vec<PathBuf>, mode: String, owner: String, was: (String, String), field: usize, recursive: bool, error: Option<String> },
     Report { title: &'static str, problems: Vec<String> },
+    /// Empty the trash: original paths of what's in it.
+    EmptyTrash { items: Vec<PathBuf> },
     /// Quick help listing all keys (F1); at startup with a "show again" checkbox.
     Help { startup: bool },
     /// Settings (F12): selected row, and the text being typed for path rows.
@@ -387,6 +393,7 @@ enum Cmd {
     Rename,
     Undo,
     Attrs,
+    EmptyTrash,
     Link,
     View,
     Edit,
@@ -447,6 +454,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Switch look: paper / neon", "", Cmd::Look),
     ("Settings", "F12", Cmd::Settings),
     ("Key help", "F1", Cmd::Help),
+    ("Empty trash", "", Cmd::EmptyTrash),
 ];
 
 /// Fuzzy score: every word of the query must appear in order somewhere in the
@@ -739,6 +747,8 @@ struct Guppy {
     last_move: Option<std::time::Instant>,
     /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
+    /// Tasks started where no task can be returned, run after the current message.
+    later: Vec<Task<Message>>,
     /// Git status per pane, and whether it must be read again.
     git: [Option<std::sync::Arc<guppy_core::git::Status>>; 2],
     git_stale: [bool; 2],
@@ -793,6 +803,7 @@ impl Guppy {
             width: 1200.0,
             last_move: None,
             loads: [None, None],
+            later: Vec::new(),
             git: [None, None],
             git_stale: [true, true],
             config,
@@ -928,7 +939,8 @@ impl Guppy {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         let task = self.handle(msg);
-        Task::batch([task, self.sync_quick(), self.sync_git()])
+        let later = Task::batch(std::mem::take(&mut self.later));
+        Task::batch([task, later, self.sync_quick(), self.sync_git()])
     }
 
     /// Follows the cursor: after a short rest, loads the entry for the quick view.
@@ -1279,6 +1291,20 @@ impl Guppy {
                     self.dialog = None;
                 }
             }
+            Message::TrashListed(Ok(items)) if items.is_empty() => {
+                self.dialog = Some(Dialog::Report { title: "Trash is empty", problems: Vec::new() });
+            }
+            Message::TrashListed(Ok(items)) => {
+                self.dialog = Some(Dialog::EmptyTrash { items });
+            }
+            Message::TrashListed(Err(e)) | Message::TrashEmptied(Err(e)) => {
+                self.dialog = Some(Dialog::Report { title: "Trash not emptied", problems: vec![e] });
+            }
+            Message::TrashEmptied(Ok(())) => {
+                self.jobs.last = self.jobs.last.take().filter(|(_, steps)| !steps.iter().any(|s| matches!(s, ops::Step::Trashed(_))));
+                self.reload(0);
+                self.reload(1);
+            }
             Message::Opened(Ok(())) => {}
             Message::Opened(Err(e)) => self.dialog = Some(Dialog::Report { title: "Not opened", problems: vec![e] }),
             Message::ToggleStartHelp => {
@@ -1547,6 +1573,12 @@ impl Guppy {
     fn confirm_dialog(&mut self) {
         match self.dialog.take() {
             Some(Dialog::Confirm { kind, sources, target }) => self.enqueue(kind, sources, target),
+            Some(Dialog::EmptyTrash { .. }) => {
+                self.later.push(Task::perform(
+                    smol::unblock(ops::empty_trash),
+                    Message::TrashEmptied,
+                ));
+            }
             Some(Dialog::Bookmark { path, name, edit }) => self.save_bookmark(path, name, edit),
             Some(Dialog::Mark { add, pattern }) => {
                 self.mark_pattern(add, &pattern);
@@ -2001,6 +2033,9 @@ impl Guppy {
             Cmd::Move => self.ask(OpKind::Move),
             Cmd::Trash => self.ask(OpKind::Trash),
             Cmd::Delete => self.ask(OpKind::Delete),
+            Cmd::EmptyTrash => {
+                return Task::perform(smol::unblock(ops::trash_contents), Message::TrashListed);
+            }
             Cmd::NewDir => self.new_dir(),
             Cmd::Rename => {
                 if !self.read_only() {
@@ -2627,6 +2662,17 @@ impl Guppy {
                     OpKind::Delete => "Delete",
                 };
                 c.push(buttons(ok)).into()
+            }
+            Dialog::EmptyTrash { items } => {
+                let what = if items.len() == 1 { "1 item".to_string() } else { format!("{} items", items.len()) };
+                column![
+                    title(format!("Empty trash: {what}")),
+                    names(items),
+                    text("This cannot be undone.").size(12).color(rgb(t.red)),
+                    buttons("Empty"),
+                ]
+                .spacing(14)
+                .into()
             }
             Dialog::View { path, body } => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
@@ -3740,7 +3786,8 @@ mod tests {
     fn palette_finds_commands() {
         let label = |q: &str| COMMANDS[palette_hits(q, &[])[0]].0;
         assert_eq!(label("copy"), "Copy to other pane");
-        assert_eq!(label("trash"), "Move to trash");
+        assert_eq!(label("move tr"), "Move to trash");
+        assert_eq!(label("empty"), "Empty trash");
         assert_eq!(label("hid"), "Show / hide hidden files");
         assert_eq!(label("drv r"), "Drives & bookmarks: right pane");
         assert_eq!(label("bookm"), "Bookmark this folder");
