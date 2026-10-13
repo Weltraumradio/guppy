@@ -25,5 +25,4 @@ Future ideas (not built yet):
 - Git status in the file list
 - Drag & drop to and from other apps (Wayland)
 - Startup-time / memory benchmark in the README
-- User actions in config.toml (key -> shell command with %f)
 - Nested archives, writing into archives, image preview inside archives

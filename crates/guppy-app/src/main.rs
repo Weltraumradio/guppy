@@ -11,11 +11,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::archive;
+use guppy_core::{actions, archive};
 use guppy_core::fs::{glob_match, human_date, human_size};
 use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
-use guppy_core::config::{Bookmark, Look, SortBy};
+use guppy_core::config::{Action, Bookmark, Look, SortBy};
 use guppy_core::{Cancel, Config, DirSize, DirSizes, Entry, FileClass, Jumper};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
@@ -448,8 +448,10 @@ fn fuzzy(query: &str, label: &str) -> Option<i32> {
 }
 
 /// Palette hits for `query`, best first (all commands when empty).
-fn palette_hits(query: &str) -> Vec<usize> {
-    let mut hits: Vec<(i32, usize)> = COMMANDS.iter().enumerate().filter_map(|(i, (label, _, _))| fuzzy(query, label).map(|s| (s, i))).collect();
+/// Indices past `COMMANDS` are the user's actions.
+fn palette_hits(query: &str, actions: &[Action]) -> Vec<usize> {
+    let labels = COMMANDS.iter().map(|c| c.0).chain(actions.iter().map(|a| a.name.as_str()));
+    let mut hits: Vec<(i32, usize)> = labels.enumerate().filter_map(|(i, label)| fuzzy(query, label).map(|s| (s, i))).collect();
     if !query.trim().is_empty() {
         hits.sort_by_key(|(s, i)| (std::cmp::Reverse(*s), *i));
     }
@@ -1165,9 +1167,7 @@ impl Guppy {
             Message::OpenJobs => self.dialog = Some(Dialog::Jobs),
             Message::PaletteRun(i) => {
                 self.dialog = None;
-                if let Some((_, _, cmd)) = COMMANDS.get(i) {
-                    return self.run_cmd(*cmd);
-                }
+                return self.run_palette(i);
             }
             Message::DrivePick(i) => {
                 if let Some(Dialog::Drives { cur, .. }) = &mut self.dialog {
@@ -1245,11 +1245,14 @@ impl Guppy {
         let len = if jumping { self.jump.len() } else { self.panes[self.active].visible(self.show_hidden, &self.sizes).len() };
         let page = (self.panes[self.active].view_h / ROW_H).max(1.0) as usize;
         let cur = if jumping { self.jump_cur } else { self.panes[self.active].cursor };
+        if let Some(i) = self.action_for(&key, m) {
+            self.run_action(i);
+            return Task::none();
+        }
         let mut move_to = |i: usize| {
             let i = i.min(len.saturating_sub(1));
             if jumping { self.jump_cur = i } else { self.panes[self.active].cursor = i }
         };
-
         match key.as_ref() {
             Key::Named(Named::ArrowDown) => move_to(cur + 1),
             Key::Named(Named::ArrowUp) => move_to(cur.saturating_sub(1)),
@@ -1812,16 +1815,16 @@ impl Guppy {
 
     fn on_palette_key(&mut self, key: Key, typed: Option<&str>) -> Task<Message> {
         let Some(Dialog::Palette { query, cur }) = &mut self.dialog else { return Task::none() };
-        let len = palette_hits(query).len();
+        let len = palette_hits(query, &self.config.actions).len();
         match key.as_ref() {
             Key::Named(Named::Escape) => self.dialog = None,
             Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(len.saturating_sub(1)),
             Key::Named(Named::ArrowUp) => *cur = cur.saturating_sub(1),
             Key::Named(Named::Enter) => {
-                let hit = palette_hits(query).get(*cur).copied();
+                let hit = palette_hits(query, &self.config.actions).get(*cur).copied();
                 self.dialog = None;
                 if let Some(i) = hit {
-                    return self.run_cmd(COMMANDS[i].2);
+                    return self.run_palette(i);
                 }
             }
             Key::Named(Named::Backspace) => {
@@ -1836,6 +1839,46 @@ impl Guppy {
             }
         }
         Task::none()
+    }
+
+    fn run_palette(&mut self, i: usize) -> Task<Message> {
+        match COMMANDS.get(i) {
+            Some(&(_, _, cmd)) => self.run_cmd(cmd),
+            None => {
+                self.run_action(i - COMMANDS.len());
+                Task::none()
+            }
+        }
+    }
+
+    /// The user action bound to this key press, if any.
+    fn action_for(&self, key: &Key, m: keyboard::Modifiers) -> Option<usize> {
+        let name = match key.as_ref() {
+            Key::Character(c) => c.to_lowercase(),
+            Key::Named(n) => format!("{n:?}").to_lowercase(),
+            _ => return None,
+        };
+        self.config.actions.iter().position(|a| {
+            actions::KeySpec::parse(&a.key)
+                .is_some_and(|k| k.key == name && k.ctrl == m.control() && k.alt == m.alt() && k.shift == m.shift())
+        })
+    }
+
+    /// Runs the user action `i` on the active pane.
+    fn run_action(&mut self, i: usize) {
+        let Some(a) = self.config.actions.get(i) else { return };
+        let p = &self.panes[self.active];
+        if p.archive {
+            self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Actions don't run inside archives.".into()] });
+            return;
+        }
+        let visible = p.visible(self.show_hidden, &self.sizes);
+        let file = visible.get(p.cursor).map(|e| e.path.as_path());
+        let marked: Vec<PathBuf> = visible.iter().filter(|e| p.marked.contains(&e.path)).map(|e| e.path.clone()).collect();
+        let line = actions::expand(&a.command, file, &marked, &p.path, &self.panes[1 - self.active].path);
+        if let Err(e) = actions::run(&line, &p.path, a.terminal) {
+            self.dialog = Some(Dialog::Report { title: "Action not started", problems: vec![format!("{}: {e}", a.name)] });
+        }
     }
 
     /// Runs a palette command as if its key had been pressed.
@@ -2581,7 +2624,7 @@ impl Guppy {
                 .into()
             }
             Dialog::Palette { query, cur } => {
-                let hits = palette_hits(query);
+                let hits = palette_hits(query, &self.config.actions);
                 let field = container(text(if query.is_empty() { "type a command …".to_string() } else { format!("{query}▏") }).size(13).color(if query.is_empty() { fg } else { rgb(t.bright) }))
                     .padding([8, 10])
                     .width(Length::Fill)
@@ -2595,7 +2638,13 @@ impl Guppy {
                 let first = cur.saturating_sub(SHOWN - 1);
                 let mut list = column![].spacing(2);
                 for (n, &i) in hits.iter().enumerate().skip(first).take(SHOWN) {
-                    let (label, keys, _) = COMMANDS[i];
+                    let (label, keys) = match COMMANDS.get(i) {
+                        Some(&(label, keys, _)) => (label, keys),
+                        None => {
+                            let a = &self.config.actions[i - COMMANDS.len()];
+                            (a.name.as_str(), a.key.as_str())
+                        }
+                    };
                     let on = n == *cur;
                     let color = if on { rgb(t.background) } else { rgb(t.bright) };
                     list = list.push(
@@ -3443,13 +3492,13 @@ mod tests {
 
     #[test]
     fn palette_finds_commands() {
-        let label = |q: &str| COMMANDS[palette_hits(q)[0]].0;
+        let label = |q: &str| COMMANDS[palette_hits(q, &[])[0]].0;
         assert_eq!(label("copy"), "Copy to other pane");
         assert_eq!(label("trash"), "Move to trash");
         assert_eq!(label("hid"), "Show / hide hidden files");
         assert_eq!(label("drv r"), "Drives & bookmarks: right pane");
         assert_eq!(label("bookm"), "Bookmark this folder");
-        assert!(palette_hits("zzzq").is_empty());
-        assert_eq!(palette_hits("").len(), COMMANDS.len());
+        assert!(palette_hits("zzzq", &[]).is_empty());
+        assert_eq!(palette_hits("", &[]).len(), COMMANDS.len());
     }
 }

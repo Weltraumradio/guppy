@@ -1,5 +1,6 @@
 //! Guppy core: filesystem access, directory sizes, jump targets and theme, with no GUI dependencies.
 
+pub mod actions;
 pub mod archive;
 pub mod config;
 pub mod drives;

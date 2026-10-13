@@ -17,6 +17,23 @@ pub struct Config {
     /// Folders the user keeps at hand, in their order (`[[bookmark]]`).
     #[serde(rename = "bookmark")]
     pub bookmarks: Vec<Bookmark>,
+    /// Shell commands on a key (`[[action]]`), see [`crate::actions`].
+    #[serde(rename = "action")]
+    pub actions: Vec<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Action {
+    pub name: String,
+    /// E.g. `"Ctrl+Alt+T"` or `"F9"`; empty = only in the command palette.
+    #[serde(default)]
+    pub key: String,
+    /// Run by `sh -c` in the active pane's folder; placeholders in [`crate::actions::expand`].
+    pub command: String,
+    /// Run inside a terminal window (for interactive or text-output commands).
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -102,7 +119,7 @@ pub struct Network {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default(), edit: Edit::default(), bookmarks: Vec::new() }
+        Self { start: Start::default(), view: View::default(), confirm: Confirm::default(), network: Network::default(), edit: Edit::default(), bookmarks: Vec::new(), actions: Vec::new() }
     }
 }
 
@@ -161,6 +178,17 @@ command = ""       # editor for F4, e.g. "code" or "kitty -e nvim"; "" = automat
 # [[bookmark]]
 # name = "Projects"
 # path = "~/Work/projects"
+
+# Your own commands, also in the command palette (Ctrl+P). They run in the active
+# pane's folder. %f = file under the cursor, %F = marked files (or %f),
+# %d = this folder, %D = the other pane's folder; all quoted for the shell.
+# [[action]]
+# name = "Open terminal here"
+# key = "Ctrl+Alt+T"
+# command = "xdg-terminal-exec"
+# [[action]]
+# name = "Pack as tar.gz"
+# command = "tar czf archive.tar.gz %F"
 "#;
 
 impl SortBy {
@@ -228,6 +256,12 @@ impl Config {
         for b in &self.bookmarks {
             out.push_str(&format!("\n[[bookmark]]\nname = {}\npath = {}\n", q(&b.name), q(&b.path)));
         }
+        for a in &self.actions {
+            out.push_str(&format!("\n[[action]]\nname = {}\nkey = {}\ncommand = {}\n", q(&a.name), q(&a.key), q(&a.command)));
+            if a.terminal {
+                out.push_str("terminal = true\n");
+            }
+        }
         out
     }
 
@@ -288,6 +322,7 @@ mod tests {
         assert!(toml::from_str::<Config>("[view]\nbogus = 1").is_err());
         let mut b = Config::default();
         b.bookmarks = vec![Bookmark { name: "Pro \"jekte\"".into(), path: "~/Work".into() }, Bookmark { name: "Root".into(), path: "/".into() }];
+        b.actions = vec![Action { name: "Pack".into(), key: "F9".into(), command: "tar czf a.tgz %F".into(), terminal: true }];
         assert_eq!(toml::from_str::<Config>(&b.to_toml()).unwrap(), b);
         // Round trip through the commented layout.
         let mut c = Config::default();
