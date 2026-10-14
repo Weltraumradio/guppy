@@ -1271,6 +1271,7 @@ name = "guppy-app"
 version = "0.2.0"
 dependencies = [
  "clipboard-win",
+ "dirs",
  "guppy-core",
  "iced",
  "image",

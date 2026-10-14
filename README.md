@@ -33,7 +33,7 @@ counts everything again.
 
 ### Moving around
 
-- Two panes, each with its own history (Alt+← / Alt+→)
+- Two panes, each with tabs (Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+1…9) that come back at the next start, and its own history (Alt+← / Alt+→)
 - Start typing to filter the list; `~` or `/` switches to fuzzy jumping across folders you've
   visited (and those zoxide knows about, if you use it)
 - Drives, mounted media, network shares and your bookmarks on Alt+F1 / Alt+F2; Ctrl+D

@@ -11,6 +11,7 @@ guppy-core = { version = "0.2.0", path = "../guppy-core" }
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "x11", "wayland", "svg", "canvas", "smol", "image-without-codecs"] }
 notify-debouncer-mini = "0.7.0"
 smol = "2"
+dirs = "7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wl-clipboard-rs = "0.9.4"

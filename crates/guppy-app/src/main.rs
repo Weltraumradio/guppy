@@ -93,6 +93,8 @@ fn rgb(c: u32) -> Color {
 enum Message {
     Key(keyboard::Event),
     Select(usize, usize),
+    /// Click on a tab: side, position.
+    TabClick(usize, usize),
     /// Mouse while a row is held: where it is, and the button let go.
     DragMoved(iced::Point),
     DragReleased,
@@ -410,6 +412,9 @@ fn setting_step(c: &mut Config, row: usize, dir: i32) {
 /// Everything the command palette offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cmd {
+    NewTab,
+    CloseTab,
+    NextTab,
     Copy,
     Move,
     Trash,
@@ -468,6 +473,9 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Sort: name, size, date", "Ctrl+S", Cmd::Sort),
     ("Recompute folder sizes", "Ctrl+R", Cmd::Sizes),
     ("Jump to folder", "Ctrl+G", Cmd::Jump),
+    ("New tab", "Ctrl+T", Cmd::NewTab),
+    ("Close tab", "Ctrl+W", Cmd::CloseTab),
+    ("Next tab", "Ctrl+Tab", Cmd::NextTab),
     ("Back", "Alt+←", Cmd::Back),
     ("Forward", "Alt+→", Cmd::Forward),
     ("Parent folder", "Backspace", Cmd::Parent),
@@ -538,6 +546,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Backspace", "shorten search, else folder up"),
         ("Alt+← Alt+→", "history back / forward"),
         ("Tab", "switch pane"),
+        ("Ctrl+T / W", "new / close tab"),
+        ("Ctrl+Tab", "next tab (Shift: previous)"),
+        ("Ctrl+1 … 9", "go to tab"),
     ]),
     ("Search", &[
         ("a–z …", "filter active pane"),
@@ -765,6 +776,9 @@ impl Pane {
 struct Guppy {
     theme: guppy_core::Theme,
     panes: [Pane; 2],
+    /// The other tabs of each side, in order; the shown one belongs at `tab_at`.
+    tabs: [Vec<Pane>; 2],
+    tab_at: [usize; 2],
     active: usize,
     show_hidden: bool,
     papers: [Paper; 2],
@@ -862,6 +876,8 @@ impl Guppy {
                 Pane::new(Config::resolve(&config.start.left, &cwd), "pane-left"),
                 Pane::new(Config::resolve(&config.start.right, &cwd), "pane-right"),
             ],
+            tabs: [Vec::new(), Vec::new()],
+            tab_at: [0, 0],
             active: 0,
             show_hidden: config.view.show_hidden,
             papers: [Paper::new(1), Paper::new(2)],
@@ -899,6 +915,7 @@ impl Guppy {
         };
         let sort = sort_from(g.config.view.sort);
         g.panes.iter_mut().for_each(|p| p.sort = sort);
+        g.restore_tabs();
         if let Some(e) = config_error {
             g.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
         } else if g.config.start.help && std::env::var_os("GUPPY_SCREENSHOT").is_none() {
@@ -1224,6 +1241,10 @@ impl Guppy {
             // Not while typing a name or with a dialog open (the mouse may just pass by).
             Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() && !self.quick => self.active = side,
             Message::HoverPane(_) => {}
+            Message::TabClick(side, k) => {
+                self.active = side;
+                self.switch_tab(side, k);
+            }
             Message::Select(side, i) => {
                 self.rename = None;
                 self.active = side;
@@ -1281,6 +1302,7 @@ impl Guppy {
                     job.cancel();
                 }
                 let _ = self.sizes.save();
+                self.save_tabs();
                 return iced::window::close(id);
             }
             Message::Git(side, path, st) => {
@@ -1533,7 +1555,14 @@ impl Guppy {
             // Esc first cancels a pending folder change, then the search.
             Key::Named(Named::Escape) if self.loads[self.active].is_some() => self.loads[self.active] = None,
             Key::Named(Named::Escape) => self.set_query(String::new()),
+            Key::Named(Named::Tab) if m.command() => self.step_tab(if m.shift() { -1 } else { 1 }),
             Key::Named(Named::Tab) => self.active = 1 - self.active,
+            Key::Character(c) if m.command() && !m.shift() && matches!(c.as_ref(), "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                let k = c.parse::<usize>().unwrap_or(1) - 1;
+                self.switch_tab(self.active, k);
+            }
+            Key::Character("t") if m.command() => self.new_tab(),
+            Key::Character("w") if m.command() => self.close_tab(),
             Key::Named(Named::Insert) => self.toggle_mark(),
             Key::Named(Named::Space) if query_empty => self.toggle_mark(),
             Key::Named(Named::ArrowLeft) if m.alt() => self.history(true),
@@ -2276,6 +2305,9 @@ impl Guppy {
             Cmd::Sort => self.cycle_sort(),
             Cmd::Sizes => self.recompute_sizes(),
             Cmd::Jump => self.set_query("~".into()),
+            Cmd::NewTab => self.new_tab(),
+            Cmd::CloseTab => self.close_tab(),
+            Cmd::NextTab => self.step_tab(1),
             Cmd::Back => self.history(true),
             Cmd::Forward => self.history(false),
             Cmd::Parent => self.go_parent(),
@@ -2535,6 +2567,114 @@ impl Guppy {
     }
 
     /// Re-reads the folder and keeps the cursor on its entry.
+    fn pane_id(side: usize) -> &'static str {
+        if side == 0 { "pane-left" } else { "pane-right" }
+    }
+
+    fn tab_count(&self, side: usize) -> usize {
+        self.tabs[side].len() + 1
+    }
+
+    /// Ctrl+T: a new tab next to this one, in the same folder.
+    fn new_tab(&mut self) {
+        let side = self.active;
+        let mut p = Pane::new(self.panes[side].path.clone(), Self::pane_id(side));
+        p.sort = self.panes[side].sort;
+        let old = std::mem::replace(&mut self.panes[side], p);
+        self.tabs[side].insert(self.tab_at[side], old);
+        self.tab_at[side] += 1;
+        self.loads[side] = None;
+        self.reload(side);
+    }
+
+    /// Shows tab `k` of `side`; the tab it leaves keeps its folder, cursor and history.
+    fn switch_tab(&mut self, side: usize, k: usize) {
+        if k == self.tab_at[side] || k >= self.tab_count(side) {
+            return;
+        }
+        self.loads[side] = None;
+        self.rename = None;
+        let old = std::mem::replace(&mut self.panes[side], Pane::new(PathBuf::new(), Self::pane_id(side)));
+        self.tabs[side].insert(self.tab_at[side], old);
+        self.panes[side] = self.tabs[side].remove(k);
+        self.tab_at[side] = k;
+        self.git_stale[side] = true;
+        self.reload(side);
+    }
+
+    fn step_tab(&mut self, dir: i32) {
+        let side = self.active;
+        let n = self.tab_count(side) as i32;
+        let k = (self.tab_at[side] as i32 + dir).rem_euclid(n) as usize;
+        self.switch_tab(side, k);
+    }
+
+    /// Ctrl+W: closes this tab; the last one stays.
+    fn close_tab(&mut self) {
+        let side = self.active;
+        if self.tabs[side].is_empty() {
+            return;
+        }
+        // The tab to the right takes its place, at the end the one to the left.
+        let k = self.tab_at[side].min(self.tabs[side].len() - 1);
+        self.loads[side] = None;
+        self.panes[side].sizing.cancel();
+        self.panes[side] = self.tabs[side].remove(k);
+        self.tab_at[side] = k;
+        self.git_stale[side] = true;
+        self.reload(side);
+    }
+
+    fn tabs_file() -> Option<PathBuf> {
+        dirs::state_dir().or_else(dirs::data_local_dir).map(|d| d.join("guppy/tabs"))
+    }
+
+    /// Writes the tabs as `side<TAB>shown<TAB>path` lines.
+    fn save_tabs(&self) {
+        let Some(file) = Self::tabs_file() else { return };
+        let mut out = String::new();
+        for side in 0..2 {
+            let mut list: Vec<&Pane> = self.tabs[side].iter().collect();
+            list.insert(self.tab_at[side], &self.panes[side]);
+            for (k, p) in list.iter().enumerate() {
+                out += &format!("{side}\t{}\t{}\n", u8::from(k == self.tab_at[side]), p.path.display());
+            }
+        }
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, out);
+    }
+
+    /// The shown tab of each side starts where the settings say; the other tabs
+    /// come back from last time around it (they are read when first shown).
+    fn restore_tabs(&mut self) {
+        let Some(text) = Self::tabs_file().and_then(|f| std::fs::read_to_string(f).ok()) else { return };
+        for side in 0..2 {
+            let mut list: Vec<(bool, PathBuf)> = text
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.splitn(3, '\t');
+                    let (s, shown, path) = (it.next()?, it.next()?, it.next()?);
+                    (s == side.to_string()).then(|| (shown == "1", PathBuf::from(path)))
+                })
+                .collect();
+            let Some(at) = list.iter().position(|(shown, _)| *shown) else { continue };
+            list.remove(at);
+            let sort = self.panes[side].sort;
+            self.tabs[side] = list
+                .into_iter()
+                .filter(|(_, p)| p.is_dir())
+                .map(|(_, p)| {
+                    let mut pane = Pane::new(p, Self::pane_id(side));
+                    pane.sort = sort;
+                    pane
+                })
+                .collect();
+            self.tab_at[side] = at.min(self.tabs[side].len());
+        }
+    }
+
     fn reload(&mut self, side: usize) {
         let path = self.panes[side].path.clone();
         self.load(side, path, After::Reload);
@@ -3904,9 +4044,44 @@ impl Guppy {
         let tone = if active { t.sheet } else { t.sheet_dim };
         // Neon frames both panes; paper outlines only the active one.
         let outline = if active { Some(rgb(t.accent)) } else { self.neon().then(|| rgb(t.muted)) };
-        let sheet = self.sheet(column![header, body].into(), side, tone, outline)
+        let content: Element<'_, Message> = match self.tab_bar(side, active) {
+            Some(bar) => column![bar, header, body].into(),
+            None => column![header, body].into(),
+        };
+        let sheet = self.sheet(content, side, tone, outline)
             .width(Length::FillPortion(3));
         mouse_area(sheet).on_enter(Message::HoverPane(side)).into()
+    }
+
+    /// Tabs above the pane header, only when there is more than one.
+    fn tab_bar(&self, side: usize, active: bool) -> Option<Element<'_, Message>> {
+        if self.tabs[side].is_empty() {
+            return None;
+        }
+        let t = &self.theme;
+        let mut list: Vec<&Pane> = self.tabs[side].iter().collect();
+        list.insert(self.tab_at[side], &self.panes[side]);
+        let tabs = list.into_iter().enumerate().map(|(k, p)| {
+            let shown = k == self.tab_at[side];
+            let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.path.display().to_string());
+            let color = if shown && active { rgb(t.accent) } else if shown { rgb(t.bright) } else { rgb(t.foreground) };
+            let line = if shown { color } else { Color::TRANSPARENT };
+            mouse_area(
+                container(text(name).size(12).font(if shown { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None))
+                    .padding([5, 10])
+                    .max_width(180)
+                    .clip(true)
+                    .style(move |_| container::Style {
+                        border: Border { color: line, width: 0.0, radius: 0.0.into() },
+                        background: shown.then(|| Background::Color(Color { a: 0.07, ..Color::WHITE })),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Message::TabClick(side, k))
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+        });
+        Some(container(row(tabs).spacing(2)).padding(iced::Padding { top: 6.0, left: 6.0, right: 6.0, bottom: 0.0 }).into())
     }
 
     /// Jump mode hit list, in place of the active pane's file list.
