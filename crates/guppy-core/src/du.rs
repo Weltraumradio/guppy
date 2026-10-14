@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn sums_nested() {
         let root = std::env::temp_dir().join(format!("guppy-du-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
         std::fs::write(root.join("a/x"), [0u8; 100]).unwrap();
         std::fs::write(root.join("a/b/y"), [0u8; 50]).unwrap();
         #[cfg(unix)]
@@ -323,19 +323,19 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(sizes.get(&root.join("a")), Some(DirSize::Done(150)));
-        assert_eq!(sizes.get(&root.join("a/b")), Some(DirSize::Done(50)));
+        assert_eq!(sizes.get(&root.join("a").join("b")), Some(DirSize::Done(50)));
         // Below and above the changed folder become estimates; a sibling stays.
-        std::fs::create_dir_all(root.join("a/c")).unwrap();
-        sizes.request(vec![root.join("a/c")], Cancel::default());
+        std::fs::create_dir_all(root.join("a").join("c")).unwrap();
+        sizes.request(vec![root.join("a").join("c")], Cancel::default());
         while sizes.busy() {
             std::thread::yield_now();
         }
-        sizes.invalidate(&root.join("a/b"));
+        sizes.invalidate(&root.join("a").join("b"));
         assert_eq!(sizes.get(&root.join("a")), Some(DirSize::Cached(150)));
-        assert_eq!(sizes.get(&root.join("a/b")), Some(DirSize::Cached(50)));
-        assert_eq!(sizes.get(&root.join("a/c")), Some(DirSize::Done(0)));
+        assert_eq!(sizes.get(&root.join("a").join("b")), Some(DirSize::Cached(50)));
+        assert_eq!(sizes.get(&root.join("a").join("c")), Some(DirSize::Done(0)));
         sizes.invalidate(&root);
-        assert_eq!(sizes.get(&root.join("a/c")), Some(DirSize::Cached(0)));
+        assert_eq!(sizes.get(&root.join("a").join("c")), Some(DirSize::Cached(0)));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

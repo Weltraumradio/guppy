@@ -1,7 +1,7 @@
 //! Git status of a folder's entries, read with `git status --porcelain`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// State of one entry, most important first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,9 +61,11 @@ pub fn status(dir: &Path) -> Option<Status> {
     if !out.status.success() {
         return None;
     }
-    let top = crate::platform::command("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]).output().ok()?;
-    let root = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim_end());
-    let dir = dir.canonicalize().ok()?;
+    // Where `dir` lies in the repository, e.g. `sub/` (empty at the top). Status paths
+    // are relative to the top too, so no absolute paths are compared (on Windows
+    // those differ in form: `C:/x` from git, `\\?\C:\x` from canonicalize).
+    let prefix = crate::platform::command("git").arg("-C").arg(dir).args(["rev-parse", "--show-prefix"]).output().ok()?;
+    let prefix = String::from_utf8_lossy(&prefix.stdout).trim_end_matches(['\n', '\r']).to_string();
     let mut st = Status::default();
     let mut items = out.stdout.split(|&b| b == 0);
     while let Some(item) = items.next() {
@@ -91,12 +93,14 @@ pub fn status(dir: &Path) -> Option<Status> {
         if mark != Mark::Ignored {
             st.dirty = true;
         }
-        let Ok(inside) = root.join(rel.trim_end_matches('/')).strip_prefix(&dir).map(Path::to_path_buf) else { continue };
-        let mut parts = inside.components();
-        let Some(first) = parts.next() else {
+        // The shown folder itself (or one above it) is untracked or ignored.
+        if rel.ends_with('/') && prefix.starts_with(rel) {
             st.all = Some(mark);
             continue;
-        };
+        }
+        let Some(inside) = rel.strip_prefix(prefix.as_str()) else { continue };
+        let mut parts = inside.split('/').filter(|p| !p.is_empty());
+        let Some(first) = parts.next() else { continue };
         let deeper = parts.next().is_some();
         // Something inside a subfolder: the folder only gets a hint, ignored files don't count.
         let mark = match (deeper, mark) {
@@ -104,7 +108,7 @@ pub fn status(dir: &Path) -> Option<Status> {
             (true, _) => Mark::Inside,
             (false, m) => m,
         };
-        let e = st.marks.entry(first.as_os_str().to_string_lossy().into_owned()).or_insert(mark);
+        let e = st.marks.entry(first.to_string()).or_insert(mark);
         *e = (*e).min(mark);
     }
     Some(st)

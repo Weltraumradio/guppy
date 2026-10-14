@@ -170,7 +170,8 @@ mod tests {
         assert_eq!(parse_mode("0644"), Some(0o644));
         assert!(parse_mode("9").is_none() && parse_mode("").is_none() && parse_mode("77777").is_none());
         assert_eq!(parse_owner("0:0"), Ok((Some(0), Some(0))));
-        assert_eq!(parse_owner(":root"), Ok((None, Some(0))));
+        let group0 = group_name(0).unwrap();
+        assert_eq!(parse_owner(&format!(":{group0}")), Ok((None, Some(0))));
         assert!(parse_owner("no-such-user-xyz").is_err());
 
         let root = std::env::temp_dir().join(format!("guppy-attrs-{}", std::process::id()));

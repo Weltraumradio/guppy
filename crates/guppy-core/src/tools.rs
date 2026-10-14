@@ -136,8 +136,8 @@ pub fn install(t: &Tool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn finds_sh_only_on_unix() {
-        assert_eq!(super::find("sh").is_some(), cfg!(unix));
+    fn finds_programs() {
+        assert!(super::find(if cfg!(windows) { "cmd" } else { "sh" }).is_some());
         assert!(super::find("surely-not-a-program-xyz").is_none());
     }
 }
