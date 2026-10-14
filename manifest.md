@@ -22,3 +22,4 @@ Future ideas (not built yet):
 - Multi-rename with patterns like [N]_[C].[E] and live preview
 - Drag & drop to and from other apps (Wayland)
 - Nested archives, writing into archives, image preview inside archives
+- rsync: sync folders with rsync (local and over SSH), saved sync profiles to run again, dry run with a preview of what would change, progress as a job
