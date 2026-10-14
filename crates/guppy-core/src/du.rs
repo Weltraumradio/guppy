@@ -148,6 +148,11 @@ impl DirSizes {
     }
 
     /// Is at least one computation running?
+    /// Folders still being computed.
+    pub fn pending(&self) -> usize {
+        self.inner.pending.load(Ordering::Relaxed) as usize
+    }
+
     pub fn busy(&self) -> bool {
         self.inner.pending.load(Ordering::Relaxed) > 0
     }

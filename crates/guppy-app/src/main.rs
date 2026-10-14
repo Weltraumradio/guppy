@@ -136,6 +136,8 @@ enum Message {
     QuickLoaded(PathBuf, ViewBody),
     /// Click on a palette row: run that command.
     PaletteRun(usize),
+    /// Icon bar: list the trash and ask before emptying it.
+    EmptyTrash,
     /// Click on a drive in the drive picker.
     DrivePick(usize),
     /// Answer to "target already exists".
@@ -641,6 +643,8 @@ struct Pane {
     id: Id,
     /// Located on a network drive.
     network: bool,
+    /// Total and free bytes of the drive (local folders only).
+    space: Option<(u64, u64)>,
     /// Showing the inside of an archive (read-only).
     archive: bool,
     /// Showing a folder on an rclone remote.
@@ -713,6 +717,7 @@ impl Pane {
             scroll_target: None,
             id: Id::new(id),
             network: false,
+            space: None,
             archive: false,
             remote: false,
         };
@@ -727,6 +732,7 @@ impl Pane {
         self.remote = remote::is_remote(&path);
         self.network = self.remote || guppy_core::platform::is_network(&path);
         self.archive = !self.remote && !path.is_dir();
+        self.space = if self.network || self.archive { None } else { guppy_core::drives::space(&path) };
         self.entries = entries;
         self.path = path;
         self.cursor = 0;
@@ -806,6 +812,22 @@ struct Guppy {
     last_pattern: String,
     /// Window close was requested while jobs run; the next request quits.
     close_armed: bool,
+    /// Most folders waiting for their size at once since sizes were last idle, for a progress fraction.
+    sizes_peak: usize,
+    /// A file being fetched from a remote or an archive to open it.
+    opening: Option<String>,
+    /// The trash is being read or emptied.
+    trash_busy: Option<&'static str>,
+}
+
+/// Something that takes a while, shown in the status bar.
+struct Activity {
+    label: String,
+    /// Known progress; `None` shows a moving bar.
+    frac: Option<f32>,
+    /// Paused, not responding or waiting for an answer.
+    stalled: bool,
+    on_press: Option<Message>,
 }
 
 fn sort_from(s: SortBy) -> Sort {
@@ -860,6 +882,9 @@ impl Guppy {
             quick_gen: 0,
             last_pattern: "*".into(),
             close_armed: false,
+            sizes_peak: 0,
+            opening: None,
+            trash_busy: None,
         };
         let sort = sort_from(g.config.view.sort);
         g.panes.iter_mut().for_each(|p| p.sort = sort);
@@ -961,7 +986,7 @@ impl Guppy {
         }
         // Only while sizes are computed; no idle ticking otherwise.
         let running = self.jobs.busy() || !self.jobs.problems.is_empty();
-        let loading = self.loads.iter().any(Option::is_some);
+        let loading = self.loads.iter().any(Option::is_some) || self.opening.is_some() || self.trash_busy.is_some() || self.connecting.is_some();
         if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
@@ -1082,8 +1107,13 @@ impl Guppy {
     }
 
     fn handle(&mut self, msg: Message) -> Task<Message> {
+        if matches!(msg, Message::TrashListed(_) | Message::TrashEmptied(_)) {
+            self.trash_busy = None;
+        }
         if matches!(msg, Message::Tick) {
             self.poll_jobs();
+            let pending = self.sizes.pending();
+            self.sizes_peak = if pending == 0 { 0 } else { self.sizes_peak.max(pending) };
         }
         match msg {
             // On the file list (empty search): files to / from the clipboard.
@@ -1364,6 +1394,7 @@ impl Guppy {
             Message::QueueDrop(n) => {
                 self.jobs.queue.remove(n);
             }
+            Message::EmptyTrash => return self.run_cmd(Cmd::EmptyTrash),
             Message::PaletteRun(i) => {
                 self.dialog = None;
                 return self.run_palette(i);
@@ -1442,8 +1473,11 @@ impl Guppy {
                 self.remotes_asked = false;
                 guppy_core::drives::prefetch_remotes();
             }
-            Message::Opened(Ok(())) => {}
-            Message::Opened(Err(e)) => self.dialog = Some(Dialog::Report { title: "Not opened", problems: vec![e] }),
+            Message::Opened(Ok(())) => self.opening = None,
+            Message::Opened(Err(e)) => {
+                self.opening = None;
+                self.dialog = Some(Dialog::Report { title: "Not opened", problems: vec![e] });
+            }
             Message::ToggleStartHelp => {
                 let mut new = self.config.clone();
                 new.start.help = !new.start.help;
@@ -1730,6 +1764,7 @@ impl Guppy {
         match self.dialog.take() {
             Some(Dialog::Confirm { kind, sources, target }) => self.enqueue(kind, sources, target),
             Some(Dialog::EmptyTrash { .. }) => {
+                self.trash_busy = Some("Emptying trash");
                 self.later.push(Task::perform(
                     smol::unblock(ops::empty_trash),
                     Message::TrashEmptied,
@@ -2195,6 +2230,7 @@ impl Guppy {
             Cmd::Trash => self.ask(OpKind::Trash),
             Cmd::Delete => self.ask(OpKind::Delete),
             Cmd::EmptyTrash => {
+                self.trash_busy = Some("Reading trash");
                 return Task::perform(smol::unblock(ops::trash_contents), Message::TrashListed);
             }
             Cmd::NewDir => self.new_dir(),
@@ -2680,8 +2716,10 @@ impl Guppy {
         if e.is_dir() || (!e.is_virtual() && guppy_core::archive::is_archive_name(&e.name)) {
             self.navigate(path);
         } else if e.remote {
+            self.opening = Some(e.name.clone());
             return Task::perform(smol::unblock(move || open_from_remote(&path)), Message::Opened);
         } else if e.in_archive {
+            self.opening = Some(e.name.clone());
             return Task::perform(smol::unblock(move || open_from_archive(&path)), Message::Opened);
         } else {
             let _ = guppy_core::platform::open(&path);
@@ -3535,9 +3573,12 @@ impl Guppy {
             self.icon_button(icons::COPY, "Copy (F5)", Some(Message::Op(OpKind::Copy))),
             self.icon_button(icons::MOVE, "Move (F6)", Some(Message::Op(OpKind::Move))),
             self.icon_button(icons::DELETE, "Trash (F8 · Del), permanently with Shift", Some(Message::Op(OpKind::Trash))),
+            self.icon_button(icons::EMPTY_TRASH, "Empty trash (asks first)", Some(Message::EmptyTrash)),
             sep(),
             self.icon_button(icons::MARK, "Mark (Ins)", Some(Message::ToggleMark)),
             self.icon_button(icons::SWAP, "Switch side (Tab)", Some(Message::SwitchSide)),
+            iced::widget::Space::new().width(Length::Fill),
+            self.search_field(),
             iced::widget::Space::new().width(Length::Fill),
             self.icon_button(icons::HIDDEN, "Hidden files (Ctrl H)", Some(Message::ToggleHidden)),
             self.icon_button(icons::SETTINGS, "Settings (F12)", Some(Message::OpenSettings)),
@@ -3868,31 +3909,16 @@ impl Guppy {
         })
     }
 
-    fn statusbar(&self) -> Element<'_, Message> {
+    /// The search field, shown in the icon bar.
+    fn search_field(&self) -> Element<'_, Message> {
         let t = &self.theme;
         let p = &self.panes[self.active];
-        let visible = p.visible(self.show_hidden, &self.sizes);
-        let count = visible.len();
-        let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
-        // Total of visible entries, once all folder sizes are known.
-        let total = visible.iter().try_fold(0u64, |acc, e| match (e.is_dir() && !e.is_virtual(), self.sizes.get(&e.path)) {
-            (false, _) => Some(acc + e.size),
-            (true, Some(DirSize::Done(n))) => Some(acc + n),
-            _ => None,
-        });
-        let cur = self.current().map(|e| {
-            if e.is_dir() { e.name.clone() } else { format!("{} · {}", e.name, human_size(e.size)) }
-        }).unwrap_or_default();
-        let marked = p.marked.len();
         let dim = rgb(t.light_foreground);
-        let bar_sep = || text("│").color(rgb(t.muted)).size(12);
-
         let search_icon = svg(svg::Handle::from_memory(icons::SEARCH.as_bytes()))
             .width(15)
             .height(15)
             .style(move |_, _| svg::Style { color: Some(dim) });
-        let jumping = self.jumping();
-        let (mode, mode_color) = if jumping { ("JUMP", rgb(t.accent)) } else { ("FILTER", dim) };
+        let (mode, mode_color) = if self.jumping() { ("JUMP", rgb(t.accent)) } else { ("FILTER", dim) };
         let query: Element<'_, Message> = if p.query.is_empty() {
             text("type to filter · ~ to jump").size(12).color(if self.neon() { rgb(t.light_foreground) } else { rgb(0x555555) }).wrapping(iced::widget::text::Wrapping::None).into()
         } else {
@@ -3902,73 +3928,219 @@ impl Guppy {
             .spacing(10)
             .align_y(iced::Alignment::Center)
             .width(Length::Fill);
-        let search = container(row![search_icon, input].spacing(8).align_y(iced::Alignment::Center))
-            .width(300)
+        let active = !p.query.is_empty();
+        container(row![search_icon, input].spacing(8).align_y(iced::Alignment::Center))
+            .width(Length::Fixed(if self.width < 900.0 { 220.0 } else { 340.0 }))
             .padding([6, 10])
             .style(move |_| container::Style {
                 background: Some(if self.neon() { rgb(t.sheet) } else { rgb(0x1a1a1a) }.into()),
-                border: if self.neon() { Border { color: rgb(t.muted), width: 1.0, radius: 0.0.into() } } else { Border::default().rounded(6) },
+                border: Border {
+                    color: if active { rgb(t.accent) } else if self.neon() { rgb(t.muted) } else { Color::TRANSPARENT },
+                    width: 1.0,
+                    radius: if self.neon() { 0.0.into() } else { 6.0.into() },
+                },
                 ..Default::default()
+            })
+            .into()
+    }
+
+    /// Everything that is busy right now, most important first.
+    fn activities(&self) -> Vec<Activity> {
+        let mut out = Vec::new();
+        if let Some((kind, job, _)) = &self.jobs.running {
+            let p = job.progress();
+            let verb = match kind {
+                _ if self.jobs.undoing => "Undoing",
+                OpKind::Copy => "Copying",
+                OpKind::Move => "Moving",
+                OpKind::Trash => "Trashing",
+                OpKind::Delete => "Deleting",
+            };
+            let count = self.jobs.started + self.jobs.queue.len();
+            let of = if count > 1 { format!(" · {} of {count}", self.jobs.started) } else { String::new() };
+            let (state, stalled) = if job.conflict().is_some() {
+                (" · waiting for you".to_string(), true)
+            } else if job.paused() {
+                (" · paused".to_string(), true)
+            } else if p.current.is_empty() {
+                (String::new(), false)
+            } else {
+                (format!(" · {}", p.current), false)
+            };
+            out.push(Activity {
+                label: format!("{verb}{of}{state}"),
+                frac: (p.total > 0).then(|| (p.done as f32 / p.total as f32).min(1.0)),
+                stalled,
+                on_press: Some(Message::OpenJobs),
             });
-
-        // Running jobs: a small clickable progress readout.
-        let jobs: Element<'_, Message> = match &self.jobs.running {
-            Some((kind, job, _)) => {
-                let p = job.progress();
-                let pct = (p.done * 100).checked_div(p.total).unwrap_or(0).min(100);
-                let verb = match kind {
-                    _ if self.jobs.undoing => "Undoing",
-                    OpKind::Copy => "Copying",
-                    OpKind::Move => "Moving",
-                    OpKind::Trash => "Trashing",
-                    OpKind::Delete => "Deleting",
-                };
-                let count = self.jobs.started + self.jobs.queue.len();
-                let of = if count > 1 { format!(" · {} of {count}", self.jobs.started) } else { String::new() };
-                let waiting = if job.conflict().is_some() {
-                    " · waiting for you"
-                } else if job.paused() {
-                    " · paused"
-                } else {
-                    ""
-                };
-                mouse_area(text(format!("{verb} {pct}%{of}{waiting}")).size(12).color(rgb(t.accent)).wrapping(iced::widget::text::Wrapping::None))
-                    .on_press(Message::OpenJobs)
-                    .interaction(iced::mouse::Interaction::Pointer)
-                    .into()
+        }
+        if let Some(name) = &self.opening {
+            out.push(Activity { label: format!("Fetching {name}"), frac: None, stalled: false, on_press: None });
+        }
+        if let Some(what) = self.trash_busy {
+            out.push(Activity { label: what.into(), frac: None, stalled: false, on_press: None });
+        }
+        if self.connecting.is_some() {
+            out.push(Activity { label: "Waiting for the login in the browser".into(), frac: None, stalled: false, on_press: None });
+        }
+        for l in self.loads.iter().flatten() {
+            let name = l.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.jumper.display(&l.path));
+            // Short reads stay invisible, so local folders don't flicker.
+            if l.since.elapsed() < Duration::from_millis(300) {
+                continue;
             }
-            None => iced::widget::Space::new().width(0).into(),
-        };
-        let bar = row![
-            search,
-            jobs,
-            iced::widget::Space::new().width(Length::Fill),
-            text(cur).size(12).color(rgb(t.foreground)).wrapping(iced::widget::text::Wrapping::None),
-            bar_sep(),
-            text(format!("{count} items")).size(12).color(dim),
-            bar_sep(),
-            text(match total {
-                Some(n) => format!("Σ {}", human_size(n)),
-                None => "Σ …".into(),
-            })
-            .size(12)
-            .color(dim),
-            bar_sep(),
-            text(match (marked, hidden_marked) {
-                (0, _) => "nothing marked".into(),
-                (m, 0) => format!("{m} marked"),
-                (m, h) => format!("{m} marked ({h} hidden)"),
-            })
-                .size(12)
-                .color(if marked > 0 { rgb(t.marked) } else { dim }),
-        ]
-        .spacing(14)
-        .align_y(iced::Alignment::Center);
+            let slow = l.since.elapsed() >= LOAD_SLOW;
+            out.push(Activity {
+                label: if slow { format!("{name} not responding · Esc") } else { format!("Reading {name}") },
+                frac: None,
+                stalled: slow,
+                on_press: None,
+            });
+        }
+        let pending = self.sizes.pending();
+        if pending > 0 {
+            let peak = self.sizes_peak.max(pending);
+            out.push(Activity {
+                label: format!("Folder sizes · {pending} left"),
+                frac: (peak > 1).then(|| 1.0 - pending as f32 / peak as f32),
+                stalled: false,
+                on_press: None,
+            });
+        }
+        if self.jump_pending {
+            out.push(Activity { label: "Indexing folders".into(), frac: None, stalled: false, on_press: None });
+        }
+        out
+    }
 
+    /// A tiny bar: filled to `frac`, or a segment sliding back and forth.
+    fn mini_bar(&self, frac: Option<f32>, color: Color) -> Element<'_, Message> {
+        let t = &self.theme;
+        const W: f32 = 64.0;
+        let radius = if self.neon() { 0.0 } else { 2.0 };
+        let fill = move |w: f32, c: Color| {
+            container(iced::widget::Space::new().width(w).height(4)).style(move |_| container::Style {
+                background: Some(c.into()),
+                border: Border::default().rounded(radius),
+                ..Default::default()
+            })
+        };
+        let (offset, width) = match frac {
+            Some(f) => (0.0, (W * f).max(2.0)),
+            None => {
+                // Triangle wave over 1.6 s.
+                let s = START.get().map_or(0.0, |s| s.elapsed().as_secs_f32()) / 0.8;
+                let phase = if (s as u32) % 2 == 0 { s.fract() } else { 1.0 - s.fract() };
+                (phase * (W - 18.0), 18.0)
+            }
+        };
+        container(row![iced::widget::Space::new().width(offset), fill(width, color)])
+            .width(W)
+            .height(4)
+            .style(move |_| container::Style {
+                background: Some(Color { a: 0.35, ..rgb(t.muted) }.into()),
+                border: Border::default().rounded(radius),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn statusbar(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        let p = &self.panes[self.active];
+        let visible = p.visible(self.show_hidden, &self.sizes);
+        let dirs = visible.iter().filter(|e| e.is_dir()).count();
+        let files = visible.len() - dirs;
+        let hidden_marked = p.marked.iter().filter(|m| !visible.iter().any(|e| &e.path == *m)).count();
+        let size_of = |e: &Entry| match (e.is_dir() && !e.is_virtual(), self.sizes.get(&e.path)) {
+            (false, _) => Some(e.size),
+            (true, Some(DirSize::Done(n))) => Some(n),
+            _ => None,
+        };
+        // Total of visible entries, once all folder sizes are known.
+        let total = visible.iter().try_fold(0u64, |acc, e| size_of(e).map(|n| acc + n));
+        let marked = p.marked.len();
+        let marked_size = visible.iter().filter(|e| p.marked.contains(&e.path)).try_fold(0u64, |acc, e| size_of(e).map(|n| acc + n));
+        let dim = rgb(t.light_foreground);
+        let label = |s: String, c: Color| text(s).size(12).color(c).wrapping(iced::widget::text::Wrapping::None);
+        let key = |s: &'static str| text(s).size(10).font(BOLD).color(dim);
+        let sep = || {
+            container(iced::widget::Space::new().width(1).height(14)).style(move |_| container::Style {
+                background: Some(rgb(t.selection).into()),
+                ..Default::default()
+            })
+        };
+        let narrow = self.width < 1100.0;
+
+        // Left: what is busy, each with its bar; more than two collapse into "+n".
+        let acts = self.activities();
+        let mut left = row![].spacing(18).align_y(iced::Alignment::Center);
+        for a in acts.iter().take(if narrow { 1 } else { 2 }) {
+            let color = if a.stalled { rgb(t.red) } else { rgb(t.accent) };
+            let pct = a.frac.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or_default();
+            let mut name = a.label.clone();
+            if name.chars().count() > 46 {
+                name = name.chars().take(45).collect::<String>() + "…";
+            }
+            let chip = row![self.mini_bar(a.frac, color), label(pct, color), label(name, rgb(t.foreground))]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+            left = left.push(match &a.on_press {
+                Some(m) => Element::from(mouse_area(chip).on_press(m.clone()).interaction(iced::mouse::Interaction::Pointer)),
+                None => chip.into(),
+            });
+        }
+        let shown = if narrow { 1 } else { 2 };
+        if acts.len() > shown {
+            left = left.push(label(format!("+{}", acts.len() - shown), dim));
+        }
+        if acts.is_empty() {
+            left = left.push(label("Ready".into(), rgb(t.muted)));
+        }
+
+        // Right: the entry under the cursor, then the folder, the marks and the drive.
+        let mut right = row![].spacing(12).align_y(iced::Alignment::Center);
+        if let Some(e) = self.current() {
+            let mut info = Vec::new();
+            if let Some(n) = size_of(e).filter(|_| !(e.remote && e.is_dir())) {
+                info.push(human_size(n));
+            }
+            if !narrow && let Some(m) = e.modified {
+                info.push(human_date(m));
+            }
+            let mut name = if e.is_dir() { format!("{}/", e.name) } else { e.name.clone() };
+            if name.chars().count() > 36 {
+                name = name.chars().take(35).collect::<String>() + "…";
+            }
+            right = right.push(label(name, rgb(t.bright)));
+            if !info.is_empty() {
+                right = right.push(label(info.join(" · "), dim));
+            }
+            right = right.push(sep());
+        }
+        right = right.push(row![label(format!("{dirs}"), rgb(t.foreground)), key("DIRS"), label(format!("{files}"), rgb(t.foreground)), key("FILES")].spacing(5).align_y(iced::Alignment::Center));
+        right = right.push(label(match total {
+            Some(n) => format!("Σ {}", human_size(n)),
+            None => "Σ …".into(),
+        }, dim));
+        if marked > 0 {
+            let size = marked_size.map(|n| format!(" · {}", human_size(n))).unwrap_or_default();
+            let hidden = if hidden_marked > 0 { format!(" ({hidden_marked} hidden)") } else { String::new() };
+            right = right.push(sep());
+            right = right.push(label(format!("● {marked} marked{size}{hidden}"), rgb(t.marked)));
+        }
+        if let Some((all, free)) = p.space.filter(|(all, _)| *all > 0) {
+            let used = 1.0 - free as f32 / all as f32;
+            let color = if used > 0.9 { rgb(t.red) } else { dim };
+            right = right.push(sep());
+            right = right.push(row![self.mini_bar(Some(used), color), label(format!("{} free of {}", human_size(free), human_size(all)), dim)].spacing(8).align_y(iced::Alignment::Center));
+        }
+
+        let bar = row![left, iced::widget::Space::new().width(Length::Fill), right].spacing(14).align_y(iced::Alignment::Center);
         container(bar)
-            .padding([0, 14])
-            .height(42)
-            .center_y(42)
+            .padding([0, 16])
+            .height(34)
+            .center_y(34)
             .width(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(rgb(t.dark_background).into()),

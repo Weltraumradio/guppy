@@ -76,8 +76,9 @@ fn drive(path: PathBuf, label: String, fs: String, network: bool) -> Drive {
     Drive { path, label, fs, network, space }
 }
 
+/// Total and free bytes of the filesystem holding `path`.
 #[cfg(unix)]
-fn space(path: &Path) -> Option<(u64, u64)> {
+pub fn space(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -90,7 +91,7 @@ fn space(path: &Path) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(unix))]
-fn space(_: &Path) -> Option<(u64, u64)> {
+pub fn space(_: &Path) -> Option<(u64, u64)> {
     None
 }
 
