@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Build
+        run: cargo build --release
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir guppy-${{ github.ref_name }}-${{ matrix.name }}
+          cp target/release/guppy-app README.md LICENSE guppy-${{ github.ref_name }}-${{ matrix.name }}/
+          tar czf guppy-${{ github.ref_name }}-${{ matrix.name }}.tar.gz guppy-${{ github.ref_name }}-${{ matrix.name }}
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $d = "guppy-${{ github.ref_name }}-${{ matrix.name }}"
+          New-Item -ItemType Directory $d | Out-Null
+          Copy-Item target/release/guppy-app.exe, README.md, LICENSE $d
+          Compress-Archive $d "$d.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: guppy-${{ github.ref_name }}-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: guppy-*
+          body: |
+            One binary per system, unpack and run `guppy-app`.
+
+            - **Linux:** needs a Vulkan or OpenGL driver (Mesa is enough).
+            - **macOS (Apple Silicon):** the binary isn't signed. After unpacking run
+              `xattr -d com.apple.quarantine guppy-app` once, or right-click → Open.
+            - **Windows:** SmartScreen may warn because the exe isn't signed; "More info" → "Run anyway".
+
+            Optional helper programs (PDF/video preview, 7z …) can be installed from
+            Settings (F12) → Helper programs.
