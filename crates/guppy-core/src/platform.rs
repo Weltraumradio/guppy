@@ -43,18 +43,50 @@ pub fn is_hidden(name: &str, m: Option<&Metadata>) -> bool {
     name.starts_with('.') || m.is_some_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
 }
 
+/// A helper program to run. On Windows it gets no console window of its own
+/// (which would flash up on every git status or preview).
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
+/// Apps started from Finder or the Dock get a bare `PATH` without Homebrew,
+/// so zoxide, ffmpeg, poppler … wouldn't be found. Call first thing in main.
+pub fn extend_path() {
+    #[cfg(target_os = "macos")]
+    {
+        let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"] {
+            if !dirs.iter().any(|d| d == Path::new(extra)) && Path::new(extra).is_dir() {
+                dirs.push(extra.into());
+            }
+        }
+        if let Ok(p) = std::env::join_paths(dirs) {
+            // SAFETY: called first thing in main, before any other thread exists.
+            unsafe { std::env::set_var("PATH", p) };
+        }
+    }
+}
+
 /// Opens a file with the system's default application.
 pub fn open(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    let mut cmd = std::process::Command::new("open");
+    let mut cmd = command("open");
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
+        let mut c = command("cmd");
         c.args(["/C", "start", ""]);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = std::process::Command::new("xdg-open");
+    let mut cmd = command("xdg-open");
     cmd.arg(path).spawn().map(|_| ())
 }
 
@@ -62,11 +94,10 @@ pub fn open(path: &Path) -> io::Result<()> {
 /// Omarchy's editor launcher, `$VISUAL`, `$EDITOR` in a terminal, then the
 /// system default application.
 pub fn edit(path: &Path, command: &str) -> io::Result<()> {
-    use std::process::Command;
     let spawn = |line: &str| -> io::Result<()> {
         let mut parts = line.split_whitespace();
         let program = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty editor command"))?;
-        Command::new(program).args(parts).arg(path).spawn().map(|_| ())
+        self::command(program).args(parts).arg(path).spawn().map(|_| ())
     };
     if !command.trim().is_empty() {
         return spawn(command);
@@ -89,7 +120,7 @@ pub fn edit(path: &Path, command: &str) -> io::Result<()> {
         }
     }
     #[cfg(target_os = "macos")]
-    if Command::new("open").arg("-t").arg(path).spawn().is_ok() {
+    if self::command("open").arg("-t").arg(path).spawn().is_ok() {
         return Ok(());
     }
     open(path)

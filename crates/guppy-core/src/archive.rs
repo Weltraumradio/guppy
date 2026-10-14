@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -72,7 +72,7 @@ fn listing(archive: &Path) -> io::Result<Arc<Listing>> {
     {
         return Ok(l.clone());
     }
-    let out = Command::new(BSDTAR)
+    let out = crate::platform::command(BSDTAR)
         .env("LC_ALL", "C")
         .args(["-tv", "--numeric-owner", "-f"])
         .arg(archive)
@@ -223,7 +223,7 @@ fn pattern(l: &Listing, inner: &Path) -> String {
 pub fn extract(archive: &Path, members: &[PathBuf], dir: &Path, mut on_file: impl FnMut(&str, u64) -> bool) -> io::Result<()> {
     let l = listing(archive)?;
     let sizes: HashMap<String, u64> = l.members.iter().map(|m| (m.path.to_string_lossy().into_owned(), m.size)).collect();
-    let mut child = Command::new(BSDTAR)
+    let mut child = crate::platform::command(BSDTAR)
         .env("LC_ALL", "C")
         .args(["-xv", "--no-same-owner", "-f"])
         .arg(archive)
@@ -262,7 +262,7 @@ pub fn extract(archive: &Path, members: &[PathBuf], dir: &Path, mut on_file: imp
 /// Reads up to `max` bytes of one member, for the viewer.
 pub fn read_member(archive: &Path, inner: &Path, max: usize) -> io::Result<Vec<u8>> {
     let l = listing(archive)?;
-    let mut child = Command::new(BSDTAR)
+    let mut child = crate::platform::command(BSDTAR)
         .args(["-xOf"])
         .arg(archive)
         .arg("--")
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn browse_and_extract() {
-        if Command::new(BSDTAR).arg("--version").output().is_err() {
+        if crate::platform::command(BSDTAR).arg("--version").output().is_err() {
             return;
         }
         let root = std::env::temp_dir().join(format!("guppy-arch-{}", std::process::id()));
@@ -329,7 +329,7 @@ mod tests {
         std::fs::write(src.join("top.txt"), "x").unwrap();
         let zip = root.join("t.zip");
         // No explicit folder entries: folders are implied by member paths.
-        let ok = Command::new(BSDTAR).args(["--format", "zip", "-cf"]).arg(&zip).arg("-C").arg(&src).args(["d/e/f.txt", "top.txt"]).status().unwrap();
+        let ok = crate::platform::command(BSDTAR).args(["--format", "zip", "-cf"]).arg(&zip).arg("-C").arg(&src).args(["d/e/f.txt", "top.txt"]).status().unwrap();
         assert!(ok.success());
 
         let rootlist = read_path(&zip).unwrap();

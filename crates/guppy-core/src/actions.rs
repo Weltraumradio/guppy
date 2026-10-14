@@ -45,11 +45,11 @@ fn quote(p: &Path) -> String {
 /// Starts `line` with `sh -c` (Windows: `cmd /C`) in `cwd`, without waiting. In a
 /// terminal the window stays open until a key is pressed, so output can be read.
 pub fn run(line: &str, cwd: &Path, terminal: bool) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     #[cfg(windows)]
     let mut cmd = {
         use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd");
+        let mut c = crate::platform::command("cmd");
         // Passed as written: cmd has its own quoting rules.
         if terminal {
             c.raw_arg(format!("/C start \"\" cmd /K {line}"));
@@ -63,21 +63,21 @@ pub fn run(line: &str, cwd: &Path, terminal: bool) -> std::io::Result<()> {
     let mut cmd = if terminal {
         let script = format!("cd {} && {line}", quote(cwd));
         let script = script.replace('\\', "\\\\").replace('"', "\\\"");
-        let mut c = Command::new("osascript");
+        let mut c = crate::platform::command("osascript");
         c.args(["-e", &format!("tell application \"Terminal\"\nactivate\ndo script \"{script}\"\nend tell")]);
         c
     } else {
-        let mut c = Command::new("sh");
+        let mut c = crate::platform::command("sh");
         c.args(["-c", line]).stdin(Stdio::null());
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = if terminal {
-        let mut c = Command::new("xdg-terminal-exec");
+        let mut c = crate::platform::command("xdg-terminal-exec");
         c.args(["sh", "-c", &format!("{line}\nprintf '\\n[done, press Enter]'; read _")]);
         c
     } else {
-        let mut c = Command::new("sh");
+        let mut c = crate::platform::command("sh");
         c.args(["-c", line]).stdin(Stdio::null());
         c
     };

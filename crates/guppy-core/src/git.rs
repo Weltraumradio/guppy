@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// State of one entry, most important first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,7 +51,7 @@ impl Status {
 /// Reads the status for `dir`; `None` outside a repository or without git.
 /// Slow on huge repositories, so call it off the UI thread.
 pub fn status(dir: &Path) -> Option<Status> {
-    let out = Command::new("git")
+    let out = crate::platform::command("git")
         .arg("-C")
         .arg(dir)
         .args(["status", "--porcelain=v1", "-z", "--branch", "--ignored=matching", "--untracked-files=normal", "."])
@@ -62,7 +61,7 @@ pub fn status(dir: &Path) -> Option<Status> {
     if !out.status.success() {
         return None;
     }
-    let top = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]).output().ok()?;
+    let top = crate::platform::command("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]).output().ok()?;
     let root = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim_end());
     let dir = dir.canonicalize().ok()?;
     let mut st = Status::default();
@@ -148,7 +147,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("guppy-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let git = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        let git = |args: &[&str]| assert!(crate::platform::command("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
         git(&["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "1").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();

@@ -1,3 +1,6 @@
+// Release builds on Windows open no console window next to the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod clip;
 mod icons;
 mod paper;
@@ -42,6 +45,7 @@ static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new
 
 fn main() -> iced::Result {
     START.get_or_init(std::time::Instant::now);
+    guppy_core::platform::extend_path();
     prefer_vulkan();
     iced::application(Guppy::new, Guppy::update, Guppy::view)
         .title(Guppy::title)

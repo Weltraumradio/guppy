@@ -213,7 +213,7 @@ impl Jumper {
 }
 
 fn load_zoxide() -> HashMap<PathBuf, f64> {
-    let Ok(out) = std::process::Command::new("zoxide").args(["query", "--list", "--score"]).output() else {
+    let Ok(out) = crate::platform::command("zoxide").args(["query", "--list", "--score"]).output() else {
         return HashMap::new();
     };
     String::from_utf8_lossy(&out.stdout)

@@ -6,6 +6,8 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use guppy_core::platform::command;
+
 use guppy_core::archive;
 use guppy_core::fs::{human_size, Entry};
 use iced::widget::image::Handle;
@@ -164,14 +166,14 @@ fn picture(png: Vec<u8>, caption: String) -> ViewBody {
 
 /// First page as a picture (poppler), else its text.
 fn pdf(path: &Path) -> ViewBody {
-    let pages = run(Command::new("pdfinfo").arg(path))
+    let pages = run(command("pdfinfo").arg(path))
         .and_then(|o| String::from_utf8_lossy(&o).lines().find_map(|l| l.strip_prefix("Pages:").map(|n| n.trim().to_string())))
         .map(|n| format!("{n} pages"))
         .unwrap_or_default();
     // pdftoppm can't write to stdout: render into a temporary file.
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!("guppy-pdf-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-    let rendered = Command::new("pdftoppm")
+    let rendered = command("pdftoppm")
         .args(["-png", "-r", "90", "-f", "1", "-l", "1", "-singlefile"])
         .arg(path)
         .arg(&root)
@@ -185,7 +187,7 @@ fn pdf(path: &Path) -> ViewBody {
     if let Some(png) = image {
         return picture(png, format!("Page 1 · {pages}"));
     }
-    match run(Command::new("pdftotext").args(["-l", "3", "-layout"]).arg(path).arg("-")) {
+    match run(command("pdftotext").args(["-l", "3", "-layout"]).arg(path).arg("-")) {
         Some(t) if !String::from_utf8_lossy(&t).trim().is_empty() => ViewBody::Text { text: String::from_utf8_lossy(&t).replace('\u{c}', "\n"), truncated: false },
         _ => ViewBody::Other("PDF · install poppler for a preview".into()),
     }
@@ -193,7 +195,7 @@ fn pdf(path: &Path) -> ViewBody {
 
 /// Duration, resolution and codecs as one line, from ffprobe.
 fn media_info(path: &Path) -> Option<(String, Vec<(String, String)>)> {
-    let out = run(Command::new("ffprobe").args(["-v", "quiet", "-show_entries", "format=duration,bit_rate:format_tags:stream=codec_type,codec_name,width,height,sample_rate,channels", "-of", "default=nw=1"]).arg(path))?;
+    let out = run(command("ffprobe").args(["-v", "quiet", "-show_entries", "format=duration,bit_rate:format_tags:stream=codec_type,codec_name,width,height,sample_rate,channels", "-of", "default=nw=1"]).arg(path))?;
     let text = String::from_utf8_lossy(&out).into_owned();
     let mut parts = Vec::new();
     let mut tags = Vec::new();
@@ -235,8 +237,8 @@ fn media_info(path: &Path) -> Option<(String, Vec<(String, String)>)> {
 /// A frame from about 10 % in, plus duration and resolution.
 fn video(path: &Path) -> ViewBody {
     let info = media_info(path).map(|(i, _)| i).unwrap_or_default();
-    let frame = run(Command::new("ffmpegthumbnailer").args(["-s", "640", "-c", "png", "-t", "10%", "-i"]).arg(path).args(["-o", "-"]))
-        .or_else(|| run(Command::new("ffmpeg").args(["-v", "quiet", "-ss", "3", "-i"]).arg(path).args(["-frames:v", "1", "-vf", "scale=640:-1", "-f", "image2pipe", "-c:v", "png", "-"])));
+    let frame = run(command("ffmpegthumbnailer").args(["-s", "640", "-c", "png", "-t", "10%", "-i"]).arg(path).args(["-o", "-"]))
+        .or_else(|| run(command("ffmpeg").args(["-v", "quiet", "-ss", "3", "-i"]).arg(path).args(["-frames:v", "1", "-vf", "scale=640:-1", "-f", "image2pipe", "-c:v", "png", "-"])));
     match frame {
         Some(png) => picture(png, info),
         None if info.is_empty() => ViewBody::Other("Video · install ffmpeg for a preview".into()),
@@ -252,7 +254,7 @@ fn audio(path: &Path) -> ViewBody {
     let mut lines: Vec<String> = tags.iter().map(|(k, v)| format!("{k:<13} {v}")).collect();
     lines.push(String::new());
     lines.push(info.clone());
-    let cover = run(Command::new("ffmpeg").args(["-v", "quiet", "-i"]).arg(path).args(["-an", "-frames:v", "1", "-vf", "scale=480:-1", "-f", "image2pipe", "-c:v", "png", "-"]));
+    let cover = run(command("ffmpeg").args(["-v", "quiet", "-i"]).arg(path).args(["-an", "-frames:v", "1", "-vf", "scale=480:-1", "-f", "image2pipe", "-c:v", "png", "-"]));
     match cover {
         Some(png) => picture(png, lines.into_iter().filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")),
         None => ViewBody::Text { text: lines.join("\n"), truncated: false },
@@ -263,7 +265,7 @@ fn audio(path: &Path) -> ViewBody {
 fn converted(path: &Path) -> ViewBody {
     let mut src = path.as_os_str().to_owned();
     src.push("[0]");
-    match run(Command::new("magick").arg(src).args(["-resize", "1600x1600>", "png:-"])) {
+    match run(command("magick").arg(src).args(["-resize", "1600x1600>", "png:-"])) {
         Some(png) => picture(png, String::new()),
         None => ViewBody::Other("Image · install ImageMagick for a preview".into()),
     }

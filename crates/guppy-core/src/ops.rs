@@ -285,7 +285,7 @@ fn trash_one(src: &Path) -> Result<(), String> {
 /// Runs AppleScript in Finder (macOS guards ~/.Trash, Finder may read it).
 #[cfg(target_os = "macos")]
 fn finder(script: &str) -> Result<String, String> {
-    let out = std::process::Command::new("osascript").args(["-e", script]).output().map_err(|e| e.to_string())?;
+    let out = crate::platform::command("osascript").args(["-e", script]).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }

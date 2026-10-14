@@ -25,7 +25,7 @@ only tested on Linux so far. Differences there:
   (the `w` bits); there is no owner. User actions run with `cmd /C`, placeholders are quoted
   with `"`. Creating symlinks needs developer mode or admin rights.
 - **Both:** previews of PDF, video and other image formats need the same tools as on Linux
-  (poppler, ffmpeg, ImageMagick) in `PATH`; colors fall back to Matte Black (no Omarchy theme).
+  (poppler, ffmpeg, ImageMagick) in `PATH` (on macOS Homebrew’s folders are searched too); colors fall back to Matte Black (no Omarchy theme).
 
 ## Benchmark
 
