@@ -11,7 +11,6 @@ pub mod git;
 pub mod jump;
 pub mod ops;
 pub mod platform;
-pub mod remote;
 pub mod theme;
 
 pub use config::Config;

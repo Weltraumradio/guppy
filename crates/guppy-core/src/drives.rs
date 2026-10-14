@@ -1,5 +1,5 @@
 //! Mounted drives for the drive picker (Alt+F1 / Alt+F2): system root, home,
-//! removable media, network shares and rclone remotes, with their fill level.
+//! removable media, network shares, with their fill level.
 
 use std::path::{Path, PathBuf};
 
@@ -40,29 +40,7 @@ pub fn list() -> Vec<Drive> {
         };
         out.push(drive(path, label, fs.to_string(), network));
     }
-    out.extend(remotes());
     out
-}
-
-static REMOTES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-
-/// Looks up the rclone remotes in the background; call at startup.
-pub fn prefetch_remotes() {
-    std::thread::spawn(|| {
-        let r = crate::remote::remotes();
-        *REMOTES.lock().unwrap() = Some(r);
-    });
-}
-
-/// rclone remotes, from the last lookup; refreshed in the background on each call
-/// so a newly configured remote shows up the next time the picker opens.
-fn remotes() -> Vec<Drive> {
-    let names = REMOTES.lock().unwrap().clone().unwrap_or_default();
-    prefetch_remotes();
-    names
-        .into_iter()
-        .map(|r| Drive { path: PathBuf::from(&r), label: r.trim_end_matches(':').to_string(), fs: "rclone".into(), network: true, space: None })
-        .collect()
 }
 
 #[cfg(not(target_os = "linux"))]

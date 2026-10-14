@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use guppy_core::{actions, archive, attrs, remote};
+use guppy_core::{actions, archive, attrs};
 use guppy_core::fs::{glob_match, human_date, human_size};
 use std::time::SystemTime;
 use guppy_core::ops::{self, Job, OpKind, Resolve};
@@ -160,12 +160,6 @@ enum Message {
     TrashListed(Result<Vec<PathBuf>, String>),
     /// Trash emptied (or failed).
     TrashEmptied(Result<(), String>),
-    /// rclone remotes for the settings.
-    RemotesListed(Result<Vec<(String, String)>, String>),
-    /// Google Drive login finished: the new remote's name, or why not.
-    DriveConnected(Result<String, String>),
-    /// A remote was removed from rclone's config (or not).
-    RemoteForgotten(Result<String, String>),
     /// Developer aid: `GUPPY_SCREENSHOT=file.ppm` saves an image once sizes are
     /// computed, then exits.
     Shot(iced::window::Screenshot),
@@ -331,13 +325,7 @@ fn open_from_archive(path: &Path) -> Result<(), String> {
     guppy_core::platform::open(&dir.join(inner)).map_err(|e| e.to_string())
 }
 
-/// Downloads a remote file into a temporary folder and opens it there.
-fn open_from_remote(path: &Path) -> Result<(), String> {
-    let local = remote::download(path, &temp_dir().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    guppy_core::platform::open(&local).map_err(|e| e.to_string())
-}
-
-/// Fresh temporary folder for files taken out of archives or remotes.
+/// Fresh temporary folder for files taken out of archives.
 fn temp_dir() -> std::io::Result<PathBuf> {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -647,8 +635,6 @@ struct Pane {
     space: Option<(u64, u64)>,
     /// Showing the inside of an archive (read-only).
     archive: bool,
-    /// Showing a folder on an rclone remote.
-    remote: bool,
 }
 
 /// What happens after a folder has been read.
@@ -719,19 +705,16 @@ impl Pane {
             network: false,
             space: None,
             archive: false,
-            remote: false,
         };
-        p.remote = remote::is_remote(&path);
-        p.network = p.remote || guppy_core::platform::is_network(&path);
+        p.network = guppy_core::platform::is_network(&path);
         p.path = path;
         p
     }
 
     /// Shows a freshly read folder.
     fn enter(&mut self, path: PathBuf, entries: Vec<Entry>) {
-        self.remote = remote::is_remote(&path);
-        self.network = self.remote || guppy_core::platform::is_network(&path);
-        self.archive = !self.remote && !path.is_dir();
+        self.network = guppy_core::platform::is_network(&path);
+        self.archive = !path.is_dir();
         self.space = if self.network || self.archive { None } else { guppy_core::drives::space(&path) };
         self.entries = entries;
         self.path = path;
@@ -785,15 +768,6 @@ struct Guppy {
     last_move: Option<std::time::Instant>,
     /// Folders currently being read, per side.
     loads: [Option<Loading>; 2],
-    /// rclone remotes shown in the settings, looked up each time they open; `Err` without rclone.
-    remotes: Option<Result<Vec<(String, String)>, String>>,
-    remotes_asked: bool,
-    /// Google Drive login waiting in the browser; setting the flag cancels it.
-    connecting: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Outcome of the last connect or remove, shown in the settings.
-    remote_note: Option<String>,
-    /// Remote row on which Del was pressed once; a second Del removes it.
-    forget_armed: Option<usize>,
     /// Tasks started where no task can be returned, run after the current message.
     later: Vec<Task<Message>>,
     /// Git status per pane, and whether it must be read again.
@@ -814,7 +788,7 @@ struct Guppy {
     close_armed: bool,
     /// Most folders waiting for their size at once since sizes were last idle, for a progress fraction.
     sizes_peak: usize,
-    /// A file being fetched from a remote or an archive to open it.
+    /// A file being fetched out of an archive to open it.
     opening: Option<String>,
     /// The trash is being read or emptied.
     trash_busy: Option<&'static str>,
@@ -855,7 +829,7 @@ impl Guppy {
             papers: [Paper::new(1), Paper::new(2)],
             scanlines: [Scanlines::default(), Scanlines::default()],
             sizes: DirSizes::default_cache_file().map(DirSizes::with_cache).unwrap_or_default(),
-            jumper: { guppy_core::drives::prefetch_remotes(); Jumper::load() },
+            jumper: Jumper::load(),
             jump: Vec::new(),
             jump_cur: 0,
             shot_wait: 0,
@@ -866,11 +840,6 @@ impl Guppy {
             width: 1200.0,
             last_move: None,
             loads: [None, None],
-            remotes: None,
-            remotes_asked: false,
-            connecting: None,
-            remote_note: None,
-            forget_armed: None,
             later: Vec::new(),
             git: [None, None],
             git_stale: [true, true],
@@ -968,7 +937,7 @@ impl Guppy {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut dirs: Vec<PathBuf> = self.panes.iter().filter(|p| !p.remote).map(|p| p.path.clone()).collect();
+        let mut dirs: Vec<PathBuf> = self.panes.iter().map(|p| p.path.clone()).collect();
         if let Some(theme_dir) = guppy_core::Theme::omarchy_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
             // The theme directory and its parent (Omarchy replaces it on switch).
             dirs.extend(theme_dir.parent().map(Path::to_path_buf));
@@ -986,7 +955,7 @@ impl Guppy {
         }
         // Only while sizes are computed; no idle ticking otherwise.
         let running = self.jobs.busy() || !self.jobs.problems.is_empty();
-        let loading = self.loads.iter().any(Option::is_some) || self.opening.is_some() || self.trash_busy.is_some() || self.connecting.is_some();
+        let loading = self.loads.iter().any(Option::is_some) || self.opening.is_some() || self.trash_busy.is_some();
         if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
@@ -1011,7 +980,7 @@ impl Guppy {
     fn update(&mut self, msg: Message) -> Task<Message> {
         let task = self.handle(msg);
         let later = Task::batch(std::mem::take(&mut self.later));
-        Task::batch([task, later, self.sync_quick(), self.sync_git(), self.sync_remotes()])
+        Task::batch([task, later, self.sync_quick(), self.sync_git()])
     }
 
     /// Follows the cursor: after a short rest, loads the entry for the quick view.
@@ -1027,62 +996,6 @@ impl Guppy {
         self.quick_gen += 1;
         let generation = self.quick_gen;
         Task::perform(smol::Timer::after(Duration::from_millis(90)), move |_| Message::QuickDue(generation))
-    }
-
-    /// Looks up the rclone remotes whenever the settings open.
-    fn sync_remotes(&mut self) -> Task<Message> {
-        if !matches!(self.dialog, Some(Dialog::Settings { .. })) {
-            self.remotes_asked = false;
-            self.forget_armed = None;
-            return Task::none();
-        }
-        if std::mem::replace(&mut self.remotes_asked, true) {
-            return Task::none();
-        }
-        Task::perform(smol::unblock(|| remote::remotes_long().map_err(|e| e.to_string())), Message::RemotesListed)
-    }
-
-    fn remote_list(&self) -> &[(String, String)] {
-        match &self.remotes {
-            Some(Ok(list)) => list,
-            _ => &[],
-        }
-    }
-
-    /// Enter on an "Online storage" row: `k` indexes the remotes, one past them is "Connect".
-    fn remote_activate(&mut self, k: usize) {
-        if let Some((name, _)) = self.remote_list().get(k) {
-            let path = PathBuf::from(name);
-            self.dialog = None;
-            self.navigate(path);
-            return;
-        }
-        if self.connecting.is_some() {
-            return;
-        }
-        if let Some(Err(e)) = &self.remotes {
-            self.remote_note = Some(format!("{e} · install it with: sudo pacman -S rclone"));
-            return;
-        }
-        let name = remote::free_name("gdrive", self.remote_list());
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.connecting = Some(cancel.clone());
-        self.remote_note = None;
-        self.later.push(Task::perform(
-            smol::unblock(move || remote::connect_drive(&name, &cancel).map(|()| name).map_err(|e| e.to_string())),
-            Message::DriveConnected,
-        ));
-    }
-
-    /// Del on a remote row: arms on the first press, removes on the second.
-    fn remote_forget(&mut self, k: usize) {
-        let Some((name, _)) = self.remote_list().get(k).cloned() else { return };
-        if self.forget_armed != Some(k) {
-            self.forget_armed = Some(k);
-            return;
-        }
-        self.forget_armed = None;
-        self.later.push(Task::perform(smol::unblock(move || remote::forget(&name).map(|()| name).map_err(|e| e.to_string())), Message::RemoteForgotten));
     }
 
     /// Reads the git status of folders that changed, off the UI thread.
@@ -1454,25 +1367,6 @@ impl Guppy {
                 self.reload(0);
                 self.reload(1);
             }
-            Message::RemotesListed(list) => self.remotes = Some(list),
-            Message::DriveConnected(res) => {
-                self.connecting = None;
-                self.remote_note = Some(match res {
-                    Ok(name) => format!("Connected as {name}: · Enter on it opens it, Alt+F1 lists it too"),
-                    Err(e) if e == "cancelled" => "Login cancelled".into(),
-                    Err(e) => format!("Not connected: {e}"),
-                });
-                self.remotes_asked = false;
-                guppy_core::drives::prefetch_remotes();
-            }
-            Message::RemoteForgotten(res) => {
-                self.remote_note = Some(match res {
-                    Ok(name) => format!("{name} removed from rclone (the files themselves are untouched)"),
-                    Err(e) => format!("Not removed: {e}"),
-                });
-                self.remotes_asked = false;
-                guppy_core::drives::prefetch_remotes();
-            }
             Message::Opened(Ok(())) => self.opening = None,
             Message::Opened(Err(e)) => {
                 self.opening = None;
@@ -1626,10 +1520,6 @@ impl Guppy {
     fn settings_activate(&mut self, dir: i32) {
         let Some(Dialog::Settings { row, edit }) = &mut self.dialog else { return };
         let row = *row;
-        if row >= SETTINGS.len() {
-            self.remote_activate(row - SETTINGS.len());
-            return;
-        }
         if setting_is_text(row) {
             let c = &self.config.start;
             *edit = Some(if row == 7 { c.left.clone() } else { c.right.clone() });
@@ -1665,23 +1555,13 @@ impl Guppy {
             }
             return;
         }
-        let last = SETTINGS.len() + self.remote_list().len();
+        let last = SETTINGS.len() - 1;
         let Some(Dialog::Settings { row, .. }) = &mut self.dialog else { return };
         match key.as_ref() {
             Key::Named(Named::ArrowDown) => *row = (*row + 1).min(last),
             Key::Named(Named::ArrowUp) => *row = row.saturating_sub(1),
             Key::Named(Named::Home) => *row = 0,
             Key::Named(Named::End) => *row = last,
-            Key::Named(Named::Delete) if *row >= SETTINGS.len() => {
-                let k = *row - SETTINGS.len();
-                self.remote_forget(k);
-            }
-            // Esc first stops a login that is waiting in the browser.
-            Key::Named(Named::Escape) if self.connecting.is_some() => {
-                if let Some(c) = self.connecting.take() {
-                    c.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
             Key::Named(Named::Enter | Named::Space) | Key::Named(Named::ArrowRight) => self.settings_activate(1),
             Key::Named(Named::ArrowLeft) => self.settings_activate(-1),
             Key::Named(Named::Escape | Named::F12) => self.dialog = None,
@@ -1985,7 +1865,7 @@ impl Guppy {
 
     /// Opens the built-in editor for the file under the cursor.
     fn edit_current(&mut self) -> Task<Message> {
-        if self.read_only() || self.local_only("Editing") {
+        if self.read_only() {
             return Task::none();
         }
         let Some(e) = self.current() else { return Task::none() };
@@ -2005,7 +1885,7 @@ impl Guppy {
 
     /// Shift+F4: the configured external editor.
     fn edit_external(&mut self) {
-        if self.read_only() || self.local_only("Editing") {
+        if self.read_only() {
             return;
         }
         let Some(e) = self.current() else { return };
@@ -2209,7 +2089,7 @@ impl Guppy {
     fn run_action(&mut self, i: usize) {
         let Some(a) = self.config.actions.get(i) else { return };
         let p = &self.panes[self.active];
-        if p.archive || p.remote {
+        if p.archive {
             self.dialog = Some(Dialog::Report { title: "Not possible", problems: vec!["Actions only run on local folders.".into()] });
             return;
         }
@@ -2405,21 +2285,9 @@ impl Guppy {
         true
     }
 
-    /// Features that need local files; on a remote, says so and returns true.
-    fn local_only(&mut self, what: &str) -> bool {
-        if !self.panes.iter().enumerate().any(|(i, p)| p.remote && (i == self.active || what == "Links")) {
-            return false;
-        }
-        self.dialog = Some(Dialog::Report {
-            title: "Not on a remote",
-            problems: vec![format!("{what}: only for local files. Enter downloads and opens a file; F5 copies it here.")],
-        });
-        true
-    }
-
     /// Alt+Enter: permissions and owner of the selection.
     fn open_attrs(&mut self) {
-        if self.read_only() || self.local_only("Permissions") {
+        if self.read_only() {
             return;
         }
         let paths = self.selection();
@@ -2435,7 +2303,7 @@ impl Guppy {
 
     /// Ctrl+Shift+F5: links to the selection in the other pane's folder.
     fn make_links(&mut self) {
-        if self.read_only() || self.local_only("Links") {
+        if self.read_only() {
             return;
         }
         if self.panes[1 - self.active].archive {
@@ -2587,7 +2455,7 @@ impl Guppy {
             let len = visible.len();
             p.cursor = pos.unwrap_or(p.cursor).min(len.saturating_sub(1));
             // Let running computations continue, request only what's missing.
-            if !self.config.view.dir_sizes || self.panes[side].archive || self.panes[side].remote {
+            if !self.config.view.dir_sizes || self.panes[side].archive {
                 return;
             }
             let p = &self.panes[side];
@@ -2615,7 +2483,7 @@ impl Guppy {
             let pos = self.panes[side].visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == *came_from);
             self.panes[side].cursor = pos.unwrap_or(0);
         }
-        if matches!(after, After::Nav | After::Parent(_)) && !self.panes[side].archive && !self.panes[side].remote {
+        if matches!(after, After::Nav | After::Parent(_)) && !self.panes[side].archive {
             self.jumper.visit(&path);
         }
         self.request_sizes(side);
@@ -2680,7 +2548,7 @@ impl Guppy {
         let p = &mut self.panes[side];
         p.sizing.cancel();
         p.sizing = Cancel::default();
-        if !self.config.view.dir_sizes || p.archive || p.remote {
+        if !self.config.view.dir_sizes || p.archive {
             return;
         }
         let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
@@ -2715,9 +2583,6 @@ impl Guppy {
         let path = e.path.clone();
         if e.is_dir() || (!e.is_virtual() && guppy_core::archive::is_archive_name(&e.name)) {
             self.navigate(path);
-        } else if e.remote {
-            self.opening = Some(e.name.clone());
-            return Task::perform(smol::unblock(move || open_from_remote(&path)), Message::Opened);
         } else if e.in_archive {
             self.opening = Some(e.name.clone());
             return Task::perform(smol::unblock(move || open_from_archive(&path)), Message::Opened);
@@ -3180,7 +3045,7 @@ impl Guppy {
                     let on = i == *cur;
                     let path = Config::resolve(&bm.path, &self.panes[*side].path);
                     // Unreachable targets are dimmed; network paths aren't probed (could hang).
-                    let there = guppy_core::platform::is_network(&path) || remote::is_remote(&path) || path.exists() || guppy_core::archive::split(&path).is_some();
+                    let there = guppy_core::platform::is_network(&path) || path.exists() || guppy_core::archive::split(&path).is_some();
                     let main = if on { rgb(t.background) } else if there { rgb(t.bright) } else { rgb(t.muted) };
                     let dim = if on { rgb(t.background) } else if there { fg } else { rgb(t.muted) };
                     let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
@@ -3286,32 +3151,7 @@ impl Guppy {
             Dialog::Settings { row: sel, edit } => {
                 let mut list = column![].spacing(2);
                 let mut section = "";
-                // Fixed rows, then "Online storage": the rclone remotes and "Connect Google Drive".
-                let remote_rows: Vec<(String, String)> = self
-                    .remote_list()
-                    .iter()
-                    .enumerate()
-                    .map(|(k, (name, kind))| {
-                        let kind = if kind == "drive" { "Google Drive" } else { kind.as_str() };
-                        let value = if self.forget_armed == Some(k) { "Del again removes".to_string() } else { kind.to_string() };
-                        (name.trim_end_matches(':').to_string(), value)
-                    })
-                    .chain(std::iter::once((
-                        "Connect Google Drive".to_string(),
-                        match (&self.connecting, &self.remotes) {
-                            (Some(_), _) => "log in in the browser …".to_string(),
-                            (None, Some(Err(_))) => "rclone missing".to_string(),
-                            (None, None) => "…".to_string(),
-                            (None, _) => "Enter".to_string(),
-                        },
-                    )))
-                    .collect();
-                let rows = SETTINGS
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (head, label))| (i, *head, label.to_string(), None))
-                    .chain(remote_rows.into_iter().enumerate().map(|(k, (label, value))| (SETTINGS.len() + k, "Online storage", label, Some(value))));
-                for (i, head, label, fixed_value) in rows {
+                for (i, &(head, label)) in SETTINGS.iter().enumerate() {
                     if head != section {
                         section = head;
                         let gap = if i == 0 { 0 } else { 12 };
@@ -3320,9 +3160,8 @@ impl Guppy {
                         );
                     }
                     let selected = i == *sel;
-                    let value = match (edit, fixed_value) {
-                        (Some(e), _) if selected => format!("{e}▏"),
-                        (_, Some(v)) => v,
+                    let value = match edit {
+                        Some(e) if selected => format!("{e}▏"),
                         _ => setting_value(&self.config, i),
                     };
                     let on = !matches!(value.as_str(), "off");
@@ -3352,20 +3191,12 @@ impl Guppy {
                         }),
                     );
                 }
-                let remotes = self.remote_list().len();
                 let hint = match edit {
                     Some(_) => "type a path · empty = startup folder · Enter saves · Esc cancels",
-                    None if self.connecting.is_some() => "Finish the Google login in the browser · Esc cancels",
-                    None if *sel >= SETTINGS.len() + remotes => "Enter opens the Google login in the browser",
-                    None if *sel >= SETTINGS.len() => "Enter opens it in this pane · Del removes the connection",
                     None if setting_is_text(*sel) => "Enter edits · . takes this pane's folder · Esc closes",
                     None => "↑↓ choose · Space/←→ change · Esc closes",
                 };
                 let file = Config::path().map(|p| self.jumper.display(&p)).unwrap_or_default();
-                let list: Element<'_, Message> = match &self.remote_note {
-                    Some(note) => column![list, container(small(note.clone())).padding([4, 10])].into(),
-                    None => list.into(),
-                };
                 column![
                     title("Settings".into()),
                     list,
@@ -3639,8 +3470,6 @@ impl Guppy {
             let dot_color = if on_cursor { fg } else if marked { rgb(t.marked) } else { self.class_color(e.class()) };
             let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
             let (size, pending) = match (e.is_dir() && !e.is_virtual(), self.sizes.get(&e.path)) {
-                // rclone doesn't know folder sizes.
-                (false, _) if e.remote && e.is_dir() => (String::new(), false),
                 (false, _) => (human_size(e.size), false),
                 (true, Some(DirSize::Done(n))) => (human_size(n), false),
                 // From the last run's cache, currently being verified.
@@ -3807,7 +3636,7 @@ impl Guppy {
                     }
                     s
                 }).unwrap_or_default()).size(11).font(BOLD).color(rgb(t.accent)),
-                text(if p.archive { "ARCHIVE · " } else if p.remote { "REMOTE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
+                text(if p.archive { "ARCHIVE · " } else if p.network { "NET · " } else { "" }).size(11).font(BOLD).color(rgb(t.foreground)),
                 text(p.sort.label()).size(11).color(rgb(t.foreground)),
             ]
             .spacing(10),
@@ -3980,9 +3809,6 @@ impl Guppy {
         if let Some(what) = self.trash_busy {
             out.push(Activity { label: what.into(), frac: None, stalled: false, on_press: None });
         }
-        if self.connecting.is_some() {
-            out.push(Activity { label: "Waiting for the login in the browser".into(), frac: None, stalled: false, on_press: None });
-        }
         for l in self.loads.iter().flatten() {
             let name = l.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.jumper.display(&l.path));
             // Short reads stay invisible, so local folders don't flicker.
@@ -4102,7 +3928,7 @@ impl Guppy {
         let mut right = row![].spacing(12).align_y(iced::Alignment::Center);
         if let Some(e) = self.current() {
             let mut info = Vec::new();
-            if let Some(n) = size_of(e).filter(|_| !(e.remote && e.is_dir())) {
+            if let Some(n) = size_of(e) {
                 info.push(human_size(n));
             }
             if !narrow && let Some(m) = e.modified {
