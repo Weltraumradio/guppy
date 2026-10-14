@@ -93,6 +93,12 @@ fn rgb(c: u32) -> Color {
 enum Message {
     Key(keyboard::Event),
     Select(usize, usize),
+    /// Mouse while a row is held: where it is, and the button let go.
+    DragMoved(iced::Point),
+    DragReleased,
+    /// The pointer is over a row (side, index) during a drag, or left it.
+    DragOver(usize, usize),
+    DragLeft(usize, usize),
     /// Mouse entered a pane: it becomes the active one.
     HoverPane(usize),
     Open(usize, usize),
@@ -550,6 +556,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Shift+F4", "external editor"),
         ("F5", "copy to other pane"),
         ("F6", "move to other pane"),
+        ("Drag", "move to pane or folder (Ctrl copies)"),
         ("F7", "new folder"),
         ("F8 Del", "move to trash"),
         ("Ctrl+Z", "undo move, rename, trash"),
@@ -783,6 +790,9 @@ struct Guppy {
     later: Vec<Task<Message>>,
     /// Which helper programs were found, checked whenever the settings open.
     tools_found: Vec<bool>,
+    drag: Option<Drag>,
+    /// Modifier keys held right now (Ctrl while dropping copies).
+    mods: keyboard::Modifiers,
     /// Outcome of the last install started from the settings.
     tools_note: Option<String>,
     /// Git status per pane, and whether it must be read again.
@@ -810,6 +820,17 @@ struct Guppy {
 }
 
 /// Something that takes a while, shown in the status bar.
+/// Files dragged with the mouse from one pane (only inside Guppy).
+struct Drag {
+    side: usize,
+    paths: Vec<PathBuf>,
+    /// Where the pointer was first seen after the press; the drag starts 6 px away.
+    start: Option<iced::Point>,
+    active: bool,
+    /// Row under the pointer.
+    over: Option<(usize, usize)>,
+}
+
 struct Activity {
     label: String,
     /// Known progress; `None` shows a moving bar.
@@ -857,6 +878,8 @@ impl Guppy {
             loads: [None, None],
             later: Vec::new(),
             tools_found: Vec::new(),
+            drag: None,
+            mods: keyboard::Modifiers::default(),
             tools_note: None,
             git: [None, None],
             git_stale: [true, true],
@@ -967,6 +990,17 @@ impl Guppy {
             iced::window::close_requests().map(Message::CloseRequested),
             watch::changes(watch::Targets { dirs }).map(Message::FsChanged),
         ]);
+        // The pointer is only followed while a row is held.
+        if self.drag.is_some() {
+            keys = Subscription::batch([
+                keys,
+                iced::event::listen_with(|e, _, _| match e {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::DragMoved(position)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::DragReleased),
+                    _ => None,
+                }),
+            ]);
+        }
         if self.panes.iter().any(|p| p.scroll_target.is_some()) {
             keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
         }
@@ -1037,6 +1071,14 @@ impl Guppy {
     }
 
     fn handle(&mut self, msg: Message) -> Task<Message> {
+        if let Message::Key(keyboard::Event::ModifiersChanged(m)) = &msg {
+            self.mods = *m;
+        }
+        if let Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Escape), .. }) = &msg
+            && self.drag.take().is_some_and(|d| d.active)
+        {
+            return Task::none();
+        }
         if matches!(msg, Message::TrashListed(_) | Message::TrashEmptied(_)) {
             self.trash_busy = None;
         }
@@ -1184,6 +1226,32 @@ impl Guppy {
                 self.rename = None;
                 self.active = side;
                 self.panes[side].cursor = i;
+                self.drag = self.drag_sources(side, i).map(|paths| Drag { side, paths, start: None, active: false, over: None });
+            }
+            Message::DragMoved(at) => {
+                if let Some(d) = &mut self.drag {
+                    let start = *d.start.get_or_insert(at);
+                    d.active |= (at.x - start.x).hypot(at.y - start.y) > 6.0;
+                }
+            }
+            Message::DragOver(side, i) => {
+                if let Some(d) = &mut self.drag {
+                    d.over = Some((side, i));
+                }
+            }
+            Message::DragLeft(side, i) => {
+                if let Some(d) = &mut self.drag
+                    && d.over == Some((side, i))
+                {
+                    d.over = None;
+                }
+            }
+            Message::DragReleased => {
+                if let Some(d) = self.drag.take().filter(|d| d.active)
+                    && let Some((kind, target)) = self.drop_plan(&d)
+                {
+                    self.ask_with(kind, d.paths, Some(target));
+                }
             }
             Message::Open(side, i) => {
                 self.rename = None;
@@ -1636,6 +1704,39 @@ impl Guppy {
             self.request_sizes(0);
             self.request_sizes(1);
         }
+    }
+
+    /// What a press on row `i` would drag: the marked files if the row is one
+    /// of them, else just that row.
+    fn drag_sources(&self, side: usize, i: usize) -> Option<Vec<PathBuf>> {
+        let p = &self.panes[side];
+        let visible = p.visible(self.show_hidden, &self.sizes);
+        let e = visible.get(i)?;
+        if !p.marked.contains(&e.path) {
+            return Some(vec![e.path.clone()]);
+        }
+        Some(visible.iter().filter(|e| p.marked.contains(&e.path)).map(|e| e.path.clone()).collect())
+    }
+
+    /// Where a drop would go and whether it copies or moves; `None` if it can't
+    /// go there (same folder, into itself, into an archive). Ctrl copies, and
+    /// out of an archive it always copies.
+    fn drop_plan(&self, d: &Drag) -> Option<(OpKind, PathBuf)> {
+        let side = d.over.map_or(self.active, |(s, _)| s);
+        let pane = &self.panes[side];
+        if pane.archive {
+            return None;
+        }
+        let row = d.over.and_then(|(s, i)| self.panes[s].visible(self.show_hidden, &self.sizes).get(i).map(|e| (e.path.clone(), e.is_dir())));
+        let target = match row {
+            Some((path, true)) if !d.paths.contains(&path) => path,
+            _ => pane.path.clone(),
+        };
+        if d.paths.iter().any(|p| p.parent() == Some(target.as_path()) || target.starts_with(p)) {
+            return None;
+        }
+        let copy = self.mods.command() || self.panes[d.side].archive;
+        Some((if copy { OpKind::Copy } else { OpKind::Move }, target))
     }
 
     fn ask(&mut self, kind: OpKind) {
@@ -2715,7 +2816,12 @@ impl Guppy {
                 background: Some(rgb(t.dark_background).into()),
                 ..Default::default()
             });
-        let main = column![self.menubar(), desk, self.statusbar()];
+        let main: Element<'_, Message> = column![self.menubar(), desk, self.statusbar()].into();
+        let main = if self.drag.as_ref().is_some_and(|d| d.active) {
+            mouse_area(main).interaction(iced::mouse::Interaction::Grabbing).into()
+        } else {
+            main
+        };
         match self.dialog_view() {
             Some(d) => iced::widget::stack![main, iced::widget::opaque(d)].into(),
             None => main.into(),
@@ -3645,6 +3751,8 @@ impl Guppy {
 
                 );
             }
+            // A folder that would take the dragged files.
+            let drop_here = self.drag.as_ref().is_some_and(|d| d.active && d.over == Some((side, i)) && e.is_dir() && !d.paths.contains(&e.path));
             let bg = if on_cursor {
                 Some(rgb(t.accent))
             } else if is_cur {
@@ -3652,20 +3760,26 @@ impl Guppy {
             } else {
                 None
             };
-            mouse_area(
+            let border = if drop_here { Border { color: rgb(t.accent), width: 1.5, radius: row_radius.into() } } else { Border::default().rounded(row_radius) };
+            let area = mouse_area(
                 container(line)
                     .height(ROW_H)
                     .padding([0, 10])
                     .center_y(ROW_H)
                     .style(move |_| container::Style {
                         background: bg.map(Background::Color),
-                        border: Border::default().rounded(row_radius),
+                        border,
                         ..Default::default()
                     }),
             )
             .on_press(Message::Select(side, i))
-            .on_double_click(Message::Open(side, i))
-            .into()
+            .on_double_click(Message::Open(side, i));
+            // Rows report the pointer only during a drag, so moving the mouse costs nothing otherwise.
+            if self.drag.as_ref().is_some_and(|d| d.active) {
+                area.on_enter(Message::DragOver(side, i)).on_exit(Message::DragLeft(side, i)).into()
+            } else {
+                area.into()
+            }
         });
 
         let header = container(
@@ -3865,6 +3979,21 @@ impl Guppy {
                 stalled,
                 on_press: Some(Message::OpenJobs),
             });
+        }
+        if let Some(d) = self.drag.as_ref().filter(|d| d.active) {
+            let what = match d.paths.as_slice() {
+                [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                many => format!("{} items", many.len()),
+            };
+            let label = match self.drop_plan(d) {
+                Some((kind, to)) => {
+                    let verb = if kind == OpKind::Copy { "Copy" } else { "Move" };
+                    let to = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| to.display().to_string());
+                    keys_label(&format!("{verb} {what} to {to} · Ctrl copies · Esc cancels"))
+                }
+                None => format!("{what}: can't drop here"),
+            };
+            out.push(Activity { label, frac: None, stalled: false, on_press: None });
         }
         if let Some(name) = &self.opening {
             out.push(Activity { label: format!("Fetching {name}"), frac: None, stalled: false, on_press: None });

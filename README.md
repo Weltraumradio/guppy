@@ -22,6 +22,7 @@ picks up the colors of the active Omarchy theme. It also builds on Windows and m
   folders from zoxide if you have it)
 - Copy, move, trash and delete run as background jobs with progress, a conflict dialog
   (skip, overwrite, keep both), pause and resume; Ctrl+Z undoes the last move, rename or trash
+- Drag files with the mouse onto the other pane or onto a folder (Ctrl copies)
 - Folder sizes are computed in the background and cached, so they are there next time
 - Zip and tar archives open like folders (7z, rar and iso too, with bsdtar)
 - Quick view next to the list (Ctrl+Q): text, images, PDF, video frames, audio tags, office docs
