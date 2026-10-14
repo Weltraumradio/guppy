@@ -1,4 +1,5 @@
-//! Permissions, owner and symbolic links (Unix).
+//! Permissions, owner and symbolic links. Windows has only "read-only",
+//! shown as the `w` bits.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,8 +15,9 @@ pub fn read(path: &Path) -> io::Result<(u32, String)> {
 }
 
 #[cfg(not(unix))]
-pub fn read(_: &Path) -> io::Result<(u32, String)> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "not supported on this system"))
+pub fn read(path: &Path) -> io::Result<(u32, String)> {
+    let ro = path.symlink_metadata()?.permissions().readonly();
+    Ok((if ro { 0o444 } else { 0o666 }, String::new()))
 }
 
 /// `rwxr-xr-x` for `0o755`.
@@ -53,8 +55,8 @@ pub fn parse_owner(s: &str) -> Result<(Option<u32>, Option<u32>), String> {
 }
 
 #[cfg(not(unix))]
-pub fn parse_owner(_: &str) -> Result<(Option<u32>, Option<u32>), String> {
-    Err("not supported on this system".into())
+pub fn parse_owner(s: &str) -> Result<(Option<u32>, Option<u32>), String> {
+    if s.trim().is_empty() { Ok((None, None)) } else { Err("the owner can't be changed here".into()) }
 }
 
 /// Applies `change` to every path; returns the problems.
@@ -91,9 +93,26 @@ fn apply_one(p: &Path, c: &Change, top: bool, problems: &mut Vec<String>) {
     }
 }
 
+/// Without write bits the entry becomes read-only, with any it becomes writable.
 #[cfg(not(unix))]
-fn apply_one(p: &Path, _: &Change, _: bool, problems: &mut Vec<String>) {
-    problems.push(format!("{}: not supported on this system", p.display()));
+fn apply_one(p: &Path, c: &Change, _: bool, problems: &mut Vec<String>) {
+    let Ok(m) = p.symlink_metadata() else { return problems.push(format!("{}: not found", p.display())) };
+    if c.uid.is_some() || c.gid.is_some() {
+        problems.push(format!("{}: the owner can't be changed here", p.display()));
+    }
+    if let Some(mode) = c.mode {
+        let mut perm = m.permissions();
+        perm.set_readonly(mode & 0o222 == 0);
+        if let Err(e) = std::fs::set_permissions(p, perm) {
+            problems.push(format!("{}: {e}", p.display()));
+        }
+    }
+    if c.recursive && m.is_dir() {
+        match std::fs::read_dir(p) {
+            Ok(rd) => rd.flatten().for_each(|e| apply_one(&e.path(), c, false, problems)),
+            Err(e) => problems.push(format!("{}: {e}", p.display())),
+        }
+    }
 }
 
 /// Creates a link in `dir` pointing to `target`, named like it.

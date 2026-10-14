@@ -31,14 +31,47 @@ pub fn expand(command: &str, file: Option<&Path>, marked: &[PathBuf], dir: &Path
 }
 
 /// Single quotes for `sh`; a `'` inside becomes `'\''`.
+#[cfg(not(windows))]
 fn quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
-/// Starts `line` with `sh -c` in `cwd`, without waiting. In a terminal the
-/// window stays open until a key is pressed, so output can be read.
+/// Double quotes for `cmd`; `"` can't occur in Windows file names.
+#[cfg(windows)]
+fn quote(p: &Path) -> String {
+    format!("\"{}\"", p.display())
+}
+
+/// Starts `line` with `sh -c` (Windows: `cmd /C`) in `cwd`, without waiting. In a
+/// terminal the window stays open until a key is pressed, so output can be read.
 pub fn run(line: &str, cwd: &Path, terminal: bool) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("cmd");
+        // Passed as written: cmd has its own quoting rules.
+        if terminal {
+            c.raw_arg(format!("/C start \"\" cmd /K {line}"));
+        } else {
+            c.raw_arg(format!("/C {line}")).stdin(Stdio::null());
+        }
+        c
+    };
+    // Terminal.app opens a window for a script; it starts in the home folder.
+    #[cfg(target_os = "macos")]
+    let mut cmd = if terminal {
+        let script = format!("cd {} && {line}", quote(cwd));
+        let script = script.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut c = Command::new("osascript");
+        c.args(["-e", &format!("tell application \"Terminal\"\nactivate\ndo script \"{script}\"\nend tell")]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", line]).stdin(Stdio::null());
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = if terminal {
         let mut c = Command::new("xdg-terminal-exec");
         c.args(["sh", "-c", &format!("{line}\nprintf '\\n[done, press Enter]'; read _")]);
@@ -78,7 +111,7 @@ impl KeySpec {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 

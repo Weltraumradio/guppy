@@ -225,7 +225,7 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
                     }
                     j.set_current(src);
                     let res = if kind == OpKind::Trash {
-                        trash::delete(src).map_err(|e| e.to_string())
+                        trash_one(src)
                     } else {
                         remove(src).map_err(|e| e.to_string())
                     };
@@ -243,24 +243,79 @@ pub fn start(kind: OpKind, sources: Vec<PathBuf>, target: Option<PathBuf>) -> Jo
     job
 }
 
+#[cfg(not(target_os = "macos"))]
+fn trash_one(src: &Path) -> Result<(), String> {
+    trash::delete(src).map_err(|e| e.to_string())
+}
+
 /// Original paths of everything in the trash (all drives).
+#[cfg(not(target_os = "macos"))]
 pub fn trash_contents() -> Result<Vec<PathBuf>, String> {
     let items = trash::os_limited::list().map_err(|e| e.to_string())?;
     Ok(items.iter().map(trash::TrashItem::original_path).collect())
 }
 
 /// Permanently deletes everything in the trash.
+#[cfg(not(target_os = "macos"))]
 pub fn empty_trash() -> Result<(), String> {
     let items = trash::os_limited::list().map_err(|e| e.to_string())?;
     trash::os_limited::purge_all(items).map_err(|e| e.to_string())
 }
 
-/// Lies in a trash folder (`~/.local/share/Trash`, `.Trash-1000` on drives), or is one.
+/// Where Guppy put things in the macOS trash this session, for undo.
+#[cfg(target_os = "macos")]
+static MAC_TRASHED: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Trashes through NSFileManager, which says where the item went (Finder's
+/// "Put Back" data is private, so undo uses that place).
+#[cfg(target_os = "macos")]
+fn trash_one(src: &Path) -> Result<(), String> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&src.to_string_lossy()));
+    let mut out = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut out))
+        .map_err(|e| e.localizedDescription().to_string())?;
+    if let Some(p) = out.and_then(|u| u.path()) {
+        MAC_TRASHED.lock().unwrap().push((src.to_path_buf(), PathBuf::from(p.to_string())));
+    }
+    Ok(())
+}
+
+/// Runs AppleScript in Finder (macOS guards ~/.Trash, Finder may read it).
+#[cfg(target_os = "macos")]
+fn finder(script: &str) -> Result<String, String> {
+    let out = std::process::Command::new("osascript").args(["-e", script]).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Names of everything in the trash (all drives); macOS doesn't tell the original paths.
+#[cfg(target_os = "macos")]
+pub fn trash_contents() -> Result<Vec<PathBuf>, String> {
+    let out = finder(
+        "set AppleScript's text item delimiters to linefeed\ntell application \"Finder\" to set n to name of every item of trash\nif class of n is not list then set n to {n}\nn as text",
+    )?;
+    Ok(out.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+}
+
+/// Permanently deletes everything in the trash.
+#[cfg(target_os = "macos")]
+pub fn empty_trash() -> Result<(), String> {
+    finder("tell application \"Finder\" to empty trash without warns").map(|_| MAC_TRASHED.lock().unwrap().clear())
+}
+
+/// Lies in a trash folder (`~/.local/share/Trash`, `.Trash-1000` on drives,
+/// macOS `.Trash`/`.Trashes`, Windows `$Recycle.Bin`), or is one.
 pub fn in_trash(p: &Path) -> bool {
     let mut prev = None;
     p.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
-        let hit = name.starts_with(".Trash") || (name == "Trash" && prev.as_deref() == Some("share"));
+        let hit = name.starts_with(".Trash")
+            || (name == "Trash" && prev.as_deref() == Some("share"))
+            || name.eq_ignore_ascii_case("$Recycle.Bin");
         prev = Some(name.into_owned());
         hit
     })
@@ -326,10 +381,21 @@ fn restore(job: &Job, paths: &[PathBuf]) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// Moves items back from where [`trash_one`] put them this session.
+#[cfg(target_os = "macos")]
 fn restore(job: &Job, paths: &[PathBuf]) {
+    let mut known = MAC_TRASHED.lock().unwrap();
     for p in paths {
-        job.problem(p, "restoring from the trash is not supported here");
+        let Some(k) = known.iter().rposition(|(from, _)| from == p) else {
+            job.problem(p, "no longer known in the trash");
+            continue;
+        };
+        let (_, there) = known.remove(k);
+        if p.symlink_metadata().is_ok() {
+            job.problem(p, "something with that name exists again, left in the trash");
+        } else if let Err(e) = std::fs::rename(&there, p) {
+            job.problem(p, e);
+        }
     }
 }
 

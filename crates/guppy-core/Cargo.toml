@@ -12,3 +12,9 @@ rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 trash = "5.2.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3.2", features = ["NSFileManager", "NSURL", "NSString", "NSError"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

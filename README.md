@@ -12,6 +12,21 @@ target/release/guppy-app
 Press F1 for all keys, Ctrl+P for the command palette. Settings live in
 `~/.config/guppy/config.toml` (written with comments on first start; F12 edits the common ones).
 
+## Windows and macOS
+
+Guppy builds for Windows and macOS too (`cargo build --release` on that system), but it is
+only tested on Linux so far. Differences there:
+
+- **macOS:** shortcuts use Cmd instead of Ctrl (also in F1 and the palette). The clipboard
+  holds file URLs like Finder; Cmd+X only moves when pasted in Guppy. *Empty trash* asks Finder
+  (macOS asks once for permission); undo of trashing works for items trashed in the same session.
+  User actions with `terminal = true` open Terminal.app.
+- **Windows:** archives need Windows 10 or newer (`tar.exe`). Alt+Enter only switches read-only
+  (the `w` bits); there is no owner. User actions run with `cmd /C`, placeholders are quoted
+  with `"`. Creating symlinks needs developer mode or admin rights.
+- **Both:** previews of PDF, video and other image formats need the same tools as on Linux
+  (poppler, ffmpeg, ImageMagick) in `PATH`; colors fall back to Matte Black (no Omarchy theme).
+
 ## Benchmark
 
 Measured on 2026-10-13 with `GUPPY_BENCH=1 target/release/guppy-app`, which prints the time

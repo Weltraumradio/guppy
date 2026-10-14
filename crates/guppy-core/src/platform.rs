@@ -1,7 +1,7 @@
 //! Everything OS-specific in one place.
 //!
-//! Linux and macOS share the Unix branch. Windows is prepared but not yet
-//! tested; hard links and drive boundaries aren't detected there yet.
+//! Linux and macOS share the Unix branch. On Windows hard links and drive
+//! boundaries aren't detected yet.
 
 use std::fs::Metadata;
 use std::io;
@@ -121,7 +121,28 @@ pub fn is_network(path: &Path) -> bool {
         .is_some_and(|(_, net)| net)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn is_network(_: &Path) -> bool {
-    false
+#[cfg(target_os = "macos")]
+pub fn is_network(path: &Path) -> bool {
+    const NET: &[&str] = &["smbfs", "nfs", "afpfs", "webdav", "ftp", "osxfuse", "macfuse"];
+    NET.contains(&crate::drives::fs_type(path).as_str())
+}
+
+/// UNC paths (`\\\\server\\share`) and mapped network drive letters.
+#[cfg(windows)]
+pub fn is_network(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOTE: u32 = 4;
+    match path.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => {
+                let root = crate::drives::wide(Path::new(&format!("{}:\\", l as char)));
+                // SAFETY: `root` is NUL-terminated.
+                unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }

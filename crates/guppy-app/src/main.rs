@@ -501,6 +501,12 @@ fn fuzzy(query: &str, label: &str) -> Option<i32> {
 }
 
 /// Palette hits for `query`, best first (all commands when empty).
+/// Key names as shown: the Mac uses Cmd where Linux and Windows use Ctrl
+/// (`modifiers.command()`).
+fn keys_label(s: &str) -> String {
+    if cfg!(target_os = "macos") { s.replace("Ctrl+", "Cmd+") } else { s.to_string() }
+}
+
 /// Indices past `COMMANDS` are the user's actions.
 fn palette_hits(query: &str, actions: &[Action]) -> Vec<usize> {
     let labels = COMMANDS.iter().map(|c| c.0).chain(actions.iter().map(|a| a.name.as_str()));
@@ -1432,7 +1438,7 @@ impl Guppy {
             Key::Named(Named::F4) if m.shift() => self.edit_external(),
             Key::Named(Named::F4) => return self.edit_current(),
             Key::Named(Named::F12) => return self.update(Message::OpenSettings),
-            Key::Character(",") if m.control() => return self.update(Message::OpenSettings),
+            Key::Character(",") if m.command() => return self.update(Message::OpenSettings),
             Key::Named(Named::Enter) if m.alt() && !jumping => self.open_attrs(),
             Key::Named(Named::Enter) if jumping => self.jump_selected(),
             Key::Named(Named::Enter) => return self.open_current(),
@@ -1450,30 +1456,30 @@ impl Guppy {
             Key::Named(Named::Space) if query_empty => self.toggle_mark(),
             Key::Named(Named::ArrowLeft) if m.alt() => self.history(true),
             Key::Named(Named::ArrowRight) if m.alt() => self.history(false),
-            Key::Named(Named::F5) if m.control() && m.shift() => self.make_links(),
+            Key::Named(Named::F5) if m.command() && m.shift() => self.make_links(),
             Key::Named(Named::F5) => self.ask(OpKind::Copy),
             Key::Named(Named::F6) => self.ask(OpKind::Move),
             Key::Named(Named::F7) => self.new_dir(),
             Key::Named(Named::F8 | Named::Delete) if m.shift() => self.ask(OpKind::Delete),
             Key::Named(Named::F8 | Named::Delete) => self.ask(OpKind::Trash),
-            Key::Character("g") if m.control() => self.set_query("~".into()),
+            Key::Character("g") if m.command() => self.set_query("~".into()),
             // The cursor keeps its row; the entries reorder beneath it.
-            Key::Character("s") if m.control() => self.cycle_sort(),
-            Key::Character("h") if m.control() => return self.update(Message::ToggleHidden),
-            Key::Character("j" | "J") if m.control() && m.shift() => {
+            Key::Character("s") if m.command() => self.cycle_sort(),
+            Key::Character("h") if m.command() => return self.update(Message::ToggleHidden),
+            Key::Character("j" | "J") if m.command() && m.shift() => {
                 let _ = self.update(Message::TogglePause);
             }
-            Key::Character("j") if m.control() => self.dialog = Some(Dialog::Jobs),
-            Key::Character("q") if m.control() => return self.update(Message::ToggleQuick),
-            Key::Character("d") if m.control() => self.bookmark_here(),
-            Key::Character("p") if m.control() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
+            Key::Character("j") if m.command() => self.dialog = Some(Dialog::Jobs),
+            Key::Character("q") if m.command() => return self.update(Message::ToggleQuick),
+            Key::Character("d") if m.command() => self.bookmark_here(),
+            Key::Character("p") if m.command() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
-            _ if query_empty && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
+            _ if query_empty && !m.command() && !m.control() && !m.alt() && matches!(typed, Some("+" | "-")) => {
                 self.dialog = Some(Dialog::Mark { add: typed == Some("+"), pattern: self.last_pattern.clone() });
             }
-            _ if query_empty && !m.control() && !m.alt() && typed == Some("*") => self.invert_marks(),
-            Key::Character("r") if m.control() => self.recompute_sizes(),
-            Key::Character("z") if m.control() => self.undo(),
+            _ if query_empty && !m.command() && !m.control() && !m.alt() && typed == Some("*") => self.invert_marks(),
+            Key::Character("r") if m.command() => self.recompute_sizes(),
+            Key::Character("z") if m.command() => self.undo(),
             // Anything printable without Ctrl/Alt goes into the input.
             _ => match typed {
                 Some(t) if !m.control() && !m.alt() && !m.logo() && t.chars().all(|c| !c.is_control()) => {
@@ -2081,7 +2087,7 @@ impl Guppy {
         };
         self.config.actions.iter().position(|a| {
             actions::KeySpec::parse(&a.key)
-                .is_some_and(|k| k.key == name && k.ctrl == m.control() && k.alt == m.alt() && k.shift == m.shift())
+                .is_some_and(|k| k.key == name && k.ctrl == m.command() && k.alt == m.alt() && k.shift == m.shift())
         })
     }
 
@@ -2811,7 +2817,7 @@ impl Guppy {
                         .align_y(iced::Alignment::Center)
                         .spacing(12),
                     body,
-                    small("Ctrl+S saves · Esc closes".into()),
+                    small(keys_label("Ctrl+S saves · Esc closes")),
                 ]
                 .spacing(14)
                 .into()
@@ -2951,7 +2957,7 @@ impl Guppy {
                     let on = n == *cur;
                     let color = if on { rgb(t.background) } else { rgb(t.bright) };
                     list = list.push(
-                        button(row![text(label).size(13).color(color).width(Length::Fill), text(keys).size(12).color(if on { color } else { fg })].spacing(12))
+                        button(row![text(label).size(13).color(color).width(Length::Fill), text(keys_label(keys)).size(12).color(if on { color } else { fg })].spacing(12))
                             .padding([5, 10])
                             .width(Length::Fill)
                             .on_press(Message::PaletteRun(i))
@@ -3210,7 +3216,7 @@ impl Guppy {
                     let mut c = column![text(*head).size(11).font(BOLD).color(rgb(t.accent))].spacing(5);
                     for (k, what) in keys.iter() {
                         c = c.push(row![
-                            text(*k).size(12).font(BOLD).color(rgb(t.bright)).width(118),
+                            text(keys_label(k)).size(12).font(BOLD).color(rgb(t.bright)).width(118),
                             text(*what).size(12).color(rgb(t.foreground)),
                         ]);
                     }
@@ -3343,7 +3349,7 @@ impl Guppy {
         .padding([10, 10]);
         let body: Element<'_, Message> = match &self.quick_view {
             Some((p, b)) => container(self.body_view(p, b, quick_id())).padding([4, 14]).height(Length::Fill).into(),
-            None => container(text("Ctrl+Q closes the preview").size(12).color(rgb(t.foreground))).center(Length::Fill).into(),
+            None => container(text(keys_label("Ctrl+Q closes the preview")).size(12).color(rgb(t.foreground))).center(Length::Fill).into(),
         };
         let outline = self.neon().then(|| rgb(t.muted));
         self.sheet(column![header, body].into(), side, t.sheet_dim, outline).width(Length::FillPortion(3)).into()

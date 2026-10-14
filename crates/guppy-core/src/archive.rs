@@ -13,7 +13,8 @@ use std::time::SystemTime;
 
 use crate::fs::{Entry, EntryKind};
 
-const BSDTAR: &str = "bsdtar";
+/// Windows 10+ ships bsdtar as `tar.exe`; macOS and Arch have `bsdtar`.
+const BSDTAR: &str = if cfg!(windows) { "tar" } else { "bsdtar" };
 
 /// Does the file name look like an archive `bsdtar` can list?
 /// Plain compressed files (`x.gz`) are not archives.
