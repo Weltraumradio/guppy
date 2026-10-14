@@ -211,6 +211,8 @@ enum Dialog {
     Jobs,
     /// Command palette (Ctrl+P): typed query and selected hit.
     Palette { query: String, cur: usize },
+    /// Text search in the files below `root`; hits live in `Guppy::search_hits`.
+    Search { root: PathBuf, query: String, cur: usize },
     /// Drive picker (Alt+F1 / Alt+F2) for the pane `side`.
     Drives { side: usize, list: Vec<guppy_core::drives::Drive>, cur: usize },
     /// Name for a bookmark of `path`: new (Ctrl+D), or renaming bookmark `edit` (F2 in the picker).
@@ -437,6 +439,7 @@ enum Cmd {
     EditExternal,
     Quick,
     Map,
+    Search,
     Mark,
     Unmark,
     Invert,
@@ -475,6 +478,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Edit in external editor", "Shift+F4", Cmd::EditExternal),
     ("Quick view in other pane", "Ctrl+Q", Cmd::Quick),
     ("Space map in other pane", "Ctrl+U", Cmd::Map),
+    ("Search text in files", "Ctrl+F", Cmd::Search),
     ("Mark by pattern", "+", Cmd::Mark),
     ("Unmark by pattern", "-", Cmd::Unmark),
     ("Invert marks", "*", Cmd::Invert),
@@ -589,6 +593,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+Shift+J", "pause / resume job"),
         ("Ctrl+Q", "quick view in other pane"),
         ("Ctrl+U", "space map in other pane"),
+        ("Ctrl+F", "search text in files below"),
         ("Ctrl+P", "command palette"),
         ("Alt+F1 / F2", "drives & bookmarks"),
         ("Ctrl+D", "bookmark this folder"),
@@ -828,6 +833,14 @@ struct Guppy {
     quick: bool,
     /// The other pane shows the space map.
     map: bool,
+    /// Running or finished text search, what it looked for, and its hits.
+    search: Option<guppy_core::search::Search>,
+    search_for: String,
+    search_hits: Vec<guppy_core::search::Hit>,
+    /// Lines around the selected hit.
+    search_ctx: Vec<(usize, String)>,
+    /// Folder the last search ran in.
+    search_root_cache: Option<PathBuf>,
     /// Entry the quick view should show, and what it shows now.
     quick_want: Option<PathBuf>,
     quick_view: Option<(PathBuf, ViewBody)>,
@@ -917,6 +930,11 @@ impl Guppy {
             jobs: Jobs::default(),
             quick: false,
             map: false,
+            search: None,
+            search_for: String::new(),
+            search_hits: Vec::new(),
+            search_ctx: Vec::new(),
+            search_root_cache: None,
             quick_want: None,
             quick_view: None,
             quick_gen: 0,
@@ -929,8 +947,17 @@ impl Guppy {
         let sort = sort_from(g.config.view.sort);
         g.panes.iter_mut().for_each(|p| p.sort = sort);
         g.restore_tabs();
-        // Developer aid for screenshots: `GUPPY_SCREENSHOT_VIEW=map` opens the space map.
-        g.map = std::env::var("GUPPY_SCREENSHOT_VIEW").as_deref() == Ok("map");
+        // Developer aid for screenshots: `GUPPY_SCREENSHOT_VIEW=map` opens the space map,
+        // `search:text` the text search for "text".
+        let shot_view = std::env::var("GUPPY_SCREENSHOT_VIEW").unwrap_or_default();
+        g.map = shot_view == "map";
+        if let Some(q) = shot_view.strip_prefix("search:") {
+            g.open_search();
+            if let Some(Dialog::Search { query, .. }) = &mut g.dialog {
+                *query = q.to_string();
+            }
+            g.on_search_key(Key::Named(Named::Enter), None);
+        }
         if let Some(e) = config_error {
             g.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
         } else if g.config.start.help && std::env::var_os("GUPPY_SCREENSHOT").is_none() {
@@ -1041,7 +1068,8 @@ impl Guppy {
         // Only while sizes are computed; no idle ticking otherwise.
         let running = self.jobs.busy() || !self.jobs.problems.is_empty();
         let loading = self.loads.iter().any(Option::is_some) || self.opening.is_some() || self.trash_busy.is_some();
-        if self.sizes.busy() || self.jump_pending || running || loading || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
+        let searching = self.search.as_ref().is_some_and(|s| !s.finished());
+        if self.sizes.busy() || self.jump_pending || running || loading || searching || std::env::var_os("GUPPY_SCREENSHOT").is_some() {
             Subscription::batch([keys, iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick)])
         } else {
             keys
@@ -1118,6 +1146,7 @@ impl Guppy {
         }
         if matches!(msg, Message::Tick) {
             self.poll_jobs();
+            self.poll_search();
             let pending = self.sizes.pending();
             self.sizes_peak = if pending == 0 { 0 } else { self.sizes_peak.max(pending) };
         }
@@ -1219,6 +1248,10 @@ impl Guppy {
                 }
                 if matches!(self.dialog, Some(Dialog::Palette { .. })) {
                     return self.on_palette_key(key, text.as_deref());
+                }
+                if matches!(self.dialog, Some(Dialog::Search { .. })) {
+                    self.on_search_key(key, text.as_deref());
+                    return Task::none();
                 }
                 if matches!(self.dialog, Some(Dialog::Drives { .. })) {
                     return self.on_drives_key(key, modifiers, text.as_deref());
@@ -1616,6 +1649,7 @@ impl Guppy {
             Key::Character("j") if m.command() => self.dialog = Some(Dialog::Jobs),
             Key::Character("q") if m.command() => return self.update(Message::ToggleQuick),
             Key::Character("u") if m.command() => return self.update(Message::ToggleMap),
+            Key::Character("f") if m.command() => self.open_search(),
             Key::Character("d") if m.command() => self.bookmark_here(),
             Key::Character("p") if m.command() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
@@ -1903,7 +1937,7 @@ impl Guppy {
             }
             Some(d @ Dialog::Settings { .. }) => self.dialog = Some(d),
             Some(d @ (Dialog::View { .. } | Dialog::Edit { .. })) => self.dialog = Some(d),
-            Some(d @ (Dialog::Palette { .. } | Dialog::Drives { .. })) => self.dialog = Some(d),
+            Some(d @ (Dialog::Palette { .. } | Dialog::Drives { .. } | Dialog::Search { .. })) => self.dialog = Some(d),
             Some(Dialog::Report { .. } | Dialog::Help { .. } | Dialog::Jobs) | None => {}
         }
     }
@@ -2241,6 +2275,93 @@ impl Guppy {
         self.reload(self.active);
     }
 
+    /// Ctrl+F: search the active folder; the last search stays until a new one.
+    fn open_search(&mut self) {
+        let root = self.panes[self.active].path.clone();
+        if self.panes[self.active].archive {
+            return;
+        }
+        // Hits of the last search stay while the folder is the same.
+        if self.search_root_cache.as_ref() != Some(&root) {
+            self.search = None;
+            self.search_root_cache = None;
+            self.search_hits.clear();
+            self.search_for.clear();
+            self.search_ctx.clear();
+        }
+        let query = self.search_for.clone();
+        self.dialog = Some(Dialog::Search { root, query, cur: 0 });
+        self.refresh_search_ctx();
+    }
+
+    fn poll_search(&mut self) {
+        let Some(s) = &self.search else { return };
+        let before = self.search_hits.len();
+        self.search_hits.extend(s.rx.try_iter());
+        if before == 0 && !self.search_hits.is_empty() {
+            self.refresh_search_ctx();
+        }
+    }
+
+    fn refresh_search_ctx(&mut self) {
+        let cur = match &self.dialog {
+            Some(Dialog::Search { cur, .. }) => *cur,
+            _ => return,
+        };
+        self.search_ctx = self.search_hits.get(cur).map(|h| guppy_core::search::context(&h.path, h.line, 3)).unwrap_or_default();
+    }
+
+    fn on_search_key(&mut self, key: Key, typed: Option<&str>) {
+        let Some(Dialog::Search { root, query, cur }) = &mut self.dialog else { return };
+        let len = self.search_hits.len();
+        let mut moved = true;
+        match key.as_ref() {
+            Key::Named(Named::Escape) => {
+                // A running search stops; its hits stay for the next Ctrl+F.
+                if let Some(s) = self.search.take() {
+                    drop(s);
+                }
+                self.dialog = None;
+                return;
+            }
+            Key::Named(Named::ArrowDown) => *cur = (*cur + 1).min(len.saturating_sub(1)),
+            Key::Named(Named::ArrowUp) => *cur = cur.saturating_sub(1),
+            Key::Named(Named::PageDown) => *cur = (*cur + 10).min(len.saturating_sub(1)),
+            Key::Named(Named::PageUp) => *cur = cur.saturating_sub(10),
+            Key::Named(Named::Enter) if *query != self.search_for && !query.trim().is_empty() => {
+                self.search_for = query.clone();
+                self.search_root_cache = Some(root.clone());
+                self.search_hits.clear();
+                self.search_ctx.clear();
+                *cur = 0;
+                self.search = Some(guppy_core::search::start(root.clone(), query.trim(), self.show_hidden));
+                return;
+            }
+            // Enter on a hit: go to the file in the active pane.
+            Key::Named(Named::Enter) => {
+                let Some(hit) = self.search_hits.get(*cur).cloned() else { return };
+                self.dialog = None;
+                if let Some(dir) = hit.path.parent() {
+                    self.load(self.active, dir.to_path_buf(), After::Parent(hit.path));
+                }
+                return;
+            }
+            Key::Named(Named::Backspace) => {
+                query.pop();
+                moved = false;
+            }
+            _ => {
+                moved = false;
+                if let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) {
+                    query.push_str(t);
+                }
+            }
+        }
+        if moved {
+            self.refresh_search_ctx();
+        }
+    }
+
     fn on_palette_key(&mut self, key: Key, typed: Option<&str>) -> Task<Message> {
         let Some(Dialog::Palette { query, cur }) = &mut self.dialog else { return Task::none() };
         let len = palette_hits(query, &self.config.actions).len();
@@ -2334,6 +2455,7 @@ impl Guppy {
             Cmd::EditExternal => self.edit_external(),
             Cmd::Quick => return self.update(Message::ToggleQuick),
             Cmd::Map => return self.update(Message::ToggleMap),
+            Cmd::Search => self.open_search(),
             Cmd::Mark | Cmd::Unmark => self.dialog = Some(Dialog::Mark { add: cmd == Cmd::Mark, pattern: self.last_pattern.clone() }),
             Cmd::Invert => self.invert_marks(),
             Cmd::Hidden => return self.update(Message::ToggleHidden),
@@ -3302,6 +3424,71 @@ impl Guppy {
                 .spacing(14)
                 .into()
             }
+            Dialog::Search { root, query, cur } => {
+                let field = container(text(if query.is_empty() { "type text, Enter searches …".to_string() } else { format!("{query}▏") }).size(13).color(if query.is_empty() { fg } else { rgb(t.bright) }))
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.25, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(4),
+                        ..Default::default()
+                    });
+                let running = self.search.as_ref().is_some_and(|s| !s.finished());
+                let scanned = self.search.as_ref().map_or(0, |s| s.scanned());
+                let n = self.search_hits.len();
+                let status = match () {
+                    _ if self.search_for.is_empty() => format!("in {}", self.jumper.display(root)),
+                    _ if running => format!("searching … {scanned} files · {n} hits"),
+                    _ if n >= guppy_core::search::MAX_HITS => format!("first {n} hits · {scanned} files"),
+                    _ => format!("{n} hits in {scanned} files"),
+                };
+                const SHOWN: usize = 10;
+                let first = cur.saturating_sub(SHOWN - 1);
+                let mut list = column![].spacing(1);
+                for (k, h) in self.search_hits.iter().enumerate().skip(first).take(SHOWN) {
+                    let on = k == *cur;
+                    let rel = h.path.strip_prefix(root).unwrap_or(&h.path).display().to_string();
+                    let c = if on { rgb(t.background) } else { rgb(t.bright) };
+                    list = list.push(
+                        container(
+                            row![
+                                container(text(format!("{rel}:{}", h.line)).size(12).color(if on { c } else { rgb(t.accent) }).wrapping(iced::widget::text::Wrapping::None)).width(Length::FillPortion(2)).clip(true),
+                                container(text(h.text.clone()).size(12).color(c).wrapping(iced::widget::text::Wrapping::None)).width(Length::FillPortion(3)).clip(true),
+                            ]
+                            .spacing(12),
+                        )
+                        .padding([4, 10])
+                        .style(move |_| container::Style {
+                            background: on.then(|| Background::Color(rgb(t.accent))),
+                            border: Border::default().rounded(if self.neon() { 0 } else { 4 }),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                // The place itself, a few lines around the hit.
+                let line = self.search_hits.get(*cur).map(|h| h.line);
+                let mut preview = column![].spacing(1);
+                for (no, l) in &self.search_ctx {
+                    let hit = Some(*no) == line;
+                    preview = preview.push(
+                        row![
+                            text(format!("{no:>5}")).size(11).color(if hit { rgb(t.accent) } else { Color { a: 0.5, ..fg } }),
+                            text(l.clone()).size(12).color(if hit { rgb(t.bright) } else { fg }).wrapping(iced::widget::text::Wrapping::None),
+                        ]
+                        .spacing(10),
+                    );
+                }
+                let preview = container(preview).padding([8, 10]).width(Length::Fill).clip(true).style(move |_| container::Style {
+                    background: Some(Color { a: 0.18, ..Color::BLACK }.into()),
+                    border: Border::default().rounded(4),
+                    ..Default::default()
+                });
+                let mut body = column![field, small(status), list].spacing(10);
+                if !self.search_ctx.is_empty() {
+                    body = body.push(preview);
+                }
+                body.push(small("Enter searches, then opens the hit · ↑↓ choose · Esc closes".into())).into()
+            }
             Dialog::Palette { query, cur } => {
                 let hits = palette_hits(query, &self.config.actions);
                 let field = container(text(if query.is_empty() { "type a command …".to_string() } else { format!("{query}▏") }).size(13).color(if query.is_empty() { fg } else { rgb(t.bright) }))
@@ -3671,7 +3858,7 @@ impl Guppy {
             .padding(22)
             .width(match dialog {
                 Dialog::View { .. } | Dialog::Edit { .. } => Length::Fill,
-                Dialog::Help { .. } => Length::Fixed(760.0),
+                Dialog::Help { .. } | Dialog::Search { .. } => Length::Fixed(760.0),
                 Dialog::Settings { .. } | Dialog::Jobs | Dialog::Conflict { .. } | Dialog::Palette { .. } | Dialog::Drives { .. } | Dialog::Attrs { .. } => Length::Fixed(560.0),
                 _ => Length::Fixed(480.0),
             })

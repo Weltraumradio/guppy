@@ -11,6 +11,7 @@ pub mod git;
 pub mod jump;
 pub mod ops;
 pub mod platform;
+pub mod search;
 pub mod theme;
 pub mod tools;
 

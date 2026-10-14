@@ -66,6 +66,8 @@ counts everything again.
 - Quick view (Ctrl+Q) turns the other pane into a preview that follows the cursor: text and
   code, images, the first page of a PDF, a frame from a video, tags and cover art of music,
   the text of Word, Excel, PowerPoint and LibreOffice files
+- Ctrl+F searches the text of all files below the current folder, in the background. Hits
+  come in while it runs, with the lines around each one; Enter takes you to the file
 - F3 opens a full viewer, F4 a small built-in editor (Shift+F4 your own editor)
 - Zip and tar archives (also .gz, .bz2, .xz, .zst) open like folders, and you can copy files
   out of them; 7z, rar and iso work too when bsdtar is installed
