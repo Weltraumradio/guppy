@@ -4556,7 +4556,11 @@ impl Guppy {
                         _ if shown => Color { a: 0.08, ..Color::WHITE },
                         _ => Color { a: 0.04, ..Color::WHITE },
                     }.into()),
-                    border: Border::default().rounded(5),
+                    border: Border {
+                        color: if shown { rgb(t.accent) } else { Color { a: 0.35, ..rgb(t.foreground) } },
+                        width: 1.0,
+                        radius: 5.0.into(),
+                    },
                     ..Default::default()
                 });
             let tip = match fav {
