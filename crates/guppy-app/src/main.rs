@@ -95,6 +95,8 @@ enum Message {
     Select(usize, usize),
     /// Click on a tab: side, position.
     TabClick(usize, usize),
+    /// Click on a part of the path in a pane header.
+    GoTo(usize, PathBuf),
     /// Mouse while a row is held: where it is, and the button let go.
     DragMoved(iced::Point),
     DragReleased,
@@ -1241,6 +1243,10 @@ impl Guppy {
             // Not while typing a name or with a dialog open (the mouse may just pass by).
             Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() && !self.quick => self.active = side,
             Message::HoverPane(_) => {}
+            Message::GoTo(side, path) => {
+                self.active = side;
+                self.navigate(path);
+            }
             Message::TabClick(side, k) => {
                 self.active = side;
                 self.switch_tab(side, k);
@@ -2835,7 +2841,12 @@ impl Guppy {
         if !self.config.view.dir_sizes || p.archive {
             return;
         }
-        let dirs = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
+        let mut dirs: Vec<PathBuf> = p.entries.iter().filter(|e| e.is_dir()).map(|e| e.path.clone()).collect();
+        // The folder itself and the ones above it (up to home) for the path line;
+        // what is below is mostly known already, so they add up quickly.
+        let home = dirs_home();
+        let top = if p.path.starts_with(&home) { home } else { p.path.clone() };
+        dirs.extend(p.path.ancestors().take_while(|a| a.starts_with(&top)).map(Path::to_path_buf));
         self.sizes.request(dirs, p.sizing.clone());
     }
 
@@ -3970,20 +3981,18 @@ impl Guppy {
 
         let header = container(
             row![
-                container(
-                    text(match &self.loads[side] {
-                        // Folder change still waiting on the filesystem.
-                        Some(l) if !matches!(l.after, After::Reload) => {
-                            let state = if l.since.elapsed() >= LOAD_SLOW { "not responding · Esc cancels" } else { "loading …" };
-                            format!("{} · {state}", l.path.display())
-                        }
-                        _ if self.neon() => format!("» {}", p.path.display()),
-                        _ => p.path.display().to_string(),
-                    })
-                        .size(12)
-                        .color(if active { rgb(t.accent) } else { rgb(t.foreground) })
-                        .wrapping(iced::widget::text::Wrapping::None),
-                )
+                container(match &self.loads[side] {
+                    // Folder change still waiting on the filesystem.
+                    Some(l) if !matches!(l.after, After::Reload) => {
+                        let state = if l.since.elapsed() >= LOAD_SLOW { "not responding · Esc cancels" } else { "loading …" };
+                        text(format!("{} · {state}", l.path.display()))
+                            .size(12)
+                            .color(if active { rgb(t.accent) } else { rgb(t.foreground) })
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into()
+                    }
+                    _ => self.crumbs(side, active),
+                })
                 .width(Length::Fill)
                 .clip(true),
                 text(self.git[side].as_ref().map(|g| {
@@ -4051,6 +4060,50 @@ impl Guppy {
         let sheet = self.sheet(content, side, tone, outline)
             .width(Length::FillPortion(3));
         mouse_area(sheet).on_enter(Message::HoverPane(side)).into()
+    }
+
+    /// The path as clickable parts, each with its size when known.
+    fn crumbs(&self, side: usize, active: bool) -> Element<'_, Message> {
+        let t = &self.theme;
+        let p = &self.panes[side];
+        let color = if active { rgb(t.accent) } else { rgb(t.foreground) };
+        let dim = Color { a: 0.65, ..color };
+        let home = dirs_home();
+        let mut parts: Vec<PathBuf> = p.path.ancestors().map(Path::to_path_buf).collect();
+        parts.reverse();
+        // Under home the path starts at `~`.
+        if p.path.starts_with(&home) {
+            parts.retain(|a| a.starts_with(&home));
+        }
+        let mut line = row![].align_y(iced::Alignment::Center);
+        if self.neon() {
+            line = line.push(text("» ").size(12).color(color));
+        }
+        let last = parts.len().saturating_sub(1);
+        for (k, part) in parts.into_iter().enumerate() {
+            let name = if part == home {
+                "~".to_string()
+            } else {
+                part.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| part.display().to_string())
+            };
+            let size = match self.sizes.get(&part) {
+                Some(DirSize::Done(n)) => Some(human_size(n)),
+                Some(DirSize::Cached(n)) => Some(format!("≈{}", human_size(n))),
+                Some(DirSize::Partial(n)) => Some(format!("…{}", human_size(n))),
+                None => None,
+            };
+            let mut seg = row![text(name).size(12).color(color).font(if k == last { BOLD } else { FONT }).wrapping(iced::widget::text::Wrapping::None)]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
+            if let Some(size) = size {
+                seg = seg.push(text(size).size(10).color(dim).wrapping(iced::widget::text::Wrapping::None));
+            }
+            if k > 0 && !(k == 1 && line_starts_root(&p.path, &home)) {
+                line = line.push(text(" / ").size(12).color(dim));
+            }
+            line = line.push(mouse_area(seg).on_press(Message::GoTo(side, part)).interaction(iced::mouse::Interaction::Pointer));
+        }
+        line.into()
     }
 
     /// Tabs above the pane header, only when there is more than one.
@@ -4443,4 +4496,9 @@ mod tests {
         assert!(palette_hits("zzzq", &[]).is_empty());
         assert_eq!(palette_hits("", &[]).len(), COMMANDS.len());
     }
+}
+
+/// Outside home the first part is `/` itself, which needs no separator after it.
+fn line_starts_root(path: &Path, home: &Path) -> bool {
+    !path.starts_with(home) && path.has_root()
 }

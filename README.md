@@ -26,6 +26,9 @@ counting). Results are cached on disk (`~/.cache/guppy/sizes.bin`), so the next 
 a folder the sizes are there at once (shown as `≈ 3.4 GB` until they've been checked again).
 When something changes, only the affected folders are counted again.
 
+The path line above each pane shows the size of every folder on the way, from `~` down to
+where you are, and each part is a link back up.
+
 Sort by size (Ctrl+S) and each row gets a small bar showing its share, which makes it easy to
 see what is eating your disk. Hard links are counted once, other drives mounted below a folder
 are left out, and network drives get fewer parallel requests so the NAS isn't flooded. Ctrl+R
