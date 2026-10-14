@@ -826,6 +826,8 @@ struct Drag {
     paths: Vec<PathBuf>,
     /// Where the pointer was first seen after the press; the drag starts 6 px away.
     start: Option<iced::Point>,
+    /// Where the pointer is now, for the label that follows it.
+    at: Option<iced::Point>,
     active: bool,
     /// Row under the pointer.
     over: Option<(usize, usize)>,
@@ -1226,11 +1228,12 @@ impl Guppy {
                 self.rename = None;
                 self.active = side;
                 self.panes[side].cursor = i;
-                self.drag = self.drag_sources(side, i).map(|paths| Drag { side, paths, start: None, active: false, over: None });
+                self.drag = self.drag_sources(side, i).map(|paths| Drag { side, paths, start: None, at: None, active: false, over: None });
             }
             Message::DragMoved(at) => {
                 if let Some(d) = &mut self.drag {
                     let start = *d.start.get_or_insert(at);
+                    d.at = Some(at);
                     d.active |= (at.x - start.x).hypot(at.y - start.y) > 6.0;
                 }
             }
@@ -2817,15 +2820,58 @@ impl Guppy {
                 ..Default::default()
             });
         let main: Element<'_, Message> = column![self.menubar(), desk, self.statusbar()].into();
-        let main = if self.drag.as_ref().is_some_and(|d| d.active) {
-            mouse_area(main).interaction(iced::mouse::Interaction::Grabbing).into()
-        } else {
-            main
+        let main = match self.drag.as_ref().filter(|d| d.active) {
+            Some(d) => {
+                let grab = mouse_area(main).interaction(iced::mouse::Interaction::Grabbing);
+                match d.at {
+                    // The label sits beside the pointer; it takes no mouse input, so the rows below still see the pointer.
+                    Some(at) => iced::widget::stack![grab, iced::widget::pin(self.drag_label(d)).position(iced::Point::new(at.x + 16.0, at.y + 12.0))].into(),
+                    None => grab.into(),
+                }
+            }
+            None => main,
         };
         match self.dialog_view() {
             Some(d) => iced::widget::stack![main, iced::widget::opaque(d)].into(),
             None => main.into(),
         }
+    }
+
+    /// What is being dragged and what letting go would do, next to the pointer.
+    fn drag_label(&self, d: &Drag) -> Element<'_, Message> {
+        let t = &self.theme;
+        let name = |p: &PathBuf| {
+            let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if p.is_dir() { format!("/{n}") } else { n }
+        };
+        let what = match d.paths.as_slice() {
+            [one] => name(one),
+            [first, rest @ ..] => format!("{} +{}", name(first), rest.len()),
+            [] => String::new(),
+        };
+        let (verb, color) = match self.drop_plan(d) {
+            Some((OpKind::Copy, _)) => ("COPY", rgb(t.marked)),
+            Some(_) => ("MOVE", rgb(t.accent)),
+            None => ("✕", rgb(t.red)),
+        };
+        container(
+            row![
+                text(verb).size(11).font(BOLD).color(color),
+                text(what).size(13).color(rgb(t.bright)).wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([5, 10])
+        .max_width(360)
+        .clip(true)
+        .style(move |_| container::Style {
+            background: Some(rgb(t.lighter_background).into()),
+            border: Border { color, width: 1.0, radius: (if self.neon() { 0 } else { 4 }).into() },
+            shadow: iced::Shadow { color: Color { a: 0.45, ..Color::BLACK }, offset: iced::Vector::new(0.0, 3.0), blur_radius: 10.0 },
+            ..Default::default()
+        })
+        .into()
     }
 
     fn dialog_view(&self) -> Option<Element<'_, Message>> {
