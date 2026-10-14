@@ -18,21 +18,62 @@ picks up the colors of the active Omarchy theme. It also builds on Windows and m
 
 ## What it does
 
-- Two panes, each with history, a filter as you type and fuzzy jumping (`~` or `/`, plus
-  folders from zoxide if you have it)
-- Copy, move, trash and delete run as background jobs with progress, a conflict dialog
-  (skip, overwrite, keep both), pause and resume; Ctrl+Z undoes the last move, rename or trash
+### Folder sizes, right in the list
+
+Every folder shows its real size, not just files. Guppy walks the folders in the background on
+all CPU cores while you keep working, and the numbers fill in as they come (`… 1.2 GB` while
+counting). Results are cached on disk (`~/.cache/guppy/sizes.bin`), so the next time you open
+a folder the sizes are there at once (shown as `≈ 3.4 GB` until they've been checked again).
+When something changes, only the affected folders are counted again.
+
+Sort by size (Ctrl+S) and each row gets a small bar showing its share, which makes it easy to
+see what is eating your disk. Hard links are counted once, other drives mounted below a folder
+are left out, and network drives get fewer parallel requests so the NAS isn't flooded. Ctrl+R
+counts everything again.
+
+### Moving around
+
+- Two panes, each with its own history (Alt+← / Alt+→)
+- Start typing to filter the list; `~` or `/` switches to fuzzy jumping across folders you've
+  visited (and those zoxide knows about, if you use it)
+- Drives, mounted media, network shares and your bookmarks on Alt+F1 / Alt+F2; Ctrl+D
+  bookmarks the current folder
+- Command palette (Ctrl+P) with every action, including your own
+- The lists update by themselves when files change on disk
+
+### Working with files
+
+- F5 copies, F6 moves, F8 trashes, Shift+F8 deletes. Everything runs as a background job with
+  progress in the status bar, so you can keep browsing
+- Several jobs queue up; in the jobs window (Ctrl+J) you can pause, resume, reorder or cancel
+  them. Large files are copied in chunks, so pausing takes effect right away
+- When a name already exists, you choose: skip, overwrite or keep both, once or for all
+- Ctrl+Z undoes the last move, rename or trash
 - Drag files with the mouse onto the other pane or onto a folder (Ctrl copies)
-- Folder sizes are computed in the background and cached, so they are there next time
-- Zip and tar archives open like folders (7z, rar and iso too, with bsdtar)
-- Quick view next to the list (Ctrl+Q): text, images, PDF, video frames, audio tags, office docs
-- Built-in viewer (F3) and editor (F4)
-- Git status per file and the branch in the pane header
-- Mark by pattern (`+`, `-`, `*`), permissions and owner (Alt+Enter), symlinks
-- Files on the system clipboard, so copy/paste works with other file managers
-- Drives and bookmarks (Alt+F1 / Alt+F2), command palette (Ctrl+P)
-- Your own commands on keys, e.g. "open a terminal here" or "pack the marked files"
-- Three looks: `paper` (Omarchy colors), `matte-black` and `neon`
+- Mark with Insert or Space, by pattern with `+` / `-` (e.g. `*.jpg`), invert with `*`
+- Ctrl+C / Ctrl+X / Ctrl+V use the system clipboard, so you can paste into Nautilus or from it
+- Rename in place (F2), new folder (F7), symlinks (Ctrl+Shift+F5), permissions and owner,
+  also recursively (Alt+Enter)
+
+### Looking inside
+
+- Quick view (Ctrl+Q) turns the other pane into a preview that follows the cursor: text and
+  code, images, the first page of a PDF, a frame from a video, tags and cover art of music,
+  the text of Word, Excel, PowerPoint and LibreOffice files
+- F3 opens a full viewer, F4 a small built-in editor (Shift+F4 your own editor)
+- Zip and tar archives (also .gz, .bz2, .xz, .zst) open like folders, and you can copy files
+  out of them; 7z, rar and iso work too when bsdtar is installed
+- Git repositories show the branch in the pane header and a mark next to changed, new and
+  ignored files
+
+### Making it yours
+
+- Your own commands on keys, with placeholders for the current file, the marked files and
+  both folders, optionally run in a terminal
+- Three looks: `paper` follows the colors of your Omarchy theme and changes with it,
+  `matte-black` keeps those colors everywhere, and `neon` is a dark terminal style
+- Settings (F12) for the everyday options, the rest in a commented config file
+- File names colored by type (code, documents, images, archives)
 
 ## Building
 
