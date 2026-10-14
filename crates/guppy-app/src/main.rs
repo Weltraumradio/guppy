@@ -44,6 +44,14 @@ const BOLD: Font = Font {
 /// Animation lengths: a glowing row, a row folding away.
 const GLOW: Duration = Duration::from_millis(900);
 const FOLD: Duration = Duration::from_millis(260);
+/// Dialogs, the active pane's frame and pictures fade in; the space map grows in.
+const APPEAR: Duration = Duration::from_millis(160);
+const MAP_IN: Duration = Duration::from_millis(320);
+
+/// Mix of two colors; `k` = 0 gives `a`, 1 gives `b`.
+fn mix(a: Color, b: Color, k: f32) -> Color {
+    Color { r: a.r + (b.r - a.r) * k, g: a.g + (b.g - a.g) * k, b: a.b + (b.b - a.b) * k, a: a.a + (b.a - a.a) * k }
+}
 
 /// Process start, for `GUPPY_BENCH`.
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -849,6 +857,11 @@ struct Guppy {
     glow: Vec<(PathBuf, std::time::Instant)>,
     /// Rows that just disappeared, per side: former position, entry, when; they fold away.
     ghosts: [Vec<(usize, Entry, std::time::Instant)>; 2],
+    /// When a dialog opened, a pane became active, the map opened, a picture came in.
+    dialog_at: Option<std::time::Instant>,
+    active_at: Option<std::time::Instant>,
+    map_at: Option<std::time::Instant>,
+    picture_at: Option<std::time::Instant>,
     /// Entry the quick view should show, and what it shows now.
     quick_want: Option<PathBuf>,
     quick_view: Option<(PathBuf, ViewBody)>,
@@ -945,6 +958,10 @@ impl Guppy {
             search_root_cache: None,
             glow: Vec::new(),
             ghosts: [Vec::new(), Vec::new()],
+            dialog_at: None,
+            active_at: None,
+            map_at: None,
+            picture_at: None,
             quick_want: None,
             quick_view: None,
             quick_gen: 0,
@@ -1101,7 +1118,22 @@ impl Guppy {
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
+        let dialog = self.dialog.as_ref().map(std::mem::discriminant);
+        let (active, map) = (self.active, self.map);
+        let map_path = self.panes[self.active].path.clone();
         let task = self.handle(msg);
+        // Start the small transitions when something appears.
+        let now = std::time::Instant::now();
+        let dialog_now = self.dialog.as_ref().map(std::mem::discriminant);
+        if dialog_now.is_some() && dialog_now != dialog {
+            self.dialog_at = Some(now);
+        }
+        if self.active != active {
+            self.active_at = Some(now);
+        }
+        if self.map && (!map || self.panes[self.active].path != map_path) {
+            self.map_at = Some(now);
+        }
         let later = Task::batch(std::mem::take(&mut self.later));
         Task::batch([task, later, self.sync_quick(), self.sync_git()])
     }
@@ -1528,6 +1560,9 @@ impl Guppy {
             }
             Message::QuickLoaded(path, body) => {
                 if self.quick_want.as_ref() == Some(&path) {
+                    if matches!(body, ViewBody::Picture { .. } | ViewBody::Image) {
+                        self.picture_at = Some(std::time::Instant::now());
+                    }
                     self.quick_view = Some((path, body));
                     return operation::scroll_to(quick_id(), AbsoluteOffset { x: None, y: Some(0.0) });
                 }
@@ -3114,7 +3149,19 @@ impl Guppy {
 
     /// One animation step: approaches the target exponentially, independent of frame rate.
     fn animating(&self) -> bool {
-        !self.glow.is_empty() || self.ghosts.iter().any(|g| !g.is_empty())
+        let running = |t: Option<std::time::Instant>, d: Duration| t.is_some_and(|t| t.elapsed() < d);
+        !self.glow.is_empty()
+            || self.ghosts.iter().any(|g| !g.is_empty())
+            || running(self.dialog_at, APPEAR)
+            || running(self.active_at, APPEAR)
+            || running(self.map_at, MAP_IN)
+            || running(self.picture_at, APPEAR)
+    }
+
+    /// Eased progress (0 to 1) of a transition that started at `t`; 1 when there is none.
+    fn eased(t: Option<std::time::Instant>, length: Duration) -> f32 {
+        let k = t.map_or(1.0, |t| Self::progress(t, length));
+        1.0 - (1.0 - k).powi(3)
     }
 
     /// How far along an animation that started at `t` is, 0 to 1.
@@ -3905,12 +3952,15 @@ impl Guppy {
             border: Border { color: rgb(t.accent), width: 1.5, radius: self.radius().into() },
             ..Default::default()
         });
+        // The backdrop darkens and the card rises a few pixels as it opens.
+        let k = Self::eased(self.dialog_at, APPEAR);
+        let pad = if viewer { 32.0 } else { 0.0 };
         Some(
             container(card)
                 .center(Length::Fill)
-                .padding(if viewer { 32 } else { 0 })
-                .style(|_| container::Style {
-                    background: Some(Color { a: 0.6, ..Color::BLACK }.into()),
+                .padding(iced::Padding { top: pad + 14.0 * (1.0 - k), bottom: pad, left: pad, right: pad })
+                .style(move |_| container::Style {
+                    background: Some(Color { a: 0.6 * k, ..Color::BLACK }.into()),
                     ..Default::default()
                 })
                 .into(),
@@ -3937,7 +3987,7 @@ impl Guppy {
             ViewBody::Image => fit(iced::widget::image(iced::widget::image::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown).into()),
             ViewBody::Svg => fit(svg(svg::Handle::from_path(path)).content_fit(iced::ContentFit::ScaleDown).into()),
             ViewBody::Picture { image, caption } => column![
-                container(iced::widget::image(image.clone()).content_fit(iced::ContentFit::ScaleDown)).center(Length::Fill),
+                container(iced::widget::image(image.clone()).content_fit(iced::ContentFit::ScaleDown).opacity(Self::eased(self.picture_at, APPEAR))).center(Length::Fill),
                 small(caption.clone()),
             ]
             .spacing(10)
@@ -3982,13 +4032,15 @@ impl Guppy {
         // The smallest ones together as one tile, so the map stays readable.
         const MAX: usize = 60;
         let rest: Vec<(&Entry, u64)> = if items.len() > MAX { items.split_off(MAX) } else { Vec::new() };
+        // Neighbouring tiles get clearly different hues, all derived from the theme's accent.
         let mut tiles: Vec<treemap::Tile> = items
             .iter()
-            .map(|(e, n)| treemap::Tile {
+            .enumerate()
+            .map(|(i, (e, n))| treemap::Tile {
                 path: Some(e.path.clone()),
                 name: if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() },
                 size: *n,
-                color: if e.is_dir() { rgb(t.accent) } else { self.class_color(e.class()) },
+                color: treemap::hue(rgb(t.accent), i),
             })
             .collect();
         if !rest.is_empty() {
@@ -4009,7 +4061,7 @@ impl Guppy {
         let body: Element<'_, Message> = if tiles.is_empty() {
             container(text(if pending { "counting …" } else { "Nothing here takes up space" }).size(12).color(rgb(t.foreground))).center(Length::Fill).into()
         } else {
-            let map = treemap::Map { tiles, cursor, text: rgb(t.bright), gap: rgb(t.sheet_dim) };
+            let map = treemap::Map { tiles, cursor, text: rgb(t.bright), gap: rgb(t.sheet_dim), grow: Self::eased(self.map_at, MAP_IN) };
             container(iced::widget::canvas(map).width(Length::Fill).height(Length::Fill)).padding(iced::Padding { top: 0.0, left: 8.0, right: 8.0, bottom: 8.0 }).into()
         };
         let outline = self.neon().then(|| rgb(t.muted));
@@ -4372,7 +4424,9 @@ impl Guppy {
         let body: Element<'_, Message> = if active && self.jumping() { self.jump_view() } else { list.into() };
         let tone = if active { t.sheet } else { t.sheet_dim };
         // Neon frames both panes; paper outlines only the active one.
-        let outline = if active { Some(rgb(t.accent)) } else { self.neon().then(|| rgb(t.muted)) };
+        let k = Self::eased(self.active_at, APPEAR);
+        let rest = if self.neon() { rgb(t.muted) } else { Color { a: 0.0, ..rgb(t.accent) } };
+        let outline = if active { Some(mix(rest, rgb(t.accent), k)) } else { self.neon().then(|| rgb(t.muted)) };
         let content: Element<'_, Message> = match self.tab_bar(side, active) {
             Some(bar) => column![bar, header, body].into(),
             None => column![header, body].into(),
@@ -4416,7 +4470,14 @@ impl Guppy {
                 .spacing(4)
                 .align_y(iced::Alignment::Center);
             if let Some(size) = size {
-                seg = seg.push(text(size).size(10).color(dim).wrapping(iced::widget::text::Wrapping::None));
+                let badge = container(text(size).size(11).font(BOLD).color(rgb(t.bright)).wrapping(iced::widget::text::Wrapping::None))
+                    .padding([1, 6])
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.28, ..Color::BLACK }.into()),
+                        border: Border::default().rounded(if self.neon() { 0 } else { 3 }),
+                        ..Default::default()
+                    });
+                seg = seg.push(badge);
             }
             if k > 0 && !(k == 1 && line_starts_root(&p.path, &home)) {
                 line = line.push(text(" / ").size(12).color(dim));
@@ -4439,8 +4500,10 @@ impl Guppy {
             let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.path.display().to_string());
             let color = if shown && active { rgb(t.accent) } else if shown { rgb(t.bright) } else { rgb(t.foreground) };
             let line = if shown { color } else { Color::TRANSPARENT };
+            // The number is the Ctrl+number that shows the tab.
+            let number = text(if k < 9 { format!("{}", k + 1) } else { String::new() }).size(10).font(BOLD).color(Color { a: 0.6, ..color });
             mouse_area(
-                container(text(name).size(12).font(if shown { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None))
+                container(row![number, text(name).size(12).font(if shown { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None)].spacing(6).align_y(iced::Alignment::Center))
                     .padding([5, 10])
                     .max_width(180)
                     .clip(true)

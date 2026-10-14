@@ -22,6 +22,48 @@ pub struct Map {
     pub cursor: Option<PathBuf>,
     pub text: Color,
     pub gap: Color,
+    /// 0 to 1 while the map appears: tiles grow from their centers and fade in.
+    pub grow: f32,
+}
+
+/// The `i`-th of a row of distinct, harmonious colors starting at `base`:
+/// the hue turns by the golden angle each time, saturation and lightness stay even.
+pub fn hue(base: Color, i: usize) -> Color {
+    let (h, _, _) = to_hsl(base);
+    from_hsl((h + i as f32 * 137.508) % 360.0, 0.55, 0.56)
+}
+
+fn to_hsl(c: Color) -> (f32, f32, f32) {
+    let (max, min) = (c.r.max(c.g).max(c.b), c.r.min(c.g).min(c.b));
+    let l = (max + min) / 2.0;
+    if max == min {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == c.r {
+        (c.g - c.b) / d + if c.g < c.b { 6.0 } else { 0.0 }
+    } else if max == c.g {
+        (c.b - c.r) / d + 2.0
+    } else {
+        (c.r - c.g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+fn from_hsl(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Color::from_rgb(r + m, g + m, b + m)
 }
 
 /// Rectangles for `values` (largest first) filling `r`, as square as possible
@@ -130,12 +172,15 @@ impl canvas::Program<Message> for Map {
             if r.width < 1.0 || r.height < 1.0 {
                 continue;
             }
+            // Growing in: each tile starts a little smaller around its center.
+            let g = 0.92 + 0.08 * self.grow;
+            let r = Rectangle::new(Point::new(r.x + r.width * (1.0 - g) / 2.0, r.y + r.height * (1.0 - g) / 2.0), Size::new(r.width * g, r.height * g));
             let on = *hover == Some(i);
             let current = t.path.is_some() && t.path == self.cursor;
-            let fill = Color { a: if on { 0.55 } else if current { 0.45 } else { 0.28 }, ..t.color };
+            let fill = Color { a: (if on { 0.62 } else if current { 0.52 } else { 0.38 }) * self.grow, ..t.color };
             // A 2 px gap between tiles in the background color.
             let inner = Rectangle::new(Point::new(r.x + 1.0, r.y + 1.0), Size::new((r.width - 2.0).max(0.0), (r.height - 2.0).max(0.0)));
-            frame.fill_rectangle(r.position(), r.size(), self.gap);
+            frame.fill_rectangle(r.position(), r.size(), Color { a: self.gap.a * self.grow, ..self.gap });
             frame.fill_rectangle(inner.position(), inner.size(), fill);
             if current {
                 frame.stroke_rectangle(inner.position(), inner.size(), canvas::Stroke::default().with_color(self.text).with_width(1.5));
@@ -165,6 +210,14 @@ impl canvas::Program<Message> for Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hues_differ() {
+        let base = Color::from_rgb8(0xe6, 0x8e, 0x0d);
+        let (a, b) = (to_hsl(hue(base, 0)).0, to_hsl(hue(base, 1)).0);
+        assert!((a - to_hsl(base).0).abs() < 1.0);
+        assert!(((b - a).rem_euclid(360.0) - 137.5).abs() < 1.0);
+    }
 
     #[test]
     fn tiles_fill_the_area() {

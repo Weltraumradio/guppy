@@ -82,7 +82,7 @@ counts everything again.
   `matte-black` keeps those colors everywhere, and `neon` is a dark terminal style
 - Settings (F12) for the everyday options, the rest in a commented config file
 - Small animations: new files glow briefly, removed ones fold away, a folder pulses when
-  you drop something on it
+  you drop something on it, dialogs and pictures fade in, the space map grows in
 - File names colored by type (code, documents, images, archives)
 
 ## Building
