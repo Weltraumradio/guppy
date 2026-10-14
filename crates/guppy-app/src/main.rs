@@ -76,10 +76,11 @@ fn prefer_vulkan() {
     }
 }
 
-/// Colors for a look: neon is a fixed palette, paper follows the Omarchy theme.
+/// Colors for a look: neon and matte black are fixed, paper follows the Omarchy theme.
 fn load_theme(look: Look) -> guppy_core::Theme {
     match look {
         Look::Paper => guppy_core::Theme::load(),
+        Look::MatteBlack => guppy_core::Theme::default(),
         Look::Neon => guppy_core::Theme::neon(),
     }
 }
@@ -395,7 +396,7 @@ fn setting_step(c: &mut Config, row: usize, dir: i32) {
         6 => flip(&mut c.confirm.delete),
         9 => c.network.threads = (c.network.threads as i32 + dir).clamp(1, 32) as usize,
         10 => flip(&mut c.start.help),
-        11 => c.view.look = if c.view.look == Look::Paper { Look::Neon } else { Look::Paper },
+        11 => c.view.look = c.view.look.step(dir),
         _ => {}
     }
 }
@@ -471,7 +472,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Bookmark this folder", "Ctrl+D", Cmd::Bookmark),
     ("Running jobs", "Ctrl+J", Cmd::Jobs),
     ("Pause / resume job", "Ctrl+Shift+J", Cmd::PauseJob),
-    ("Switch look: paper / neon", "", Cmd::Look),
+    ("Switch look: paper / matte black / neon", "", Cmd::Look),
     ("Settings", "F12", Cmd::Settings),
     ("Key help", "F1", Cmd::Help),
     ("Empty trash", "", Cmd::EmptyTrash),
@@ -2156,7 +2157,7 @@ impl Guppy {
             }
             Cmd::Look => {
                 let mut new = self.config.clone();
-                new.view.look = if new.view.look == Look::Paper { Look::Neon } else { Look::Paper };
+                new.view.look = new.view.look.step(1);
                 self.set_config(new);
             }
             Cmd::Settings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),

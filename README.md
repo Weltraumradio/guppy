@@ -2,7 +2,7 @@
 
 A modern, lightweight two-pane file manager for Linux in the spirit of Norton Commander,
 written in Rust with [iced](https://iced.rs). Colors follow the active Omarchy theme
-("paper" look); a "neon" terminal look is built in.
+("paper" look); "matte-black" and a "neon" terminal look are built in.
 
 ```
 cargo build --release

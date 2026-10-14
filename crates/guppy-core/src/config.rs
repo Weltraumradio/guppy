@@ -87,6 +87,9 @@ pub enum Look {
     /// Warm paper sheets in the Omarchy theme's colors.
     #[default]
     Paper,
+    /// Paper sheets in Omarchy's "Matte Black", whatever theme is active.
+    #[serde(rename = "matte-black")]
+    MatteBlack,
     /// Cyberpunk terminal: black glass, neon lines, scanlines.
     Neon,
 }
@@ -95,8 +98,16 @@ impl Look {
     pub fn name(self) -> &'static str {
         match self {
             Look::Paper => "paper",
+            Look::MatteBlack => "matte-black",
             Look::Neon => "neon",
         }
+    }
+
+    /// The next look forward (`dir` > 0) or back, round in a circle.
+    pub fn step(self, dir: i32) -> Self {
+        const ALL: [Look; 3] = [Look::Paper, Look::MatteBlack, Look::Neon];
+        let i = ALL.iter().position(|&l| l == self).unwrap_or(0) as i32;
+        ALL[(i + dir.signum()).rem_euclid(ALL.len() as i32) as usize]
     }
 }
 
@@ -159,7 +170,7 @@ help = true        # show the key help at startup
 show_hidden = false
 sort = "name"      # "name", "size" or "date"
 dir_sizes = true   # compute folder sizes automatically (otherwise only on Ctrl+R)
-look = "paper"     # "paper" (Omarchy colors) or "neon" (cyberpunk terminal)
+look = "paper"     # "paper" (Omarchy colors), "matte-black" or "neon" (cyberpunk terminal)
 
 [confirm]
 # Ask before these operations. Progress is shown either way.
