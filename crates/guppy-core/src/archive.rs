@@ -1,5 +1,6 @@
-//! Archives as read-only folders. Reading and extracting goes through `bsdtar`
-//! (libarchive, part of every Arch system), which knows zip, tar.*, 7z, rar, iso.
+//! Archives as read-only folders. Zip and tar (plain, gz, bz2, xz, zst) are read
+//! by Guppy itself; everything else (7z, rar, iso, …) goes through `bsdtar`
+//! (libarchive, part of every Arch system, `tar.exe` on Windows).
 //!
 //! A path inside an archive is the archive's path joined with the member's path,
 //! e.g. `/home/kc/x.zip/docs/a.txt`; [`split`] takes it apart again.
@@ -46,6 +47,8 @@ pub fn split(path: &Path) -> Option<(PathBuf, PathBuf)> {
 /// One member as `bsdtar -tv` lists it.
 #[derive(Debug, Clone)]
 struct Member {
+    /// Position in the archive (used by the built-in readers).
+    index: usize,
     /// Normalized path without a leading `./` or `/`.
     path: PathBuf,
     kind: EntryKind,
@@ -72,6 +75,11 @@ fn listing(archive: &Path) -> io::Result<Arc<Listing>> {
     {
         return Ok(l.clone());
     }
+    if let Some(format) = native::format(archive) {
+        let l = Arc::new(native::list(archive, format)?);
+        CACHE.lock().unwrap().get_or_insert_default().insert(archive.to_path_buf(), (stamp.0, stamp.1, l.clone()));
+        return Ok(l);
+    }
     let out = crate::platform::command(BSDTAR)
         .env("LC_ALL", "C")
         .args(["-tv", "--numeric-owner", "-f"])
@@ -90,7 +98,7 @@ fn listing(archive: &Path) -> io::Result<Arc<Listing>> {
 
 fn missing(e: io::Error) -> io::Error {
     if e.kind() == io::ErrorKind::NotFound {
-        io::Error::other("bsdtar is not installed (package libarchive)")
+        io::Error::other(crate::tools::missing_hint("bsdtar"))
     } else {
         e
     }
@@ -128,6 +136,7 @@ fn parse(out: &str) -> Listing {
             continue;
         }
         members.push(Member {
+            index: members.len(),
             path: PathBuf::from(name),
             kind,
             size: fields[4].parse().unwrap_or(0),
@@ -222,6 +231,9 @@ fn pattern(l: &Listing, inner: &Path) -> String {
 /// `on_file` gets each extracted member's size; returning `false` aborts.
 pub fn extract(archive: &Path, members: &[PathBuf], dir: &Path, mut on_file: impl FnMut(&str, u64) -> bool) -> io::Result<()> {
     let l = listing(archive)?;
+    if let Some(format) = native::format(archive) {
+        return native::extract(archive, format, &l, members, dir, on_file);
+    }
     let sizes: HashMap<String, u64> = l.members.iter().map(|m| (m.path.to_string_lossy().into_owned(), m.size)).collect();
     let mut child = crate::platform::command(BSDTAR)
         .env("LC_ALL", "C")
@@ -262,6 +274,9 @@ pub fn extract(archive: &Path, members: &[PathBuf], dir: &Path, mut on_file: imp
 /// Reads up to `max` bytes of one member, for the viewer.
 pub fn read_member(archive: &Path, inner: &Path, max: usize) -> io::Result<Vec<u8>> {
     let l = listing(archive)?;
+    if let Some(format) = native::format(archive) {
+        return native::read_member(archive, format, &l, inner, max);
+    }
     let mut child = crate::platform::command(BSDTAR)
         .args(["-xOf"])
         .arg(archive)
@@ -287,6 +302,192 @@ pub fn read_path(path: &Path) -> io::Result<Vec<Entry>> {
     match split(path) {
         Some((archive, inner)) => read_dir(&archive, &inner),
         None => crate::fs::read_dir(path),
+    }
+}
+
+/// Zip and tar archives, read without external programs.
+mod native {
+    use std::fs::File;
+    use std::io::{self, BufReader, Read};
+    use std::path::{Component, Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    use super::{Listing, Member};
+    use crate::fs::EntryKind;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Format {
+        Zip,
+        Tar,
+        TarGz,
+        TarBz2,
+        TarXz,
+        TarZst,
+    }
+
+    /// The built-in reader for this file name, if there is one.
+    pub fn format(archive: &Path) -> Option<Format> {
+        let n = archive.file_name()?.to_string_lossy().to_ascii_lowercase();
+        let has = |exts: &[&str]| exts.iter().any(|e| n.ends_with(e));
+        // Office documents and e-books are zip files too (the viewer reads their text).
+        Some(if has(&[".zip", ".jar", ".apk", ".cbz", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub"]) {
+            Format::Zip
+        } else if has(&[".tar"]) {
+            Format::Tar
+        } else if has(&[".tar.gz", ".tgz"]) {
+            Format::TarGz
+        } else if has(&[".tar.bz2", ".tbz", ".tbz2"]) {
+            Format::TarBz2
+        } else if has(&[".tar.xz", ".txz"]) {
+            Format::TarXz
+        } else if has(&[".tar.zst", ".tzst"]) {
+            Format::TarZst
+        } else {
+            return None;
+        })
+    }
+
+    /// Member name without `./` or `/` in front and `/` at the end; `None` for
+    /// the root itself and for names that would leave the target folder (`..`).
+    fn clean(name: &str) -> Option<PathBuf> {
+        let p = Path::new(name.trim_start_matches("./").trim_start_matches('/').trim_end_matches('/'));
+        if p.as_os_str().is_empty() || p == Path::new(".") || !p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) {
+            return None;
+        }
+        Some(p.components().filter(|c| matches!(c, Component::Normal(_))).collect())
+    }
+
+    fn zip_err(e: zip::result::ZipError) -> io::Error {
+        match e {
+            zip::result::ZipError::Io(e) => e,
+            e => io::Error::other(e.to_string()),
+        }
+    }
+
+    fn zip_time(t: zip::DateTime) -> Option<SystemTime> {
+        use chrono::{Local, NaiveDate, TimeZone};
+        let naive = NaiveDate::from_ymd_opt(t.year().into(), t.month().into(), t.day().into())?.and_hms_opt(t.hour().into(), t.minute().into(), t.second().into())?;
+        Local.from_local_datetime(&naive).earliest().map(SystemTime::from)
+    }
+
+    /// The decompressed tar stream.
+    fn tar_stream(archive: &Path, format: Format) -> io::Result<Box<dyn Read>> {
+        let file = BufReader::new(File::open(archive)?);
+        Ok(match format {
+            Format::TarGz => Box::new(flate2::read::MultiGzDecoder::new(file)),
+            Format::TarBz2 => Box::new(bzip2::read::MultiBzDecoder::new(file)),
+            Format::TarXz => Box::new(lzma_rust2::XzReader::new(file, true)),
+            Format::TarZst => Box::new(ruzstd::decoding::StreamingDecoder::new(file).map_err(|e| io::Error::other(e.to_string()))?),
+            _ => Box::new(file),
+        })
+    }
+
+    pub fn list(archive: &Path, format: Format) -> io::Result<Listing> {
+        let mut members = Vec::new();
+        if format == Format::Zip {
+            let mut z = zip::ZipArchive::new(BufReader::new(File::open(archive)?)).map_err(zip_err)?;
+            for index in 0..z.len() {
+                let f = z.by_index_raw(index).map_err(zip_err)?;
+                let Some(path) = f.name().ok().and_then(|n| clean(&n)) else { continue };
+                let kind = if f.is_dir() { EntryKind::Dir } else if f.is_symlink() { EntryKind::Symlink } else { EntryKind::File };
+                members.push(Member { index, path, kind, size: f.size(), modified: f.last_modified().and_then(zip_time) });
+            }
+        } else {
+            let mut t = tar::Archive::new(tar_stream(archive, format)?);
+            for (index, e) in t.entries()?.enumerate() {
+                let e = e?;
+                let Some(path) = e.path().ok().and_then(|p| clean(&p.to_string_lossy())) else { continue };
+                let h = e.header();
+                let kind = match h.entry_type() {
+                    t if t.is_dir() => EntryKind::Dir,
+                    t if t.is_symlink() => EntryKind::Symlink,
+                    _ => EntryKind::File,
+                };
+                let modified = h.mtime().ok().map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+                members.push(Member { index, path, kind, size: if kind == EntryKind::File { h.size().unwrap_or(0) } else { 0 }, modified });
+            }
+        }
+        Ok(Listing { prefix: String::new(), members })
+    }
+
+    /// Writes one zip member below `dir`; folders and links included.
+    fn unpack_zip(f: &mut zip::read::ZipFile<'_, BufReader<File>>, m: &Member, dir: &Path) -> io::Result<()> {
+        let out = dir.join(&m.path);
+        if m.kind == EntryKind::Dir {
+            return std::fs::create_dir_all(&out);
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        if m.kind == EntryKind::Symlink {
+            let mut target = String::new();
+            f.read_to_string(&mut target)?;
+            return std::os::unix::fs::symlink(target, &out);
+        }
+        let mut file = File::create(&out)?;
+        io::copy(f, &mut file)?;
+        if let Some(t) = m.modified {
+            let _ = file.set_modified(t);
+        }
+        #[cfg(unix)]
+        if let Some(mode) = f.unix_mode().filter(|m| m & 0o111 != 0) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777));
+        }
+        Ok(())
+    }
+
+    pub fn extract(
+        archive: &Path,
+        format: Format,
+        l: &Listing,
+        wanted: &[PathBuf],
+        dir: &Path,
+        mut on_file: impl FnMut(&str, u64) -> bool,
+    ) -> io::Result<()> {
+        let picked = |p: &Path| wanted.iter().any(|w| p.starts_with(w));
+        if format == Format::Zip {
+            let mut z = zip::ZipArchive::new(BufReader::new(File::open(archive)?)).map_err(zip_err)?;
+            for m in l.members.iter().filter(|m| picked(&m.path)) {
+                let mut f = z.by_index(m.index).map_err(zip_err)?;
+                unpack_zip(&mut f, m, dir)?;
+                if !on_file(&m.path.to_string_lossy(), m.size) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        let mut t = tar::Archive::new(tar_stream(archive, format)?);
+        for e in t.entries()? {
+            let mut e = e?;
+            let Some(path) = e.path().ok().and_then(|p| clean(&p.to_string_lossy())) else { continue };
+            if !picked(&path) {
+                continue;
+            }
+            let size = if e.header().entry_type().is_file() { e.header().size().unwrap_or(0) } else { 0 };
+            // unpack_in refuses anything that would land outside `dir`.
+            e.unpack_in(dir)?;
+            if !on_file(&path.to_string_lossy(), size) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_member(archive: &Path, format: Format, l: &Listing, inner: &Path, max: usize) -> io::Result<Vec<u8>> {
+        let m = l.members.iter().find(|m| m.path == inner && m.kind == EntryKind::File).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not in the archive"))?;
+        let mut buf = Vec::new();
+        if format == Format::Zip {
+            let mut z = zip::ZipArchive::new(BufReader::new(File::open(archive)?)).map_err(zip_err)?;
+            z.by_index(m.index).map_err(zip_err)?.take(max as u64).read_to_end(&mut buf)?;
+            return Ok(buf);
+        }
+        let mut t = tar::Archive::new(tar_stream(archive, format)?);
+        if let Some(e) = t.entries()?.nth(m.index) {
+            e?.take(max as u64).read_to_end(&mut buf)?;
+        }
+        Ok(buf)
     }
 }
 
@@ -353,6 +554,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(out.join("d/e/f.txt")).unwrap(), "hello");
         assert!(!out.join("top.txt").exists());
         assert_eq!(seen, 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every tar flavour the built-in reader knows, made with bsdtar for comparison.
+    #[test]
+    fn native_tar_flavours() {
+        if crate::platform::command(BSDTAR).arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("guppy-tars-{}", std::process::id()));
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        std::fs::write(src.join("d/f.txt"), "hello").unwrap();
+        for (name, flag) in [("t.tar", None), ("t.tar.gz", Some("-z")), ("t.tar.bz2", Some("-j")), ("t.tar.xz", Some("-J")), ("t.tar.zst", Some("--zstd"))] {
+            let a = root.join(name);
+            let mut c = crate::platform::command(BSDTAR);
+            c.arg("-cf").arg(&a);
+            if let Some(f) = flag {
+                c.arg(f);
+            }
+            assert!(c.arg("-C").arg(&src).arg("d").status().unwrap().success(), "{name}");
+            assert!(native::format(&a).is_some(), "{name}");
+            assert_eq!(read_path(&a.join("d")).unwrap()[0].name, "f.txt", "{name}");
+            assert_eq!(read_member(&a, Path::new("d/f.txt"), 10).unwrap(), b"hello", "{name}");
+            let out = root.join(format!("out-{name}"));
+            std::fs::create_dir_all(&out).unwrap();
+            extract(&a, &[PathBuf::from("d")], &out, |_, _| true).unwrap();
+            assert_eq!(std::fs::read_to_string(out.join("d/f.txt")).unwrap(), "hello", "{name}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

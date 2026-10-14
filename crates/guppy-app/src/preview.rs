@@ -189,7 +189,7 @@ fn pdf(path: &Path) -> ViewBody {
     }
     match run(command("pdftotext").args(["-l", "3", "-layout"]).arg(path).arg("-")) {
         Some(t) if !String::from_utf8_lossy(&t).trim().is_empty() => ViewBody::Text { text: String::from_utf8_lossy(&t).replace('\u{c}', "\n"), truncated: false },
-        _ => ViewBody::Other("PDF · install poppler for a preview".into()),
+        _ => ViewBody::Other(format!("PDF preview {}", guppy_core::tools::missing_hint("pdftoppm"))),
     }
 }
 
@@ -241,7 +241,7 @@ fn video(path: &Path) -> ViewBody {
         .or_else(|| run(command("ffmpeg").args(["-v", "quiet", "-ss", "3", "-i"]).arg(path).args(["-frames:v", "1", "-vf", "scale=640:-1", "-f", "image2pipe", "-c:v", "png", "-"])));
     match frame {
         Some(png) => picture(png, info),
-        None if info.is_empty() => ViewBody::Other("Video · install ffmpeg for a preview".into()),
+        None if info.is_empty() => ViewBody::Other(format!("Video preview {}", guppy_core::tools::missing_hint("ffmpeg"))),
         None => ViewBody::Text { text: info, truncated: false },
     }
 }
@@ -249,7 +249,7 @@ fn video(path: &Path) -> ViewBody {
 /// Tags and format, with the cover art if there is one.
 fn audio(path: &Path) -> ViewBody {
     let Some((info, tags)) = media_info(path) else {
-        return ViewBody::Other("Audio · install ffmpeg for details".into());
+        return ViewBody::Other(format!("Audio details {}", guppy_core::tools::missing_hint("ffmpeg")));
     };
     let mut lines: Vec<String> = tags.iter().map(|(k, v)| format!("{k:<13} {v}")).collect();
     lines.push(String::new());
@@ -267,7 +267,7 @@ fn converted(path: &Path) -> ViewBody {
     src.push("[0]");
     match run(command("magick").arg(src).args(["-resize", "1600x1600>", "png:-"])) {
         Some(png) => picture(png, String::new()),
-        None => ViewBody::Other("Image · install ImageMagick for a preview".into()),
+        None => ViewBody::Other(format!("Image preview {}", guppy_core::tools::missing_hint("magick"))),
     }
 }
 

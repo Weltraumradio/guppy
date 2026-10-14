@@ -781,6 +781,10 @@ struct Guppy {
     loads: [Option<Loading>; 2],
     /// Tasks started where no task can be returned, run after the current message.
     later: Vec<Task<Message>>,
+    /// Which helper programs were found, checked whenever the settings open.
+    tools_found: Vec<bool>,
+    /// Outcome of the last install started from the settings.
+    tools_note: Option<String>,
     /// Git status per pane, and whether it must be read again.
     git: [Option<std::sync::Arc<guppy_core::git::Status>>; 2],
     git_stale: [bool; 2],
@@ -852,6 +856,8 @@ impl Guppy {
             last_move: None,
             loads: [None, None],
             later: Vec::new(),
+            tools_found: Vec::new(),
+            tools_note: None,
             git: [None, None],
             git_stale: [true, true],
             config,
@@ -1239,7 +1245,7 @@ impl Guppy {
             Message::NewDir => self.new_dir(),
             Message::DialogConfirm => self.confirm_dialog(),
             Message::DialogCancel => self.cancel_dialog(),
-            Message::OpenSettings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
+            Message::OpenSettings => self.open_settings(),
             Message::Viewed(path, body) => {
                 if let Some(Dialog::View { path: p, body: b }) = &mut self.dialog
                     && *p == path
@@ -1528,9 +1534,32 @@ impl Guppy {
     }
 
     /// Enter/Space/←/→ on the selected settings row.
+    fn open_settings(&mut self) {
+        self.tools_found = guppy_core::tools::TOOLS.iter().map(|t| guppy_core::tools::find(t.bin).is_some()).collect();
+        self.tools_note = None;
+        self.dialog = Some(Dialog::Settings { row: 0, edit: None });
+    }
+
+    /// Enter on a helper program: installs it in a terminal or opens its download page.
+    fn tool_activate(&mut self, k: usize) {
+        let Some(t) = guppy_core::tools::TOOLS.get(k) else { return };
+        if self.tools_found.get(k) == Some(&true) {
+            return;
+        }
+        self.tools_note = Some(match guppy_core::tools::install(t) {
+            Ok(()) if guppy_core::tools::install_command(t).is_some() => format!("Installing {} in a terminal · open the settings again afterwards", t.name),
+            Ok(()) => format!("Download page for {} opened in the browser", t.name),
+            Err(e) => format!("{}: {e}", t.name),
+        });
+    }
+
     fn settings_activate(&mut self, dir: i32) {
         let Some(Dialog::Settings { row, edit }) = &mut self.dialog else { return };
         let row = *row;
+        if row >= SETTINGS.len() {
+            self.tool_activate(row - SETTINGS.len());
+            return;
+        }
         if setting_is_text(row) {
             let c = &self.config.start;
             *edit = Some(if row == 7 { c.left.clone() } else { c.right.clone() });
@@ -1566,7 +1595,7 @@ impl Guppy {
             }
             return;
         }
-        let last = SETTINGS.len() - 1;
+        let last = SETTINGS.len() + guppy_core::tools::TOOLS.len() - 1;
         let Some(Dialog::Settings { row, .. }) = &mut self.dialog else { return };
         match key.as_ref() {
             Key::Named(Named::ArrowDown) => *row = (*row + 1).min(last),
@@ -2160,7 +2189,7 @@ impl Guppy {
                 new.view.look = new.view.look.step(1);
                 self.set_config(new);
             }
-            Cmd::Settings => self.dialog = Some(Dialog::Settings { row: 0, edit: None }),
+            Cmd::Settings => self.open_settings(),
             Cmd::Help => self.dialog = Some(Dialog::Help { startup: false }),
         }
         self.scroll_into_view()
@@ -3162,7 +3191,19 @@ impl Guppy {
             Dialog::Settings { row: sel, edit } => {
                 let mut list = column![].spacing(2);
                 let mut section = "";
-                for (i, &(head, label)) in SETTINGS.iter().enumerate() {
+                // Fixed rows, then "Helper programs" with their status.
+                let tool_rows = guppy_core::tools::TOOLS.iter().enumerate().map(|(k, tool)| {
+                    let value = if self.tools_found.get(k) == Some(&true) {
+                        "found"
+                    } else if guppy_core::tools::install_command(tool).is_some() {
+                        "missing · Enter installs"
+                    } else {
+                        "missing · Enter: download page"
+                    };
+                    (SETTINGS.len() + k, "Helper programs", tool.name, Some(value.to_string()))
+                });
+                let rows = SETTINGS.iter().enumerate().map(|(i, &(head, label))| (i, head, label, None)).chain(tool_rows);
+                for (i, head, label, fixed) in rows {
                     if head != section {
                         section = head;
                         let gap = if i == 0 { 0 } else { 12 };
@@ -3171,11 +3212,12 @@ impl Guppy {
                         );
                     }
                     let selected = i == *sel;
-                    let value = match edit {
-                        Some(e) if selected => format!("{e}▏"),
+                    let value = match (edit, fixed) {
+                        (Some(e), _) if selected => format!("{e}▏"),
+                        (_, Some(v)) => v,
                         _ => setting_value(&self.config, i),
                     };
-                    let on = !matches!(value.as_str(), "off");
+                    let on = !matches!(value.as_str(), "off") && !value.starts_with("missing");
                     let value_color = if selected { rgb(t.background) } else if on { rgb(t.bright) } else { fg };
                     let label_color = if selected { rgb(t.background) } else { fg };
                     list = list.push(
@@ -3202,16 +3244,26 @@ impl Guppy {
                         }),
                     );
                 }
-                let hint = match edit {
-                    Some(_) => "type a path · empty = startup folder · Enter saves · Esc cancels",
-                    None if setting_is_text(*sel) => "Enter edits · . takes this pane's folder · Esc closes",
-                    None => "↑↓ choose · Space/←→ change · Esc closes",
+                let tool = sel.checked_sub(SETTINGS.len()).and_then(|k| guppy_core::tools::TOOLS.get(k));
+                let hint = match (edit, tool) {
+                    (Some(_), _) => "type a path · empty = startup folder · Enter saves · Esc cancels".to_string(),
+                    (None, Some(t)) => match guppy_core::tools::install_command(t) {
+                        _ if t.builtin && guppy_core::tools::find(t.bin).is_some() => format!("For {} · part of the system", t.purpose),
+                        Some(cmd) => format!("For {} · Enter runs: {cmd}", t.purpose),
+                        None => format!("For {} · Enter opens {}", t.purpose, t.url),
+                    },
+                    (None, None) if setting_is_text(*sel) => "Enter edits · . takes this pane's folder · Esc closes".to_string(),
+                    (None, None) => "↑↓ choose · Space/←→ change · Esc closes".to_string(),
+                };
+                let hint = match &self.tools_note {
+                    Some(note) => format!("{note}\n{hint}"),
+                    None => hint,
                 };
                 let file = Config::path().map(|p| self.jumper.display(&p)).unwrap_or_default();
                 column![
                     title("Settings".into()),
                     list,
-                    column![small(hint.into()), text(format!("Saved to {file}")).size(11).color(Color { a: 0.6, ..fg })].spacing(4),
+                    column![small(hint), text(format!("Saved to {file}")).size(11).color(Color { a: 0.6, ..fg })].spacing(4),
                 ]
                 .spacing(16)
                 .into()

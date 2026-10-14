@@ -12,6 +12,15 @@ target/release/guppy-app
 Press F1 for all keys, Ctrl+P for the command palette. Settings live in
 `~/.config/guppy/config.toml` (written with comments on first start; F12 edits the common ones).
 
+## Helper programs
+
+Guppy needs nothing else to run; zip and tar archives (also .gz, .bz2, .xz, .zst) are read by
+Guppy itself. A few extras use programs when they are installed: poppler (PDF preview), ffmpeg
+(video and audio), ImageMagick (HEIC, AVIF, RAW, PSD …), bsdtar (7z, rar, iso), git (status
+in the list) and zoxide (jump to folders used in the shell). Settings (F12) → *Helper programs*
+shows which are there; Enter on a missing one installs it in a terminal (pacman, apt, Homebrew
+or winget) or opens its download page. Previews say which program they are missing.
+
 ## Windows and macOS
 
 Guppy builds for Windows and macOS too (`cargo build --release` on that system), but it is
@@ -21,11 +30,12 @@ only tested on Linux so far. Differences there:
   holds file URLs like Finder; Cmd+X only moves when pasted in Guppy. *Empty trash* asks Finder
   (macOS asks once for permission); undo of trashing works for items trashed in the same session.
   User actions with `terminal = true` open Terminal.app.
-- **Windows:** archives need Windows 10 or newer (`tar.exe`). Alt+Enter only switches read-only
+- **Windows:** 7z, rar and iso archives need Windows 10 or newer (`tar.exe`). Alt+Enter only switches read-only
   (the `w` bits); there is no owner. User actions run with `cmd /C`, placeholders are quoted
   with `"`. Creating symlinks needs developer mode or admin rights.
-- **Both:** previews of PDF, video and other image formats need the same tools as on Linux
-  (poppler, ffmpeg, ImageMagick) in `PATH` (on macOS Homebrew’s folders are searched too); colors fall back to Matte Black (no Omarchy theme).
+- **Both:** helper programs as above, installed with winget or Homebrew (on macOS Homebrew’s
+  folders are searched even when Guppy starts from the Dock); colors fall back to Matte Black
+  (no Omarchy theme).
 
 ## Benchmark
 

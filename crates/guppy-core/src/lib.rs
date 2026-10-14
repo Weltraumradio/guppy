@@ -12,6 +12,7 @@ pub mod jump;
 pub mod ops;
 pub mod platform;
 pub mod theme;
+pub mod tools;
 
 pub use config::Config;
 pub use du::{Cancel, DirSize, DirSizes};
