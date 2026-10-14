@@ -30,7 +30,10 @@ The path line above each pane shows the size of every folder on the way, from `~
 where you are, and each part is a link back up.
 
 Sort by size (Ctrl+S) and each row gets a small bar showing its share, which makes it easy to
-see what is eating your disk. Hard links are counted once, other drives mounted below a folder
+see what is eating your disk. Ctrl+U turns the other pane into a space map: the current folder as tiles sized by
+what they hold, largest first. Click a folder tile to go into it.
+
+Hard links are counted once, other drives mounted below a folder
 are left out, and network drives get fewer parallel requests so the NAS isn't flooded. Ctrl+R
 counts everything again.
 

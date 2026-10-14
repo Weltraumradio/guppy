@@ -5,6 +5,7 @@ mod clip;
 mod icons;
 mod paper;
 mod preview;
+mod treemap;
 mod watch;
 
 use paper::{Paper, Scanlines};
@@ -146,6 +147,10 @@ enum Message {
     ToggleStartHelp,
     /// Ctrl+Q: show the entry under the cursor in the other pane.
     ToggleQuick,
+    /// Space map of the active folder in the other pane.
+    ToggleMap,
+    /// Click on a tile: folders are entered, files get the cursor.
+    MapClick(PathBuf),
     /// The cursor rested long enough: load the quick view (if still current).
     QuickDue(u64),
     QuickLoaded(PathBuf, ViewBody),
@@ -431,6 +436,7 @@ enum Cmd {
     Edit,
     EditExternal,
     Quick,
+    Map,
     Mark,
     Unmark,
     Invert,
@@ -468,6 +474,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("Edit file", "F4", Cmd::Edit),
     ("Edit in external editor", "Shift+F4", Cmd::EditExternal),
     ("Quick view in other pane", "Ctrl+Q", Cmd::Quick),
+    ("Space map in other pane", "Ctrl+U", Cmd::Map),
     ("Mark by pattern", "+", Cmd::Mark),
     ("Unmark by pattern", "-", Cmd::Unmark),
     ("Invert marks", "*", Cmd::Invert),
@@ -581,6 +588,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+J", "running jobs (P pauses, Del cancels)"),
         ("Ctrl+Shift+J", "pause / resume job"),
         ("Ctrl+Q", "quick view in other pane"),
+        ("Ctrl+U", "space map in other pane"),
         ("Ctrl+P", "command palette"),
         ("Alt+F1 / F2", "drives & bookmarks"),
         ("Ctrl+D", "bookmark this folder"),
@@ -818,6 +826,8 @@ struct Guppy {
     jobs: Jobs,
     /// Quick view on: the other pane shows the entry under the cursor.
     quick: bool,
+    /// The other pane shows the space map.
+    map: bool,
     /// Entry the quick view should show, and what it shows now.
     quick_want: Option<PathBuf>,
     quick_view: Option<(PathBuf, ViewBody)>,
@@ -906,6 +916,7 @@ impl Guppy {
             config,
             jobs: Jobs::default(),
             quick: false,
+            map: false,
             quick_want: None,
             quick_view: None,
             quick_gen: 0,
@@ -918,6 +929,8 @@ impl Guppy {
         let sort = sort_from(g.config.view.sort);
         g.panes.iter_mut().for_each(|p| p.sort = sort);
         g.restore_tabs();
+        // Developer aid for screenshots: `GUPPY_SCREENSHOT_VIEW=map` opens the space map.
+        g.map = std::env::var("GUPPY_SCREENSHOT_VIEW").as_deref() == Ok("map");
         if let Some(e) = config_error {
             g.dialog = Some(Dialog::Report { title: "Settings not loaded", problems: vec![e] });
         } else if g.config.start.help && std::env::var_os("GUPPY_SCREENSHOT").is_none() {
@@ -1241,7 +1254,7 @@ impl Guppy {
             }
             Message::Key(_) | Message::Tick => return Task::none(),
             // Not while typing a name or with a dialog open (the mouse may just pass by).
-            Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() && !self.quick => self.active = side,
+            Message::HoverPane(side) if self.rename.is_none() && self.dialog.is_none() && !self.quick && !self.map => self.active = side,
             Message::HoverPane(_) => {}
             Message::GoTo(side, path) => {
                 self.active = side;
@@ -1434,7 +1447,21 @@ impl Guppy {
                 }
                 self.pick_drive(false);
             }
+            Message::ToggleMap => {
+                self.map = !self.map;
+                self.quick = false;
+            }
+            Message::MapClick(path) => {
+                let p = &self.panes[self.active];
+                if path.is_dir() {
+                    self.navigate(path);
+                } else if let Some(i) = p.visible(self.show_hidden, &self.sizes).iter().position(|e| e.path == path) {
+                    self.panes[self.active].cursor = i;
+                    return self.scroll_into_view();
+                }
+            }
             Message::ToggleQuick => {
+                self.map = false;
                 self.quick = !self.quick;
                 self.quick_want = None;
                 self.quick_view = None;
@@ -1588,6 +1615,7 @@ impl Guppy {
             }
             Key::Character("j") if m.command() => self.dialog = Some(Dialog::Jobs),
             Key::Character("q") if m.command() => return self.update(Message::ToggleQuick),
+            Key::Character("u") if m.command() => return self.update(Message::ToggleMap),
             Key::Character("d") if m.command() => self.bookmark_here(),
             Key::Character("p") if m.command() => self.dialog = Some(Dialog::Palette { query: String::new(), cur: 0 }),
             // On the file list (empty search): `+` / `-` mark by pattern, `*` inverts.
@@ -2305,6 +2333,7 @@ impl Guppy {
             Cmd::Edit => return self.edit_current(),
             Cmd::EditExternal => self.edit_external(),
             Cmd::Quick => return self.update(Message::ToggleQuick),
+            Cmd::Map => return self.update(Message::ToggleMap),
             Cmd::Mark | Cmd::Unmark => self.dialog = Some(Dialog::Mark { add: cmd == Cmd::Mark, pattern: self.last_pattern.clone() }),
             Cmd::Invert => self.invert_marks(),
             Cmd::Hidden => return self.update(Message::ToggleHidden),
@@ -2961,7 +2990,11 @@ impl Guppy {
 
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
-        let side_view = |side: usize| if self.quick && side != self.active { self.quick_pane(side) } else { self.pane_view(side) };
+        let side_view = |side: usize| match side != self.active {
+            true if self.quick => self.quick_pane(side),
+            true if self.map => self.map_pane(side),
+            _ => self.pane_view(side),
+        };
         let body = row![side_view(0), side_view(1)].spacing(16);
         let desk = container(body)
             .padding([12, 13])
@@ -3710,6 +3743,51 @@ impl Guppy {
         let body: Element<'_, Message> = match &self.quick_view {
             Some((p, b)) => container(self.body_view(p, b, quick_id())).padding([4, 14]).height(Length::Fill).into(),
             None => container(text(keys_label("Ctrl+Q closes the preview")).size(12).color(rgb(t.foreground))).center(Length::Fill).into(),
+        };
+        let outline = self.neon().then(|| rgb(t.muted));
+        self.sheet(column![header, body].into(), side, t.sheet_dim, outline).width(Length::FillPortion(3)).into()
+    }
+
+    /// The active folder as tiles sized by their content, largest first.
+    fn map_pane(&self, side: usize) -> Element<'_, Message> {
+        let t = &self.theme;
+        let p = &self.panes[self.active];
+        let visible = p.visible(self.show_hidden, &self.sizes);
+        let mut items: Vec<(&Entry, u64)> = visible.iter().map(|e| (*e, entry_size(e, &self.sizes).unwrap_or(0))).filter(|(_, n)| *n > 0).collect();
+        items.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let total: u64 = items.iter().map(|(_, n)| n).sum();
+        // The smallest ones together as one tile, so the map stays readable.
+        const MAX: usize = 60;
+        let rest: Vec<(&Entry, u64)> = if items.len() > MAX { items.split_off(MAX) } else { Vec::new() };
+        let mut tiles: Vec<treemap::Tile> = items
+            .iter()
+            .map(|(e, n)| treemap::Tile {
+                path: Some(e.path.clone()),
+                name: if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() },
+                size: *n,
+                color: if e.is_dir() { rgb(t.accent) } else { self.class_color(e.class()) },
+            })
+            .collect();
+        if !rest.is_empty() {
+            tiles.push(treemap::Tile { path: None, name: format!("{} more", rest.len()), size: rest.iter().map(|(_, n)| n).sum(), color: rgb(t.light_foreground) });
+        }
+        let pending = self.sizes.busy();
+        let header = container(
+            row![
+                text(if self.neon() { "» SPACE" } else { "SPACE" }).size(11).font(BOLD).color(rgb(t.accent)),
+                container(text(self.jumper.display(&p.path)).size(12).color(rgb(t.bright)).wrapping(iced::widget::text::Wrapping::None)).width(Length::Fill).clip(true),
+                text(format!("{}{}", human_size(total), if pending { " · counting …" } else { "" })).size(11).color(rgb(t.foreground)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([10, 10]);
+        let cursor = visible.get(p.cursor).map(|e| e.path.clone());
+        let body: Element<'_, Message> = if tiles.is_empty() {
+            container(text(if pending { "counting …" } else { "Nothing here takes up space" }).size(12).color(rgb(t.foreground))).center(Length::Fill).into()
+        } else {
+            let map = treemap::Map { tiles, cursor, text: rgb(t.bright), gap: rgb(t.sheet_dim) };
+            container(iced::widget::canvas(map).width(Length::Fill).height(Length::Fill)).padding(iced::Padding { top: 0.0, left: 8.0, right: 8.0, bottom: 8.0 }).into()
         };
         let outline = self.neon().then(|| rgb(t.muted));
         self.sheet(column![header, body].into(), side, t.sheet_dim, outline).width(Length::FillPortion(3)).into()
