@@ -81,6 +81,8 @@ counts everything again.
 - Three looks: `paper` follows the colors of your Omarchy theme and changes with it,
   `matte-black` keeps those colors everywhere, and `neon` is a dark terminal style
 - Settings (F12) for the everyday options, the rest in a commented config file
+- Small animations: new files glow briefly, removed ones fold away, a folder pulses when
+  you drop something on it
 - File names colored by type (code, documents, images, archives)
 
 ## Building

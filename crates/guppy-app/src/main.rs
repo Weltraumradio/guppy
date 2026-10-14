@@ -41,6 +41,10 @@ const BOLD: Font = Font {
     ..FONT
 };
 
+/// Animation lengths: a glowing row, a row folding away.
+const GLOW: Duration = Duration::from_millis(900);
+const FOLD: Duration = Duration::from_millis(260);
+
 /// Process start, for `GUPPY_BENCH`.
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -841,6 +845,10 @@ struct Guppy {
     search_ctx: Vec<(usize, String)>,
     /// Folder the last search ran in.
     search_root_cache: Option<PathBuf>,
+    /// Rows that just appeared or took a drop: they glow and fade out.
+    glow: Vec<(PathBuf, std::time::Instant)>,
+    /// Rows that just disappeared, per side: former position, entry, when; they fold away.
+    ghosts: [Vec<(usize, Entry, std::time::Instant)>; 2],
     /// Entry the quick view should show, and what it shows now.
     quick_want: Option<PathBuf>,
     quick_view: Option<(PathBuf, ViewBody)>,
@@ -935,6 +943,8 @@ impl Guppy {
             search_hits: Vec::new(),
             search_ctx: Vec::new(),
             search_root_cache: None,
+            glow: Vec::new(),
+            ghosts: [Vec::new(), Vec::new()],
             quick_want: None,
             quick_view: None,
             quick_gen: 0,
@@ -1062,7 +1072,7 @@ impl Guppy {
                 }),
             ]);
         }
-        if self.panes.iter().any(|p| p.scroll_target.is_some()) {
+        if self.panes.iter().any(|p| p.scroll_target.is_some()) || self.animating() {
             keys = Subscription::batch([keys, iced::window::frames().map(Message::Frame)]);
         }
         // Only while sizes are computed; no idle ticking otherwise.
@@ -1326,6 +1336,8 @@ impl Guppy {
                 if let Some(d) = self.drag.take().filter(|d| d.active)
                     && let Some((kind, target)) = self.drop_plan(&d)
                 {
+                    // The folder that took the drop pulses once.
+                    self.glow.push((target.clone(), std::time::Instant::now()));
                     self.ask_with(kind, d.paths, Some(target));
                 }
             }
@@ -1341,6 +1353,8 @@ impl Guppy {
             }
             Message::Frame(now) => {
                 bench_report();
+                self.glow.retain(|(_, t)| t.elapsed() < GLOW);
+                self.ghosts.iter_mut().for_each(|g| g.retain(|(_, _, t)| t.elapsed() < FOLD));
                 return self.animate_scroll(now);
             }
             Message::CloseRequested(id) => {
@@ -2883,11 +2897,24 @@ impl Guppy {
             }
         };
         if let After::Reload = after {
-            let keep = self.panes[side].visible(self.show_hidden, &self.sizes).get(self.panes[side].cursor).map(|e| e.path.clone());
-            let p = &mut self.panes[side];
-            if p.path != path {
+            let before: Vec<Entry> = self.panes[side].visible(self.show_hidden, &self.sizes).into_iter().cloned().collect();
+            let keep = before.get(self.panes[side].cursor).map(|e| e.path.clone());
+            if self.panes[side].path != path {
                 return;
             }
+            // Gone rows fold away, new ones glow (not when everything changed at once).
+            let now = std::time::Instant::now();
+            let new: HashSet<&PathBuf> = entries.iter().map(|e| &e.path).collect();
+            let old: HashSet<&PathBuf> = before.iter().map(|e| &e.path).collect();
+            let gone: Vec<(usize, Entry, std::time::Instant)> = before.iter().enumerate().filter(|(_, e)| !new.contains(&e.path)).map(|(i, e)| (i, e.clone(), now)).collect();
+            let added: Vec<PathBuf> = entries.iter().filter(|e| !old.contains(&e.path)).map(|e| e.path.clone()).collect();
+            if gone.len() <= 50 {
+                self.ghosts[side].extend(gone);
+            }
+            if added.len() <= 50 && !before.is_empty() {
+                self.glow.extend(added.into_iter().map(|p| (p, now)));
+            }
+            let p = &mut self.panes[side];
             p.entries = entries;
             let names: HashSet<&PathBuf> = p.entries.iter().map(|e| &e.path).collect();
             p.marked.retain(|m| names.contains(m));
@@ -3086,6 +3113,15 @@ impl Guppy {
     }
 
     /// One animation step: approaches the target exponentially, independent of frame rate.
+    fn animating(&self) -> bool {
+        !self.glow.is_empty() || self.ghosts.iter().any(|g| !g.is_empty())
+    }
+
+    /// How far along an animation that started at `t` is, 0 to 1.
+    fn progress(t: std::time::Instant, length: Duration) -> f32 {
+        (t.elapsed().as_secs_f32() / length.as_secs_f32()).min(1.0)
+    }
+
     fn animate_scroll(&mut self, now: std::time::Instant) -> Task<Message> {
         const TAU: f32 = 0.03; // seconds; smaller = faster
         let dt = self.last_frame.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
@@ -4215,8 +4251,12 @@ impl Guppy {
             }
             // A folder that would take the dragged files.
             let drop_here = self.drag.as_ref().is_some_and(|d| d.active && d.over == Some((side, i)) && e.is_dir() && !d.paths.contains(&e.path));
+            let glow = self.glow.iter().filter(|(p, _)| *p == e.path).map(|(_, t)| Self::progress(*t, GLOW)).fold(None, |a: Option<f32>, x| Some(a.map_or(x, |a| a.min(x))));
             let bg = if on_cursor {
                 Some(rgb(t.accent))
+            } else if let Some(k) = glow {
+                // Bright at first, then fading out (ease-out).
+                Some(Color { a: 0.45 * (1.0 - k) * (1.0 - k), ..rgb(t.accent) })
             } else if is_cur {
                 Some(Color { a: 0.09, ..Color::WHITE })
             } else {
@@ -4285,6 +4325,21 @@ impl Guppy {
             ..Default::default()
         });
 
+        // Rows that just went away fold up where they were.
+        let mut rows: Vec<Element<'_, Message>> = rows.collect();
+        let mut ghosts: Vec<&(usize, Entry, std::time::Instant)> = self.ghosts[side].iter().collect();
+        ghosts.sort_by_key(|g| std::cmp::Reverse(g.0));
+        for (at, e, start) in ghosts {
+            let k = Self::progress(*start, FOLD);
+            let h = ROW_H * (1.0 - k) * (1.0 - k);
+            let name = if e.is_dir() { format!("/{}", e.name) } else { e.name.clone() };
+            let ghost = container(text(name).size(13).color(Color { a: 1.0 - k, ..self.class_color(e.class()) }).wrapping(iced::widget::text::Wrapping::None))
+                .height(h)
+                .padding(iced::Padding { left: 32.0, ..Default::default() })
+                .center_y(h)
+                .clip(true);
+            rows.insert((*at).min(rows.len()), ghost.into());
+        }
         let list = scrollable(column(rows).padding([0, 6]))
             .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(3)))
             .style(move |_, status| {
