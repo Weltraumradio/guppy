@@ -110,6 +110,10 @@ enum Message {
     TabClick(usize, usize),
     /// Click on a part of the path in a pane header.
     GoTo(usize, PathBuf),
+    /// Click on a favorite button: side, slot. Opens it, or fills a free slot.
+    Favorite(usize, usize),
+    /// Right-click on a favorite button: puts the pane's folder on it, or clears it.
+    SetFavorite(usize, usize),
     /// Mouse while a row is held: where it is, and the button let go.
     DragMoved(iced::Point),
     DragReleased,
@@ -1334,6 +1338,18 @@ impl Guppy {
             Message::GoTo(side, path) => {
                 self.active = side;
                 self.navigate(path);
+            }
+            Message::Favorite(side, slot) => {
+                self.active = side;
+                let cwd = self.panes[side].path.clone();
+                match self.config.favorites.get(slot).filter(|f| !f.path.is_empty()) {
+                    Some(f) => self.navigate(Config::resolve(&f.path, &cwd)),
+                    None => self.set_favorite(side, slot),
+                }
+            }
+            Message::SetFavorite(side, slot) => {
+                self.active = side;
+                self.set_favorite(side, slot);
             }
             Message::TabClick(side, k) => {
                 self.active = side;
@@ -2616,6 +2632,27 @@ impl Guppy {
             self.active = if other { 1 - side } else { side };
             self.navigate(path);
         }
+    }
+
+    /// Puts the pane's folder on favorite `slot`; if it is already there, frees the slot.
+    fn set_favorite(&mut self, side: usize, slot: usize) {
+        let here = self.panes[side].path.clone();
+        let mut new = self.config.clone();
+        if new.favorites.len() <= slot {
+            new.favorites.resize(slot + 1, Bookmark { name: String::new(), path: String::new() });
+        }
+        let f = &mut new.favorites[slot];
+        if !f.path.is_empty() && Config::resolve(&f.path, &here) == here {
+            *f = Bookmark { name: String::new(), path: String::new() };
+        } else {
+            let name = here.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.jumper.display(&here));
+            *f = Bookmark { name, path: self.jumper.display(&here) };
+        }
+        // Free slots at the end aren't worth keeping in the file.
+        while new.favorites.last().is_some_and(|f| f.path.is_empty()) {
+            new.favorites.pop();
+        }
+        self.set_config(new);
     }
 
     /// Ctrl+D: names a new bookmark for the active folder; if it has one, shows it in the list.
@@ -4427,9 +4464,10 @@ impl Guppy {
         let k = Self::eased(self.active_at, APPEAR);
         let rest = if self.neon() { rgb(t.muted) } else { Color { a: 0.0, ..rgb(t.accent) } };
         let outline = if active { Some(mix(rest, rgb(t.accent), k)) } else { self.neon().then(|| rgb(t.muted)) };
+        let favorites = self.favorite_bar(side);
         let content: Element<'_, Message> = match self.tab_bar(side, active) {
-            Some(bar) => column![bar, header, body].into(),
-            None => column![header, body].into(),
+            Some(bar) => column![bar, favorites, header, body].into(),
+            None => column![favorites, header, body].into(),
         };
         let sheet = self.sheet(content, side, tone, outline)
             .width(Length::FillPortion(3));
@@ -4485,6 +4523,61 @@ impl Guppy {
             line = line.push(mouse_area(seg).on_press(Message::GoTo(side, part)).interaction(iced::mouse::Interaction::Pointer));
         }
         line.into()
+    }
+
+    /// Four folder buttons at the top of a pane. Click opens, right-click sets or clears.
+    fn favorite_bar(&self, side: usize) -> Element<'_, Message> {
+        let t = &self.theme;
+        let here = &self.panes[side].path;
+        let buttons = (0..4).map(|slot| {
+            let fav = self.config.favorites.get(slot).filter(|f| !f.path.is_empty());
+            let path = fav.map(|f| Config::resolve(&f.path, here));
+            let shown = path.as_ref() == Some(here);
+            let (name, color) = match fav {
+                Some(f) => (f.name.clone(), if shown { rgb(t.accent) } else { rgb(t.bright) }),
+                None => ("+".to_string(), rgb(t.foreground)),
+            };
+            let label = row![
+                text(format!("{}", slot + 1)).size(10).font(BOLD).color(Color { a: 0.6, ..color }),
+                text(name).size(if fav.is_some() { 12 } else { 14 }).font(if shown || fav.is_none() { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let b = button(container(label).center_x(Length::Fill).center_y(Length::Fill).clip(true))
+                .padding([0, 6])
+                .width(Length::Fill)
+                .height(26)
+                .on_press(Message::Favorite(side, slot))
+                .style(move |_, status| button::Style {
+                    background: Some(match status {
+                        button::Status::Hovered | button::Status::Pressed => Color { a: 0.12, ..Color::WHITE },
+                        _ if shown => Color { a: 0.08, ..Color::WHITE },
+                        _ => Color { a: 0.04, ..Color::WHITE },
+                    }.into()),
+                    border: Border {
+                        color: if shown { rgb(t.accent) } else { Color { a: 0.35, ..rgb(t.foreground) } },
+                        width: 1.0,
+                        radius: 5.0.into(),
+                    },
+                    ..Default::default()
+                });
+            let tip = match fav {
+                Some(f) => format!("{}\nRight-click: put this folder here (again: clear)", f.path),
+                None => "Click or right-click: put this folder here".to_string(),
+            };
+            let b = mouse_area(b).on_right_press(Message::SetFavorite(side, slot));
+            iced::widget::tooltip(b, text(tip).size(12), iced::widget::tooltip::Position::Bottom)
+                .style(move |_| container::Style {
+                    background: Some(rgb(t.lighter_background).into()),
+                    text_color: Some(rgb(t.foreground)),
+                    border: Border::default().rounded(4),
+                    ..Default::default()
+                })
+                .padding(6)
+                .delay(Duration::from_millis(600))
+                .into()
+        });
+        container(row(buttons).spacing(4)).padding(iced::Padding { top: 6.0, left: 6.0, right: 6.0, bottom: 0.0 }).into()
     }
 
     /// Tabs above the pane header, only when there is more than one.
