@@ -4538,17 +4538,18 @@ impl Guppy {
             let shown = path.as_ref() == Some(here);
             let (name, color) = match fav {
                 Some(f) => (f.name.clone(), if shown { rgb(t.accent) } else { rgb(t.bright) }),
-                None => ("+".to_string(), rgb(t.muted)),
+                None => ("+".to_string(), rgb(t.foreground)),
             };
             let label = row![
                 text(format!("{}", slot + 1)).size(10).font(BOLD).color(Color { a: 0.6, ..color }),
-                text(name).size(12).font(if shown { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None),
+                text(name).size(if fav.is_some() { 12 } else { 14 }).font(if shown || fav.is_none() { BOLD } else { FONT }).color(color).wrapping(iced::widget::text::Wrapping::None),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            let b = button(container(label).center_x(Length::Fill).clip(true))
-                .padding([4, 6])
+            let b = button(container(label).center_x(Length::Fill).center_y(Length::Fill).clip(true))
+                .padding([0, 6])
                 .width(Length::Fill)
+                .height(26)
                 .on_press(Message::Favorite(side, slot))
                 .style(move |_, status| button::Style {
                     background: Some(match status {
